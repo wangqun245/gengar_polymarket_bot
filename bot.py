@@ -80,6 +80,8 @@ class PolyBot:
             private_key=os.getenv("PRIVATE_KEY", ""),
             safe_address=os.getenv("SAFE_ADDRESS", ""),
             dry_run=self.dry_run,
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "3")),
+            funder_address=os.getenv("FUNDER_ADDRESS", "") or os.getenv("SAFE_ADDRESS", ""),
         )
         self.telegram = TelegramNotifier()
         self.tracker = Tracker(
