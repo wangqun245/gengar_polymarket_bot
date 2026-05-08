@@ -76,12 +76,88 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
     return float(shares), spend
 
 
+def _env(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
+def _load_manual_api_creds() -> Optional[ApiCreds]:
+    mode = _env("CLOB_CREDS_MODE").lower() or "auto"
+    key = _env("CLOB_API_KEY")
+    secret = _env("CLOB_SECRET")
+    passphrase = _env("CLOB_PASS_PHRASE")
+
+    if mode in {"auto", "derive", "wallet"}:
+        if key or secret or passphrase:
+            print(
+                "[executor] Ignoring CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE "
+                "because CLOB_CREDS_MODE=auto. Wallet-derived CLOB creds will be used."
+            )
+        return None
+
+    if mode not in {"manual", "env"}:
+        raise ValueError(
+            "CLOB_CREDS_MODE must be 'auto' or 'manual' "
+            f"(got {mode!r})"
+        )
+
+    missing = [
+        name for name, value in (
+            ("CLOB_API_KEY", key),
+            ("CLOB_SECRET", secret),
+            ("CLOB_PASS_PHRASE", passphrase),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "CLOB_CREDS_MODE=manual requires all CLOB API credential fields: "
+            + ", ".join(missing)
+        )
+
+    return ApiCreds(api_key=key, api_secret=secret, api_passphrase=passphrase)
+
+
+def _redacted(value: str) -> str:
+    if not value:
+        return "<empty>"
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _creds_mode() -> str:
+    return _env("CLOB_CREDS_MODE").lower() or "auto"
+
+
+def _uses_possible_relayer_keys() -> bool:
+    return bool(_env("RELAYER_API_KEY") or _env("RELAYER_API_KEY_ADDRESS"))
+
+
+def _manual_creds_are_configured() -> bool:
+    return bool(_env("CLOB_API_KEY") or _env("CLOB_SECRET") or _env("CLOB_PASS_PHRASE"))
+
+
+def _print_auth_hint() -> None:
+    if _uses_possible_relayer_keys():
+        print(
+            "[executor] Note: RELAYER_API_KEY is for gasless relayer operations, "
+            "not CLOB order auth. This bot derives CLOB L2 creds from PRIVATE_KEY "
+            "unless CLOB_CREDS_MODE=manual."
+        )
+    if _manual_creds_are_configured() and _creds_mode() == "manual":
+        print(
+            "[executor] Using manual CLOB API credentials: "
+            f"key={_redacted(_env('CLOB_API_KEY'))}, "
+            f"secret={_redacted(_env('CLOB_SECRET'))}, "
+            f"passphrase={_redacted(_env('CLOB_PASS_PHRASE'))}"
+        )
+    elif _creds_mode() in {"auto", "derive", "wallet"}:
+        print("[executor] CLOB creds mode: auto (derive from PRIVATE_KEY)")
+
+
 def _load_api_creds() -> Optional[ApiCreds]:
-    key = os.getenv("CLOB_API_KEY", "")
-    secret = os.getenv("CLOB_SECRET", "")
-    passphrase = os.getenv("CLOB_PASS_PHRASE", "")
-    if key and secret and passphrase:
-        return ApiCreds(api_key=key, api_secret=secret, api_passphrase=passphrase)
+    """Backward-compatible wrapper for callers/tests that still import it."""
+    return _load_manual_api_creds()
     return None
 
 
@@ -117,11 +193,13 @@ class Executor:
 
     def initialize(self) -> bool:
         try:
+            _print_auth_hint()
+            manual_creds = _load_manual_api_creds()
             self.client = ClobClient(
                 host="https://clob.polymarket.com",
                 key=self.private_key,
                 chain_id=POLYGON,
-                creds=_load_api_creds(),
+                creds=manual_creds,
                 funder=self.funder_address or None,
                 signature_type=self.signature_type,
             )
