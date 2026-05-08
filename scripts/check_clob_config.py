@@ -71,7 +71,7 @@ def main() -> int:
     private_key = env("PRIVATE_KEY")
     safe_address = env("SAFE_ADDRESS")
     funder = env("FUNDER_ADDRESS") or safe_address
-    sig_type = _signature_type(int(env("SIGNATURE_TYPE") or "3"))
+    sig_type = _signature_type(int(env("SIGNATURE_TYPE") or "2"))
     creds_mode = (env("CLOB_CREDS_MODE") or "auto").lower()
 
     if not private_key:
@@ -121,7 +121,7 @@ def main() -> int:
         print("3. Restart the bot so it derives CLOB creds from PRIVATE_KEY")
         return 1
 
-    print("\nOK: CLOB API key owner matches the wallet signer, or is not address-shaped.")
+    print("\nOK: CLOB credentials were resolved.")
 
     try:
         balance = client.get_balance_allowance(
@@ -146,7 +146,16 @@ def main() -> int:
         print("\n== local signed order ==")
         print(f"order signer: {signed_order.signer}")
         print(f"order maker: {signed_order.maker}")
+        print(f"order signature type: {signed_order.signatureType}")
         print(f"payload owner would be: {api_key}")
+        if int(signed_order.signatureType) == 3 and not same_address(
+            signed_order.signer, signed_order.maker
+        ):
+            print("\nPROBLEM FOUND:")
+            print("SIGNATURE_TYPE=3 built an order whose signer is not the funded maker.")
+            print("Your account is behaving like a Safe/proxy wallet, not a 1271 deposit wallet.")
+            print("Set SIGNATURE_TYPE=2 and rerun this script.")
+            return 1
         if api_key.startswith("0x") and not same_address(api_key, signed_order.signer):
             print("PROBLEM FOUND: order signer != payload owner")
             return 1

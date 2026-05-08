@@ -201,6 +201,12 @@ class Executor:
         self.client: Optional[ClobClient] = None
         self._initialized = False
 
+        if self.signature_type == SignatureTypeV2.POLY_1271:
+            print(
+                "[executor] SIGNATURE_TYPE=3 is for deposit wallets. "
+                "MetaMask/Rabby Polymarket Safe accounts usually need SIGNATURE_TYPE=2."
+            )
+
     def initialize(self) -> bool:
         try:
             _print_auth_hint()
