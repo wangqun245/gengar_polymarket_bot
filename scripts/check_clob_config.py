@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fast CLOB auth/config diagnostic.
 
-This script does not place an order. It derives or loads the same API
-credentials the bot will use, prints the signer/funder/API-key relationship,
-checks balance, and optionally builds a local signed order to expose the exact
-order signer before a live POST.
+By default, this script does not place an order. It derives or loads the same
+API credentials the bot will use, prints the signer/funder/API-key
+relationship, checks balance, and optionally builds a local signed order to
+expose the exact order signer before a live POST.
 """
 
 import argparse
@@ -55,6 +55,14 @@ def main() -> int:
         "--build-order",
         action="store_true",
         help="Build a local signed order using the current market token. Does not POST.",
+    )
+    parser.add_argument(
+        "--post-smoke-test",
+        action="store_true",
+        help=(
+            "Place a post-only $5.00 limit order at $0.01, then cancel it. "
+            "This is live and should only be used with DRY_RUN=true after review."
+        ),
     )
     args = parser.parse_args()
 
@@ -124,11 +132,15 @@ def main() -> int:
     except Exception as exc:
         print(f"Balance check failed: {exc}")
 
-    if args.build_order:
+    if args.build_order or args.post_smoke_test:
         market = get_current_market()
-        token_id = market.down_token_id or market.up_token_id
+        if market is None:
+            print("Could not fetch current market; try again in a few seconds.")
+            return 1
+
+        token_id = market.token_id_down or market.token_id_up
         signed_order = client.create_order(
-            OrderArgs(token_id=token_id, price=0.01, size=5.0, side="BUY"),
+            OrderArgs(token_id=token_id, price=0.01, size=500.0, side="BUY"),
             options=_order_options(),
         )
         print("\n== local signed order ==")
@@ -139,6 +151,28 @@ def main() -> int:
             print("PROBLEM FOUND: order signer != payload owner")
             return 1
         print("OK: local order signer matches payload owner.")
+
+        if args.post_smoke_test:
+            from py_clob_client_v2 import OrderPayload, OrderType
+
+            dry_run = env("DRY_RUN").lower() != "false"
+            if not dry_run:
+                print("\nRefusing smoke test while DRY_RUN=false.")
+                print("Set DRY_RUN=true for this one-off auth smoke test.")
+                return 2
+
+            print("\n== live CLOB POST smoke test ==")
+            print("Posting post-only BUY 500 shares @ $0.01 ($5.00), then cancelling.")
+            response = client.post_order(
+                signed_order,
+                order_type=OrderType.GTC,
+                post_only=True,
+            )
+            order_id = response.get("orderID", "")
+            print(f"POST succeeded: {response}")
+            if order_id:
+                cancel_response = client.cancel_order(OrderPayload(orderID=order_id))
+                print(f"Cancel response: {cancel_response}")
 
     return 0
 
