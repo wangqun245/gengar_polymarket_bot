@@ -158,7 +158,17 @@ def _print_auth_hint() -> None:
 def _load_api_creds() -> Optional[ApiCreds]:
     """Backward-compatible wrapper for callers/tests that still import it."""
     return _load_manual_api_creds()
-    return None
+
+
+def _friendly_error(exc: Exception) -> str:
+    message = str(exc)
+    if "order signer address has to be the address of the API KEY" in message:
+        return (
+            f"{message} | Fix: set CLOB_CREDS_MODE=auto and clear "
+            "CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE, then run "
+            "`python scripts/check_clob_config.py --build-order`."
+        )
+    return message
 
 
 def _signature_type(value: int) -> SignatureTypeV2:
@@ -348,7 +358,7 @@ class Executor:
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
             return OrderResult(
-                success=False, status=FAILED, error=str(e),
+                success=False, status=FAILED, error=_friendly_error(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
@@ -511,7 +521,7 @@ class Executor:
                 )
 
             return OrderResult(
-                success=False, status=FAILED, error=str(e),
+                success=False, status=FAILED, error=_friendly_error(e),
                 side="SELL", price=price, token_id=token_id[:16] + "...",
             )
 
