@@ -59,16 +59,18 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
         return 0.0, 0.0
     price_cents = round(price * 100)
     max_usd_cents = int(max_usd * 100)
-    max_shares = max_usd_cents // price_cents if price_cents > 0 else 0
+    if price_cents <= 0:
+        return 0.0, 0.0
 
-    if max_shares < MIN_SHARES:
-        min_cost_cents = int(MIN_SHARES) * price_cents
-        if min_cost_cents <= max_usd_cents:
-            max_shares = int(MIN_SHARES)
-        else:
-            return 0.0, 0.0
+    max_shares = max_usd_cents // price_cents
+    min_notional_cents = int(POLY_MIN_NOTIONAL * 100)
+    min_notional_shares = (min_notional_cents + price_cents - 1) // price_cents
+    min_required_shares = max(int(MIN_SHARES), min_notional_shares)
 
-    shares = int(max_shares)
+    # A $5 budget can round down below Polymarket's $5 notional when shares
+    # must be whole numbers (e.g. 6 shares * $0.75 = $4.50). Allow the smallest
+    # valid notional even if it exceeds the requested budget by less than 1 share.
+    shares = int(max(max_shares, min_required_shares))
     spend = shares * price_cents / 100.0
     if shares < MIN_SHARES:
         return 0.0, 0.0
