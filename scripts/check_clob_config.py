@@ -8,6 +8,7 @@ expose the exact order signer before a live POST.
 """
 
 import argparse
+import importlib.metadata
 import os
 import sys
 from pathlib import Path
@@ -71,7 +72,7 @@ def main() -> int:
     private_key = env("PRIVATE_KEY")
     safe_address = env("SAFE_ADDRESS")
     funder = env("FUNDER_ADDRESS") or safe_address
-    sig_type = _signature_type(int(env("SIGNATURE_TYPE") or "2"))
+    sig_type = _signature_type(int(env("SIGNATURE_TYPE") or "3"))
     creds_mode = (env("CLOB_CREDS_MODE") or "auto").lower()
 
     if not private_key:
@@ -79,6 +80,11 @@ def main() -> int:
         return 2
 
     print("== .env summary ==")
+    try:
+        package_version = importlib.metadata.version("py-clob-client-v2")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = "unknown"
+    print(f"py-clob-client-v2: {package_version}")
     print(f"CLOB_CREDS_MODE: {creds_mode}")
     print(f"SIGNATURE_TYPE: {int(sig_type)} ({sig_type.name})")
     print(f"SAFE_ADDRESS: {safe_address or '<empty>'}")
@@ -153,8 +159,8 @@ def main() -> int:
         ):
             print("\nPROBLEM FOUND:")
             print("SIGNATURE_TYPE=3 built an order whose signer is not the funded maker.")
-            print("Your account is behaving like a Safe/proxy wallet, not a 1271 deposit wallet.")
-            print("Set SIGNATURE_TYPE=2 and rerun this script.")
+            print("Deposit-wallet POLY_1271 orders require signer == maker == deposit wallet.")
+            print("Upgrade with: pip install --upgrade --pre py-clob-client-v2==1.0.1rc1")
             return 1
         if api_key.startswith("0x") and not same_address(api_key, signed_order.signer):
             print("PROBLEM FOUND: order signer != payload owner")

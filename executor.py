@@ -203,8 +203,8 @@ class Executor:
 
         if self.signature_type == SignatureTypeV2.POLY_1271:
             print(
-                "[executor] SIGNATURE_TYPE=3 is for deposit wallets. "
-                "MetaMask/Rabby Polymarket Safe accounts usually need SIGNATURE_TYPE=2."
+                "[executor] SIGNATURE_TYPE=3 (POLY_1271 deposit wallet). "
+                "Requires py-clob-client-v2>=1.0.1rc1 for correct wrapped order signatures."
             )
 
     def initialize(self) -> bool:
