@@ -45,7 +45,7 @@ from strategy import (
     StrategyConfig,
     TradingStats,
 )
-from executor import Executor, FILLED, PARTIAL, FAILED
+from executor import Executor, FILLED, PARTIAL, FAILED, max_buy_price
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
@@ -184,6 +184,7 @@ class PolyBot:
               f"Skip chase: >{self.strategy_config.trend_entry_skip_threshold_pct:.3f}%")
         print(f"  Entry window: first {self.strategy_config.trend_entry_window_seconds}s | "
               f"Trade amount: ${self.strategy_config.trend_trade_amount:.2f}")
+        print(f"  Max buy price: ${max_buy_price():.2f}")
         print(f"  Polymarket WS: {'on' if self._poly_ws_enabled else 'off'} | "
               f"Take profit: ${self._take_profit_price:.2f} or {self._min_profit_pct:.0%}+")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
@@ -864,6 +865,27 @@ class PolyBot:
                     return
 
                 hint_price = actual_price
+
+        cap_price = max_buy_price()
+        if hint_price > cap_price:
+            print(f"  SKIP: buy price ${hint_price:.3f} > MAX_BUY_PRICE ${cap_price:.2f}")
+            self.tracker.log_signal(
+                window_ts=self._current_window,
+                btc_price=self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0,
+                opening_price=self._opening_price,
+                up_price=self._cached_up,
+                down_price=self._cached_down,
+                seconds_remaining=seconds_remaining,
+                side=sig.side,
+                true_prob=sig.true_prob,
+                market_price=hint_price,
+                edge=sig.edge,
+                kelly_size=sig.kelly_size,
+                action="skipped_price_cap",
+                skip_reason="buy_price_above_cap",
+                actual_price=hint_price,
+            )
+            return
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
 

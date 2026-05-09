@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from dotenv import load_dotenv
+
 from py_clob_client_v2 import (
     ApiCreds,
     AssetType,
@@ -25,6 +27,8 @@ from py_clob_client_v2 import (
 from py_clob_client_v2.constants import POLYGON
 
 
+load_dotenv()
+
 FILLED = "FILLED"
 PARTIAL = "PARTIAL"
 REJECTED = "REJECTED"
@@ -32,7 +36,7 @@ FAILED = "FAILED"
 
 MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
-MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.90"))
+DEFAULT_MAX_BUY_PRICE = 0.90
 POLY_MIN_NOTIONAL = 5.0
 
 DEFAULT_TICK_SIZE = "0.01"
@@ -78,6 +82,20 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
 
 def _env(name: str) -> str:
     return os.getenv(name, "").strip()
+
+
+def max_buy_price() -> float:
+    raw = os.getenv("MAX_BUY_PRICE", str(DEFAULT_MAX_BUY_PRICE))
+    raw = str(raw).split("#", 1)[0].strip()
+    try:
+        cap = float(raw)
+        if cap <= 0 or cap >= 1:
+            print(f"[executor] Invalid MAX_BUY_PRICE={raw!r}; using ${DEFAULT_MAX_BUY_PRICE:.2f}")
+            return DEFAULT_MAX_BUY_PRICE
+        return cap
+    except ValueError:
+        print(f"[executor] Invalid MAX_BUY_PRICE={raw!r}; using ${DEFAULT_MAX_BUY_PRICE:.2f}")
+        return DEFAULT_MAX_BUY_PRICE
 
 
 def _load_manual_api_creds() -> Optional[ApiCreds]:
@@ -224,7 +242,7 @@ class Executor:
 
             self._initialized = True
             print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
-            print(f"[executor] Max buy price: ${MAX_BUY_PRICE:.2f}")
+            print(f"[executor] Max buy price: ${max_buy_price():.2f}")
             print(f"[executor] Address: {self.client.get_address()}")
             print(f"[executor] Funder: {self.funder_address or self.client.get_address()}")
             print(f"[executor] Signature type: {int(self.signature_type)} ({self.signature_type.name})")
@@ -301,10 +319,11 @@ class Executor:
                 )
             market_price = round(market_price, 2)
 
-        if market_price > MAX_BUY_PRICE:
+        cap_price = max_buy_price()
+        if market_price > cap_price:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f}",
+                error=f"Price ${market_price:.3f} > cap ${cap_price:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
@@ -391,6 +410,12 @@ class Executor:
             if fill:
                 matched = self._extract_fill(fill, price)
                 if matched:
+                    cap_price = max_buy_price()
+                    if matched[0] > cap_price:
+                        print(
+                            f"  [order] WARNING: verified buy price ${matched[0]:.3f} "
+                            f"exceeds MAX_BUY_PRICE ${cap_price:.2f}"
+                        )
                     suffix = f" (attempt {attempt + 1})" if attempt > 0 else ""
                     print(f"  [order] Order API verified{suffix}: "
                           f"{matched[2]:.0f} shares @ ${matched[0]:.3f}")
