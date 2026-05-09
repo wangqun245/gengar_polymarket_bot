@@ -37,15 +37,22 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from market import get_current_market, current_window_ts, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
-from strategy import evaluate, estimate_true_probability, get_skip_reason, StrategyConfig, TradingStats
-from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE
+from polymarket_ws import PolymarketMarketFeed
+from strategy import (
+    evaluate_trend_entry,
+    estimate_true_probability,
+    get_trend_entry_skip_reason,
+    StrategyConfig,
+    TradingStats,
+)
+from executor import Executor, FILLED, PARTIAL, FAILED
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 
 
 FORCED_EXIT_START = 5
 FORCED_EXIT_END = 1
-POSITION_CHECK_INTERVAL = 3
+POSITION_CHECK_INTERVAL = 0.25
 MAX_EXIT_RETRIES = 3
 EXIT_RETRY_COOLDOWN = 10
 
@@ -66,6 +73,10 @@ class PolyBot:
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             min_bet=float(os.getenv("MIN_BET", "5.0")),
             max_bet=float(os.getenv("MAX_BET", "25.0")),
+            trend_entry_window_seconds=int(os.getenv("TREND_ENTRY_WINDOW_SECONDS", "60")),
+            trend_entry_threshold_pct=float(os.getenv("TREND_ENTRY_THRESHOLD_PCT", "0.03")),
+            trend_entry_skip_threshold_pct=float(os.getenv("TREND_ENTRY_SKIP_THRESHOLD_PCT", "0.20")),
+            trend_trade_amount=float(os.getenv("TREND_TRADE_AMOUNT", os.getenv("MAX_BET", "25.0"))),
         )
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
@@ -76,6 +87,7 @@ class PolyBot:
         self._vol_fallback = 0.12  # used until enough windows accumulate
 
         self.price_feed = BinancePriceFeed()
+        self.poly_feed = PolymarketMarketFeed()
         self.executor = Executor(
             private_key=os.getenv("PRIVATE_KEY", ""),
             safe_address=os.getenv("SAFE_ADDRESS", ""),
@@ -91,8 +103,15 @@ class PolyBot:
         self.stats = TradingStats(bankroll=initial_bankroll)
         self.stats.hourly.hour_start = time.time()
 
+        self._poly_ws_enabled = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
+        self._take_profit_price = float(os.getenv("TAKE_PROFIT_PRICE", "0.70"))
+        self._min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.10"))
+        self._min_profit_usd = float(os.getenv("MIN_PROFIT_USD", "1.00"))
+        self._confirm_ws_sell_price = os.getenv("CONFIRM_WS_SELL_PRICE", "true").lower() == "true"
+
         self._running = False
         self._current_window: int = 0
+        self._current_market = None
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
 
@@ -162,19 +181,19 @@ class PolyBot:
             apply_proxy(proxy_url)
             print(f"✅ Tor active: {proxy_url}\n")
 
-        kf = self.strategy_config.kelly_fraction
-        mp = self.strategy_config.min_prob
-        me = self.strategy_config.min_edge
         print("=" * 55)
         print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
-        print(f"  Kelly: {kf*100:.0f}% fraction | "
-              f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
-        print(f"  Min prob: {mp:.0%} | Min edge: {me:.0%} | Min BTC delta: {self.strategy_config.min_btc_delta:.2f}%")
-        print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
-              f"T-{self.strategy_config.entry_window_end}s")
+        print(f"  Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
+        print(f"  Entry mode: Binance trend scalp")
+        print(f"  Trend trigger: {self.strategy_config.trend_entry_threshold_pct:.3f}% | "
+              f"Skip chase: >{self.strategy_config.trend_entry_skip_threshold_pct:.3f}%")
+        print(f"  Entry window: first {self.strategy_config.trend_entry_window_seconds}s | "
+              f"Trade amount: ${self.strategy_config.trend_trade_amount:.2f}")
+        print(f"  Polymarket WS: {'on' if self._poly_ws_enabled else 'off'} | "
+              f"Take profit: ${self._take_profit_price:.2f} or {self._min_profit_pct:.0%}+")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
-        print(f"  Exits: hold to resolution")
+        print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
@@ -196,6 +215,8 @@ class PolyBot:
             self.tracker.set_session_balance(self.stats.bankroll)
 
         self.price_feed.start()
+        if self._poly_ws_enabled:
+            self.poly_feed.start()
         print("\n⏳ Waiting for BTC price...")
         price = self.price_feed.wait_for_price(timeout=30)
         if not price:
@@ -205,7 +226,7 @@ class PolyBot:
 
         self.telegram.startup_alert({
             "dry_run": self.dry_run,
-            "kelly_fraction": kf,
+            "kelly_fraction": self.strategy_config.kelly_fraction,
             "min_edge": self.strategy_config.min_edge,
             "min_bet": self.strategy_config.min_bet,
             "max_bet": self.strategy_config.max_bet,
@@ -249,6 +270,9 @@ class PolyBot:
             self._opening_price = btc_price
             print(f"  📌 Open: ${btc_price:,.2f}")
 
+        self._ensure_market_subscription()
+        self._refresh_cached_ws_prices()
+
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
             self._manage_position(btc_price, seconds_remaining, now)
@@ -258,29 +282,40 @@ class PolyBot:
         if self._traded or self._trade_attempted:
             return
 
-        # IDLE: look for entry
-        up_price, down_price = self._get_market_prices(btc_price, seconds_remaining)
-
-        realized_vol = self._compute_realized_vol()
-        signal_result = evaluate(
+        # IDLE: watch Binance during the first minute and enter on trend.
+        signal_result = evaluate_trend_entry(
             btc_price=btc_price,
             opening_price=self._opening_price,
-            up_market_price=up_price,
-            down_market_price=down_price,
             seconds_remaining=seconds_remaining,
             bankroll=self.stats.bankroll,
             config=self.strategy_config,
-            realized_vol=realized_vol,
         )
+        skip_reason = get_trend_entry_skip_reason(
+            btc_price=btc_price,
+            opening_price=self._opening_price,
+            seconds_remaining=seconds_remaining,
+            config=self.strategy_config,
+        )
+
+        if skip_reason == "trend_move_too_large":
+            self._trade_attempted = True
+            move = abs(((btc_price - self._opening_price) / self._opening_price) * 100)
+            print(
+                f"  Skip: BTC move {move:.3f}% > "
+                f"{self.strategy_config.trend_entry_skip_threshold_pct:.3f}% chase limit"
+            )
+        elif skip_reason == "entry_window_closed":
+            self._trade_attempted = True
 
         # Store context for window-end no-trade signal logging
         self._last_tick_context = {
             "btc_price": btc_price,
-            "up_price": up_price,
-            "down_price": down_price,
+            "up_price": self._cached_up,
+            "down_price": self._cached_down,
             "seconds_remaining": seconds_remaining,
             "window_ts": self._current_window,
             "signal": signal_result,
+            "skip_reason": skip_reason,
         }
 
         if signal_result:
@@ -292,8 +327,15 @@ class PolyBot:
             d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
             if self._traded:
                 state = "HOLDING"
-            elif self._opening_price > 0 and abs(delta) < self.strategy_config.min_btc_delta:
-                state = f"ΔSMALL ({abs(delta):.3f}%<{self.strategy_config.min_btc_delta:.3f}%)"
+            elif skip_reason == "trend_below_threshold":
+                state = (
+                    f"TREND_WAIT "
+                    f"({abs(delta):.3f}%<{self.strategy_config.trend_entry_threshold_pct:.3f}%)"
+                )
+            elif skip_reason == "entry_window_closed":
+                state = "ENTRY_CLOSED"
+            elif skip_reason == "trend_move_too_large":
+                state = "SKIP_CHASE"
             else:
                 state = "IDLE"
             n = len(self._recent_window_deltas)
@@ -301,7 +343,7 @@ class PolyBot:
             print(
                 f"  ⏱  T-{seconds_remaining:5.1f}s | "
                 f"BTC ${btc_price:,.2f} {d}{abs(delta):.3f}% | "
-                f"UP ${up_price:.3f} DN ${down_price:.3f} | "
+                f"UP ${self._cached_up:.3f} DN ${self._cached_down:.3f} | "
                 f"vol={vol_label} | P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
@@ -339,14 +381,7 @@ class PolyBot:
 
         self._last_position_check = now
 
-        # Get current sell price (for tracking only)
-        if self.dry_run:
-            current_sell_price = round(max(our_prob, 0.01), 2)
-        else:
-            sell_probe = round(self._trade_shares * self._trade_price, 2)
-            current_sell_price = self.executor.get_market_price(
-                self._trade_token_id, "SELL", max(sell_probe, 1.0)
-            )
+        current_sell_price = self._get_live_sell_price(self._trade_token_id, our_prob)
 
         if current_sell_price <= 0:
             return
@@ -360,7 +395,31 @@ class PolyBot:
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
-        # Status line (monitoring only — no exits)
+        target_price = self._profit_target_price()
+        can_sell_notional = self._trade_shares * current_sell_price >= 5.0
+
+        if (
+            current_sell_price >= target_price
+            and unrealized_pnl >= self._min_profit_usd
+            and can_sell_notional
+        ):
+            sell_price = current_sell_price
+            if not self.dry_run and self._confirm_ws_sell_price:
+                probe = max(round(self._trade_shares * current_sell_price, 2), 1.0)
+                confirmed = self.executor.get_market_price(self._trade_token_id, "SELL", probe)
+                if confirmed > 0:
+                    sell_price = confirmed
+                    current_value = self._trade_shares * sell_price
+                    unrealized_pnl = current_value - self._trade_cost
+            if sell_price >= target_price and unrealized_pnl >= self._min_profit_usd:
+                self._exit_position(sell_price, seconds_remaining, "take_profit_ws")
+                return
+
+        if now - self._last_status_print < 5:
+            return
+        self._last_status_print = now
+
+        # Status line
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
         pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
         print(
@@ -368,6 +427,7 @@ class PolyBot:
             f"BTC {d}{abs(btc_delta_pct):.3f}% | "
             f"Prob: {our_prob:.2f} | "
             f"Sell: ${current_sell_price:.3f} | "
+            f"Target: ${target_price:.2f} | "
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
         )
 
@@ -522,14 +582,11 @@ class PolyBot:
             elif self._last_tick_context:
                 # Log the no-trade signal for this window using last tick state
                 ctx = self._last_tick_context
-                skip_reason = get_skip_reason(
+                skip_reason = ctx.get("skip_reason") or get_trend_entry_skip_reason(
                     btc_price=ctx["btc_price"],
                     opening_price=self._opening_price,
-                    up_market_price=ctx["up_price"],
-                    down_market_price=ctx["down_price"],
                     seconds_remaining=ctx["seconds_remaining"],
                     config=self.strategy_config,
-                    realized_vol=self._compute_realized_vol(),
                 )
                 sig = ctx.get("signal")
                 self.tracker.log_signal(
@@ -560,6 +617,7 @@ class PolyBot:
                     self._last_real_balance = real_bal
 
         self._current_window = window_ts
+        self._current_market = None
         self._opening_price = 0.0
         self._traded = False
         self._trade_attempted = False
@@ -600,6 +658,63 @@ class PolyBot:
             except Exception:
                 print(f"  🔌 CLOB health check still failing — staying halted")
 
+    # ── Polymarket live prices ──────────────────────────────────────
+
+    def _ensure_market_subscription(self):
+        if self._current_market:
+            return self._current_market
+
+        market = get_current_market(self.period)
+        if not market:
+            return None
+
+        self._current_market = market
+        if self._poly_ws_enabled:
+            self.poly_feed.subscribe(
+                [market.token_id_up, market.token_id_down],
+                labels={market.token_id_up: "UP", market.token_id_down: "DOWN"},
+            )
+        return market
+
+    def _live_token_price(self, token_id: str):
+        if not self._poly_ws_enabled or not token_id:
+            return None
+        price = self.poly_feed.get_price(token_id)
+        if not price:
+            return None
+        if time.time() - price.timestamp > 10:
+            return None
+        return price
+
+    def _refresh_cached_ws_prices(self):
+        market = self._current_market
+        if not market:
+            return
+        up = self._live_token_price(market.token_id_up)
+        down = self._live_token_price(market.token_id_down)
+        if up:
+            up_price = up.best_ask or up.last_trade or up.mid
+            if up_price > 0:
+                self._cached_up = up_price
+        if down:
+            down_price = down.best_ask or down.last_trade or down.mid
+            if down_price > 0:
+                self._cached_down = down_price
+
+    def _get_live_sell_price(self, token_id: str, fallback_prob: float) -> float:
+        price = self._live_token_price(token_id)
+        if price and price.best_bid > 0:
+            return price.best_bid
+        if self.dry_run:
+            return round(max(fallback_prob, 0.01), 2)
+        sell_probe = round(self._trade_shares * self._trade_price, 2)
+        return self.executor.get_market_price(token_id, "SELL", max(sell_probe, 1.0))
+
+    def _profit_target_price(self) -> float:
+        pct_target = self._trade_price * (1.0 + self._min_profit_pct)
+        fixed_target = self._take_profit_price if self._take_profit_price > 0 else 0.0
+        return round(max(pct_target, fixed_target), 2)
+
     # ── Market prices (cached, complement engine) ───────────────────
 
     def _compute_realized_vol(self) -> float:
@@ -626,12 +741,24 @@ class PolyBot:
             up = round(min(max(implied, 0.02), 0.98), 3)
             return up, round(1.0 - up, 3)
 
+        market = self._ensure_market_subscription()
+        if market:
+            up_live = self._live_token_price(market.token_id_up)
+            down_live = self._live_token_price(market.token_id_down)
+            if up_live and down_live:
+                up_price = up_live.best_ask or up_live.last_trade or up_live.mid
+                down_price = down_live.best_ask or down_live.last_trade or down_live.mid
+                if up_price > 0 and down_price > 0:
+                    self._cached_up = up_price
+                    self._cached_down = down_price
+                    return up_price, down_price
+
         now = time.time()
         if now - self._price_last_fetched < self._PRICE_REFRESH:
             return self._cached_up, self._cached_down
 
         try:
-            market = get_current_market(self.period)
+            market = self._ensure_market_subscription()
             if not market:
                 return self._cached_up, self._cached_down
 
@@ -695,7 +822,7 @@ class PolyBot:
             self.telegram.status_update({"alert": msg})
             return
 
-        market = get_current_market(self.period) if not self.dry_run else None
+        market = self._ensure_market_subscription() if not self.dry_run else None
         token_id = ""
         if market:
             token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
@@ -707,7 +834,7 @@ class PolyBot:
 
         print(f"\n  🎯 {sig.side} | edge={sig.edge:.3f} | "
               f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
-        print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | T-{seconds_remaining:.0f}s")
+        print(f"     Amount: ${trade_amount:.2f} | T-{seconds_remaining:.0f}s")
 
         # Preview actual market price, re-check edge, then pass price into buy()
         # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
@@ -718,7 +845,7 @@ class PolyBot:
                 actual_edge = sig.true_prob - actual_price
                 print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f})")
 
-                if actual_edge < self.strategy_config.min_edge:
+                if False and actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
                     btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
                     self.tracker.log_signal(
@@ -791,7 +918,7 @@ class PolyBot:
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     Holding to resolution (no stops)")
+            print(f"     Watching live Polymarket bid for profit exit")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -1097,6 +1224,7 @@ class PolyBot:
         print(f"\n\n🛑 Shutting down...")
         self._running = False
         self.price_feed.stop()
+        self.poly_feed.stop()
         if self.executor._initialized:
             self.executor.cancel_all()
 

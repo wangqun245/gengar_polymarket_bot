@@ -1,0 +1,3 @@
+start_time,end_time,start_balance,end_balance,real_pnl,tracked_pnl,pnl_drift,trades,wins,losses,win_rate,avg_entry_price,avg_edge,avg_delta
+2026-05-09 11:50:19,2026-05-09 11:50:28,100.0,100.0,0.0,0.0,0.0,0,0,0,0.0,0.0,0.0,0.0
+2026-05-09 11:52:17,2026-05-09 11:54:47,100.0,100.0,0.0,0.0,0.0,0,0,0,0.0,0.0,0.0,0.0

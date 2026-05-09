@@ -1,0 +1,1 @@
+timestamp,window_ts,window_time,btc_price,opening_price,btc_delta_pct,up_price,down_price,seconds_remaining,side,true_prob,market_price,edge,kelly_size,action,skip_reason,actual_price,actual_edge,fill_price,slippage

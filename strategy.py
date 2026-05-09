@@ -36,6 +36,10 @@ class StrategyConfig:
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
     min_bet: float = 5.0            # Polymarket minimum notional
     max_bet: float = 25.0           # Hard cap per trade
+    trend_entry_window_seconds: int = 60
+    trend_entry_threshold_pct: float = 0.03
+    trend_entry_skip_threshold_pct: float = 0.20
+    trend_trade_amount: float = 25.0
 
 
 @dataclass
@@ -244,6 +248,73 @@ def get_skip_reason(
     if edge < config.min_edge:
         return "edge_below_min"
     return ""
+
+
+def get_trend_entry_skip_reason(
+    btc_price: float,
+    opening_price: float,
+    seconds_remaining: float,
+    config: "StrategyConfig" = None,
+) -> str:
+    """Return the current skip reason for the window-open trend entry mode."""
+    if config is None:
+        config = StrategyConfig()
+    if opening_price <= 0:
+        return "no_opening_price"
+
+    elapsed = 300 - seconds_remaining
+    if elapsed < 0:
+        return "before_window"
+    if elapsed > config.trend_entry_window_seconds:
+        return "entry_window_closed"
+
+    btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    abs_delta = abs(btc_delta_pct)
+    if abs_delta < config.trend_entry_threshold_pct:
+        return "trend_below_threshold"
+    if abs_delta > config.trend_entry_skip_threshold_pct:
+        return "trend_move_too_large"
+    return ""
+
+
+def evaluate_trend_entry(
+    btc_price: float,
+    opening_price: float,
+    seconds_remaining: float,
+    bankroll: float = 100.0,
+    config: StrategyConfig = None,
+) -> Optional[TradeSignal]:
+    """Evaluate the early-window Binance trend entry signal."""
+    if config is None:
+        config = StrategyConfig()
+    if opening_price <= 0:
+        return None
+
+    elapsed = 300 - seconds_remaining
+    if elapsed < 0 or elapsed > config.trend_entry_window_seconds:
+        return None
+
+    btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    abs_delta = abs(btc_delta_pct)
+    if abs_delta < config.trend_entry_threshold_pct:
+        return None
+    if abs_delta > config.trend_entry_skip_threshold_pct:
+        return None
+
+    side = "UP" if btc_delta_pct > 0 else "DOWN"
+    trade_amount = min(config.trend_trade_amount, config.max_bet, bankroll)
+    trade_amount = max(trade_amount, config.min_bet)
+
+    return TradeSignal(
+        side=side,
+        confidence=min(abs_delta / config.trend_entry_skip_threshold_pct, 1.0),
+        btc_delta_pct=btc_delta_pct,
+        market_price=0.0,
+        edge=1.0,
+        true_prob=1.0,
+        seconds_remaining=seconds_remaining,
+        kelly_size=trade_amount,
+    )
 
 
 def evaluate(
