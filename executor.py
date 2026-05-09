@@ -278,7 +278,7 @@ class Executor:
             )
 
         if self.dry_run:
-            sim_price = 0.55
+            sim_price = round(price, 2) if price > 0 else 0.55
             return OrderResult(
                 success=True, order_id=f"DRY-{int(time.time())}",
                 status=FILLED, side="BUY", price=sim_price,

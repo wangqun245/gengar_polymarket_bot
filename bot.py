@@ -173,13 +173,7 @@ class PolyBot:
 
     def start(self):
         if not self.dry_run:
-            from proxy import ensure_tor, apply_proxy
-            import logging as _log
-            _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
-            print("\n🧅 Starting Tor proxy for CLOB API...")
-            proxy_url = ensure_tor()
-            apply_proxy(proxy_url)
-            print(f"✅ Tor active: {proxy_url}\n")
+            print("  Direct CLOB connection enabled (Tor disabled)")
 
         print("=" * 55)
         print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
@@ -839,7 +833,9 @@ class PolyBot:
         # Preview actual market price, re-check edge, then pass price into buy()
         # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
         hint_price = 0.0
-        if not self.dry_run and self.executor._initialized:
+        if self.dry_run:
+            hint_price = self._cached_up if sig.side == "UP" else self._cached_down
+        elif self.executor._initialized:
             actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price > 0:
                 actual_edge = sig.true_prob - actual_price
