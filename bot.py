@@ -157,6 +157,8 @@ class PolyBot:
         self._last_hour_check: int = 0
         self._winner_cache: dict = {}
         self._dry_pending_resolutions: list = []
+        self._resolving_window_ts: int = 0
+        self._resolving_window_winner: str = ""
 
         # Trade state
         self._traded: bool = False
@@ -580,16 +582,28 @@ class PolyBot:
             return ""
         if window_ts in self._winner_cache:
             return self._winner_cache[window_ts]
-        winner = get_market_winner(self.period, window_ts) or ""
+        winner = ""
+        for attempt in range(3):
+            winner = get_market_winner(self.period, window_ts) or ""
+            if winner:
+                break
+            if attempt < 2:
+                time.sleep(2)
+
+        window_label = time.strftime("%H:%M", time.localtime(window_ts))
         if winner:
-            print(f"  Polymarket final result: {winner} for {window_ts}")
+            print(f"  Polymarket final result: {winner} for {window_label} ({window_ts})")
             self._winner_cache[window_ts] = winner
         else:
-            print(f"  Polymarket final result not available yet for {window_ts}")
+            print(f"  Polymarket final result not available after 3 tries for {window_label} ({window_ts})")
         return winner
 
-    def _dry_run_resolution_won(self, side: str) -> Optional[bool]:
-        winner = self._polymarket_winner_for_window()
+    def _dry_run_resolution_won(self, side: str, window_ts: int = None) -> Optional[bool]:
+        window_ts = window_ts or self._current_window
+        if window_ts == self._resolving_window_ts:
+            winner = self._resolving_window_winner
+        else:
+            winner = self._polymarket_winner_for_window(window_ts)
         if not winner:
             return None
         return winner == side
@@ -776,6 +790,11 @@ class PolyBot:
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         self._process_dry_pending_resolutions()
         if self._current_window > 0:
+            self._resolving_window_ts = self._current_window
+            self._resolving_window_winner = (
+                self._polymarket_winner_for_window(self._current_window)
+                if self.dry_run else ""
+            )
             # Resolve any pending phantom sell from the previous window.
             # Must run before trade state is reset below.
             # Balance is fetched once here and reused by the sync below.
@@ -931,6 +950,9 @@ class PolyBot:
                               f"${real_bal:.2f} (drift ${drift:.2f})")
                     self.stats.bankroll = real_bal
                     self._last_real_balance = real_bal
+
+            self._resolving_window_ts = 0
+            self._resolving_window_winner = ""
 
         self._current_window = window_ts
         self._current_market = None
@@ -1468,7 +1490,7 @@ class PolyBot:
         if not self._cheap_traded or self._cheap_exited:
             return
         if self.dry_run:
-            won = self._dry_run_resolution_won(self._cheap_side)
+            won = self._dry_run_resolution_won(self._cheap_side, self._current_window)
             if won is None:
                 print("  Cheap scalp dry-run resolution pending Polymarket final result")
                 self._queue_dry_resolution(
@@ -1692,7 +1714,7 @@ class PolyBot:
         if not self._relative_traded or self._relative_exited:
             return
         if self.dry_run:
-            won = self._dry_run_resolution_won(self._relative_side)
+            won = self._dry_run_resolution_won(self._relative_side, self._current_window)
             if won is None:
                 print("  Relative overreaction dry-run resolution pending Polymarket final result")
                 self._queue_dry_resolution(
@@ -1908,7 +1930,7 @@ class PolyBot:
         if not self._panic_traded or self._panic_exited:
             return
         if self.dry_run:
-            won = self._dry_run_resolution_won(self._panic_side)
+            won = self._dry_run_resolution_won(self._panic_side, self._current_window)
             if won is None:
                 print("  Panic rebound dry-run resolution pending Polymarket final result")
                 self._queue_dry_resolution(
@@ -2256,7 +2278,7 @@ class PolyBot:
 
         # ── Dry run: Binance price fallback ──────────────────────────
         if self.dry_run:
-            won = self._dry_run_resolution_won(self._trade_side)
+            won = self._dry_run_resolution_won(self._trade_side, self._current_window)
             if won is None:
                 print("  Trend follow dry-run resolution pending Polymarket final result")
                 self._queue_dry_resolution(
