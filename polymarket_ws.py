@@ -65,13 +65,14 @@ class PolymarketMarketFeed:
                 return
             self._asset_ids = clean_ids
             self._labels = {str(k): v for k, v in labels.items()}
+            self._prices = {}
             for asset_id in clean_ids:
-                self._prices.setdefault(
-                    asset_id,
-                    TokenPrice(asset_id=asset_id, label=self._labels.get(asset_id, "")),
+                self._prices[asset_id] = TokenPrice(
+                    asset_id=asset_id,
+                    label=self._labels.get(asset_id, ""),
                 )
-                self._prices[asset_id].label = self._labels.get(asset_id, "")
             self._subscription_version += 1
+            self._last_message = 0.0
         short = ", ".join(f"{self._labels.get(a, '')}:{a[:8]}" for a in clean_ids)
         print(f"[poly-ws] Subscribed assets: {short}")
 
@@ -232,6 +233,8 @@ class PolymarketMarketFeed:
         timestamp=None,
     ):
         with self._lock:
+            if asset_id not in self._asset_ids:
+                return
             price = self._prices.setdefault(
                 asset_id,
                 TokenPrice(asset_id=asset_id, label=self._labels.get(asset_id, "")),

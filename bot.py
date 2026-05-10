@@ -142,14 +142,17 @@ class PolyBot:
             os.getenv("RELATIVE_OVERREACTION_PRICE", os.getenv("RELATIVE_OVERREACTION_CENTS", "0.10"))
         )
         self._relative_trade_amount = float(os.getenv("RELATIVE_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
+        self._relative_min_buy_price = float(os.getenv("RELATIVE_MIN_BUY_PRICE", "0.05"))
         self._relative_max_buy_price = float(os.getenv("RELATIVE_MAX_BUY_PRICE", "0.65"))
         self._relative_take_profit_price = float(os.getenv("RELATIVE_TAKE_PROFIT_PRICE", "0.55"))
         self._relative_min_profit_pct = float(os.getenv("RELATIVE_MIN_PROFIT_PCT", "0.10"))
         self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
+        self._poly_ws_warmup_seconds = float(os.getenv("POLYMARKET_WS_WARMUP_SECONDS", "2.0"))
 
         self._running = False
         self._current_window: int = 0
         self._current_market = None
+        self._market_subscription_time: float = 0.0
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
         self._winner_cache: dict = {}
@@ -395,19 +398,27 @@ class PolyBot:
             print(f"  📌 Open: ${btc_price:,.2f}")
 
         self._ensure_market_subscription()
+        ws_warmed = (
+            not self._poly_ws_enabled
+            or (
+                self._market_subscription_time > 0
+                and now - self._market_subscription_time >= self._poly_ws_warmup_seconds
+            )
+        )
         self._refresh_cached_ws_prices()
-        self._update_realtime_history(now, btc_price)
-        self._update_panic_price_history(now)
+        if ws_warmed:
+            self._update_realtime_history(now, btc_price)
+            self._update_panic_price_history(now)
 
-        self._manage_relative_reaction(seconds_remaining, now)
-        if not self._relative_traded and not self._relative_trade_attempted:
-            self._try_relative_reaction_entry(seconds_remaining)
-        self._manage_cheap_scalp(seconds_remaining, now)
-        if not self._cheap_traded and not self._cheap_trade_attempted:
-            self._try_cheap_scalp_entry(seconds_remaining)
-        self._manage_panic_rebound(seconds_remaining, now)
-        if not self._panic_traded and not self._panic_trade_attempted:
-            self._try_panic_rebound_entry(btc_price, seconds_remaining)
+            self._manage_relative_reaction(seconds_remaining, now)
+            if not self._relative_traded and not self._relative_trade_attempted:
+                self._try_relative_reaction_entry(seconds_remaining)
+            self._manage_cheap_scalp(seconds_remaining, now)
+            if not self._cheap_traded and not self._cheap_trade_attempted:
+                self._try_cheap_scalp_entry(seconds_remaining)
+            self._manage_panic_rebound(seconds_remaining, now)
+            if not self._panic_traded and not self._panic_trade_attempted:
+                self._try_panic_rebound_entry(btc_price, seconds_remaining)
 
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
@@ -923,6 +934,7 @@ class PolyBot:
 
         self._current_window = window_ts
         self._current_market = None
+        self._market_subscription_time = 0.0
         self._opening_price = 0.0
         self._traded = False
         self._trade_attempted = False
@@ -955,6 +967,7 @@ class PolyBot:
         self._relative_shares = 0.0
         self._relative_exit_revenue = 0.0
         self._relative_last_check = 0.0
+        self._realtime_history = []
         self._clear_pending_relative_buy()
         self._panic_traded = False
         self._panic_trade_attempted = False
@@ -1092,6 +1105,7 @@ class PolyBot:
             return None
 
         self._current_market = market
+        self._market_subscription_time = time.time()
         if self._poly_ws_enabled:
             self.poly_feed.subscribe(
                 [market.token_id_up, market.token_id_down],
@@ -1105,7 +1119,11 @@ class PolyBot:
         price = self.poly_feed.get_price(token_id)
         if not price:
             return None
+        if self._market_subscription_time > 0 and price.timestamp < self._market_subscription_time:
+            return None
         if time.time() - price.timestamp > 10:
+            return None
+        if price.best_bid > 0 and price.best_ask > 0 and price.best_bid >= price.best_ask:
             return None
         return price
 
@@ -1583,6 +1601,12 @@ class PolyBot:
         if actual_price <= 0:
             return
         cap_price = min(self._relative_max_buy_price, max_buy_price())
+        if actual_price < self._relative_min_buy_price:
+            print(
+                f"  Relative skip {side}: executable ${actual_price:.3f} "
+                f"< min ${self._relative_min_buy_price:.2f}"
+            )
+            return
         if actual_price > cap_price:
             print(f"  Relative skip {side}: executable ${actual_price:.3f} > cap ${cap_price:.2f}")
             return
