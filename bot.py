@@ -714,11 +714,17 @@ class PolyBot:
                             # Settlement landed — it was a real win
                             profit = balance_increase - pp["cost"]
                             self.stats.record_win(profit)
+                            self._update_strategy_pnl("trend", "Trend follow", profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.win_alert(profit, self.stats.total_pnl)
+                            self.telegram.strategy_result_alert(
+                                strategy="Trend follow",
+                                profit=profit,
+                                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                                total_pnl=self.stats.total_pnl,
+                            )
                             btc_price, _ = self.price_feed.get_price()
                             self.tracker.log_trade_resolve(
                                 btc_final_price=btc_price,
@@ -733,11 +739,18 @@ class PolyBot:
                             # Balance still hasn't moved — genuine loss
                             net_loss = pp["cost"] - pp["exit_revenue"]
                             self.stats.record_loss(net_loss)
+                            profit = -net_loss
+                            self._update_strategy_pnl("trend", "Trend follow", profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+                            self.telegram.strategy_result_alert(
+                                strategy="Trend follow",
+                                profit=profit,
+                                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                                total_pnl=self.stats.total_pnl,
+                            )
                             btc_price, _ = self.price_feed.get_price()
                             self.tracker.log_trade_resolve(
                                 btc_final_price=btc_price,
@@ -753,6 +766,7 @@ class PolyBot:
                     # Dry run or executor not ready — treat as loss
                     net_loss = pp["cost"] - pp["exit_revenue"]
                     self.stats.record_loss(net_loss)
+                    self._update_strategy_pnl("trend", "Trend follow", -net_loss)
                     self._pending_phantom = {}
 
             # Record closing delta for rolling vol calculation
@@ -2147,7 +2161,13 @@ class PolyBot:
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+            self._update_strategy_pnl("trend", "Trend follow", profit)
+            self.telegram.strategy_result_alert(
+                strategy="Trend follow",
+                profit=profit,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
+            )
             btc_price, _ = self.price_feed.get_price()
             self.tracker.log_trade_resolve(
                 btc_final_price=btc_price,
