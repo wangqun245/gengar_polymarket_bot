@@ -82,6 +82,12 @@ class PolyBot:
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
         self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
+        self._strategy_daily_loss_limits = {
+            "trend": float(os.getenv("TREND_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+            "cheap": float(os.getenv("CHEAP_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+            "panic": float(os.getenv("PANIC_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+            "relative": float(os.getenv("RELATIVE_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+        }
         self._rolling_vol_windows = int(os.getenv("ROLLING_VOL_WINDOWS", "12"))
         self._vol_floor = float(os.getenv("VOL_FLOOR", "0.06"))
         self._vol_cap = float(os.getenv("VOL_CAP", "0.30"))
@@ -116,6 +122,29 @@ class PolyBot:
         self._cheap_take_profit_price = float(os.getenv("CHEAP_BUY_TAKE_PROFIT_PRICE", "0.30"))
         self._cheap_min_profit_pct = float(os.getenv("CHEAP_BUY_MIN_PROFIT_PCT", "0.10"))
         self._cheap_min_profit_usd = float(os.getenv("CHEAP_BUY_MIN_PROFIT_USD", "1.00"))
+        self._panic_enabled = os.getenv("PANIC_BUY_ENABLED", "true").lower() == "true"
+        self._panic_lookback_seconds = int(os.getenv("PANIC_LOOKBACK_SECONDS", "20"))
+        self._panic_drop_pct = float(os.getenv("PANIC_DROP_PCT", "0.25"))
+        self._panic_max_buy_price = float(os.getenv("PANIC_MAX_BUY_PRICE", "0.45"))
+        self._panic_max_btc_against_pct = float(os.getenv("PANIC_MAX_BTC_AGAINST_PCT", "0.08"))
+        self._panic_entry_window_seconds = int(os.getenv("PANIC_ENTRY_WINDOW_SECONDS", "240"))
+        self._panic_trade_amount = float(os.getenv("PANIC_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
+        self._panic_take_profit_price = float(os.getenv("PANIC_TAKE_PROFIT_PRICE", "0.55"))
+        self._panic_min_profit_pct = float(os.getenv("PANIC_MIN_PROFIT_PCT", "0.12"))
+        self._panic_min_profit_usd = float(os.getenv("PANIC_MIN_PROFIT_USD", "1.00"))
+        self._realtime_to_save = int(os.getenv("REALTIME_TO_SAVE", "120"))
+        self._relative_enabled = os.getenv("RELATIVE_REACTION_ENABLED", "true").lower() == "true"
+        self._relative_entry_window_seconds = int(os.getenv("RELATIVE_ENTRY_WINDOW_SECONDS", "120"))
+        self._relative_lookback_seconds = int(os.getenv("RELATIVE_LOOKBACK_SECONDS", str(self._realtime_to_save)))
+        self._relative_min_btc_move_pct = float(os.getenv("RELATIVE_MIN_BTC_MOVE_PCT", "0.02"))
+        self._relative_overreaction_price = float(
+            os.getenv("RELATIVE_OVERREACTION_PRICE", os.getenv("RELATIVE_OVERREACTION_CENTS", "0.10"))
+        )
+        self._relative_trade_amount = float(os.getenv("RELATIVE_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
+        self._relative_max_buy_price = float(os.getenv("RELATIVE_MAX_BUY_PRICE", "0.65"))
+        self._relative_take_profit_price = float(os.getenv("RELATIVE_TAKE_PROFIT_PRICE", "0.55"))
+        self._relative_min_profit_pct = float(os.getenv("RELATIVE_MIN_PROFIT_PCT", "0.10"))
+        self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
 
         self._running = False
         self._current_window: int = 0
@@ -165,6 +194,52 @@ class PolyBot:
         self._cheap_pending_shares: float = 0.0
         self._cheap_pending_balance_before: float = 0.0
         self._cheap_pending_last_check: float = 0.0
+
+        # Strategy-level risk and P&L
+        self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
+        self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False}
+
+        # Fourth strategy: Binance/Polymarket relative overreaction
+        self._realtime_history = []
+        self._relative_traded: bool = False
+        self._relative_trade_attempted: bool = False
+        self._relative_exited: bool = False
+        self._relative_side: str = ""
+        self._relative_token_id: str = ""
+        self._relative_price: float = 0.0
+        self._relative_cost: float = 0.0
+        self._relative_shares: float = 0.0
+        self._relative_exit_revenue: float = 0.0
+        self._relative_last_check: float = 0.0
+        self._relative_pending_side: str = ""
+        self._relative_pending_token_id: str = ""
+        self._relative_pending_order_id: str = ""
+        self._relative_pending_price: float = 0.0
+        self._relative_pending_amount: float = 0.0
+        self._relative_pending_shares: float = 0.0
+        self._relative_pending_balance_before: float = 0.0
+        self._relative_pending_last_check: float = 0.0
+
+        # Third strategy: panic sell rebound
+        self._panic_traded: bool = False
+        self._panic_trade_attempted: bool = False
+        self._panic_exited: bool = False
+        self._panic_side: str = ""
+        self._panic_token_id: str = ""
+        self._panic_price: float = 0.0
+        self._panic_cost: float = 0.0
+        self._panic_shares: float = 0.0
+        self._panic_exit_revenue: float = 0.0
+        self._panic_last_check: float = 0.0
+        self._panic_price_history = {"UP": [], "DOWN": []}
+        self._panic_pending_side: str = ""
+        self._panic_pending_token_id: str = ""
+        self._panic_pending_order_id: str = ""
+        self._panic_pending_price: float = 0.0
+        self._panic_pending_amount: float = 0.0
+        self._panic_pending_shares: float = 0.0
+        self._panic_pending_balance_before: float = 0.0
+        self._panic_pending_last_check: float = 0.0
 
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
         # Resolved at next window boundary once Polygon settlement has had time to land.
@@ -222,9 +297,20 @@ class PolyBot:
               f"entry <= ${self._cheap_entry_price:.2f} for first {self._cheap_entry_window_seconds}s")
         print(f"  Cheap scalp exit: ${self._cheap_take_profit_price:.2f} or "
               f"{self._cheap_min_profit_pct:.0%}+ / ${self._cheap_min_profit_usd:.2f}+")
+        print(f"  Panic rebound: {'on' if self._panic_enabled else 'off'} | "
+              f"drop {self._panic_drop_pct:.0%} / buy <= ${self._panic_max_buy_price:.2f}")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
         print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
+        print(
+            "  Strategy loss limits: "
+            f"trend ${self._strategy_daily_loss_limits['trend']:.0f} | "
+            f"cheap ${self._strategy_daily_loss_limits['cheap']:.0f} | "
+            f"panic ${self._strategy_daily_loss_limits['panic']:.0f} | "
+            f"relative ${self._strategy_daily_loss_limits['relative']:.0f}"
+        )
+        print(f"  Relative overreaction: {'on' if self._relative_enabled else 'off'} | "
+              f"entry first {self._relative_entry_window_seconds}s | save {self._realtime_to_save}s")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -293,6 +379,8 @@ class PolyBot:
 
         self._check_pending_buy_fill(now)
         self._check_pending_cheap_buy(now)
+        self._check_pending_panic_buy(now)
+        self._check_pending_relative_buy(now)
 
         if window_ts != self._current_window:
             self._on_new_window(window_ts, closing_btc_price=btc_price)
@@ -305,10 +393,18 @@ class PolyBot:
 
         self._ensure_market_subscription()
         self._refresh_cached_ws_prices()
+        self._update_realtime_history(now, btc_price)
+        self._update_panic_price_history(now)
 
+        self._manage_relative_reaction(seconds_remaining, now)
+        if not self._relative_traded and not self._relative_trade_attempted:
+            self._try_relative_reaction_entry(seconds_remaining)
         self._manage_cheap_scalp(seconds_remaining, now)
         if not self._cheap_traded and not self._cheap_trade_attempted:
             self._try_cheap_scalp_entry(seconds_remaining)
+        self._manage_panic_rebound(seconds_remaining, now)
+        if not self._panic_traded and not self._panic_trade_attempted:
+            self._try_panic_rebound_entry(btc_price, seconds_remaining)
 
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
@@ -387,6 +483,82 @@ class PolyBot:
     # ── Active position management ──────────────────────────────────
 
     # ── Position monitoring (hold to resolution) ────────────────────
+
+    def _check_daily_loss_limit(self, label: str = "trade") -> bool:
+        if self._daily_loss_halted:
+            print(f"  DAILY LOSS LIMIT - skipping {label} "
+                  f"(session P&L ${self.stats.total_pnl:+.2f})")
+            return False
+
+        session_pnl = self.stats.bankroll - self._session_start_balance
+        if session_pnl <= -self._daily_loss_limit:
+            self._daily_loss_halted = True
+            msg = (f"DAILY LOSS LIMIT HIT: ${session_pnl:+.2f} "
+                   f"(limit -${self._daily_loss_limit:.0f}) - stopping trades")
+            print(f"\n  {msg}")
+            self.telegram.status_update({"alert": msg})
+            return False
+        return True
+
+    def _check_strategy_daily_loss_limit(self, key: str, label: str) -> bool:
+        limit = self._strategy_daily_loss_limits.get(key, 0.0)
+        if limit <= 0:
+            return True
+        strategy_pnl = self._strategy_pnl.get(key, 0.0)
+        if self._strategy_loss_halted.get(key, False):
+            print(
+                f"  {label.upper()} LOSS LIMIT - skipping "
+                f"(strategy P&L ${strategy_pnl:+.2f}, limit -${limit:.0f})"
+            )
+            return False
+        if strategy_pnl <= -limit:
+            self._strategy_loss_halted[key] = True
+            msg = (
+                f"{label} DAILY LOSS LIMIT HIT: ${strategy_pnl:+.2f} "
+                f"(limit -${limit:.0f}) - stopping only this strategy"
+            )
+            print(f"\n  {msg}")
+            self.telegram.status_update({"alert": msg})
+            return False
+        return True
+
+    def _check_risk_limits(self, key: str, label: str) -> bool:
+        return (
+            self._check_daily_loss_limit(label)
+            and self._check_strategy_daily_loss_limit(key, label)
+        )
+
+    def _update_strategy_pnl(self, key: str, label: str, profit: float):
+        self._strategy_pnl[key] = self._strategy_pnl.get(key, 0.0) + profit
+        self._check_strategy_daily_loss_limit(key, label)
+
+    def _record_cheap_result(self, profit: float):
+        self._record_strategy_result("cheap", "Cheap scalp", profit)
+
+    def _record_panic_result(self, profit: float):
+        self._record_strategy_result("panic", "Panic rebound", profit)
+
+    def _record_relative_result(self, profit: float):
+        self._record_strategy_result("relative", "Relative overreaction", profit)
+
+    def _record_strategy_result(self, key: str, label: str, profit: float):
+        self._update_strategy_pnl(key, label, profit)
+        self.stats.total_trades += 1
+        if profit > 0:
+            self.stats.wins += 1
+            self.stats.total_pnl += profit
+            self.stats.hourly.record_result(profit, won=True)
+        else:
+            loss = abs(profit)
+            self.stats.losses += 1
+            self.stats.total_pnl -= loss
+            self.stats.hourly.record_result(-loss, won=False)
+        self.telegram.strategy_result_alert(
+            strategy=label,
+            profit=profit,
+            strategy_pnl=self._strategy_pnl.get(key, 0.0),
+            total_pnl=self.stats.total_pnl,
+        )
 
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
         """Monitor only — all trades hold to resolution. No stops.
@@ -618,6 +790,18 @@ class PolyBot:
 
             if self._cheap_traded and not self._cheap_exited:
                 self._resolve_cheap_scalp(closing_btc_price)
+            if self._relative_pending_side and not self._relative_traded:
+                if not self.dry_run and self.executor._initialized:
+                    self._relative_pending_last_check = 0.0
+                    self._check_pending_relative_buy(time.time())
+            if self._relative_traded and not self._relative_exited:
+                self._resolve_relative_reaction(closing_btc_price)
+            if self._panic_pending_side and not self._panic_traded:
+                if not self.dry_run and self.executor._initialized:
+                    self._panic_pending_last_check = 0.0
+                    self._check_pending_panic_buy(time.time())
+            if self._panic_traded and not self._panic_exited:
+                self._resolve_panic_rebound(closing_btc_price)
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -683,6 +867,29 @@ class PolyBot:
         self._cheap_exit_revenue = 0.0
         self._cheap_last_check = 0.0
         self._clear_pending_cheap_buy()
+        self._relative_traded = False
+        self._relative_trade_attempted = False
+        self._relative_exited = False
+        self._relative_side = ""
+        self._relative_token_id = ""
+        self._relative_price = 0.0
+        self._relative_cost = 0.0
+        self._relative_shares = 0.0
+        self._relative_exit_revenue = 0.0
+        self._relative_last_check = 0.0
+        self._clear_pending_relative_buy()
+        self._panic_traded = False
+        self._panic_trade_attempted = False
+        self._panic_exited = False
+        self._panic_side = ""
+        self._panic_token_id = ""
+        self._panic_price = 0.0
+        self._panic_cost = 0.0
+        self._panic_shares = 0.0
+        self._panic_exit_revenue = 0.0
+        self._panic_last_check = 0.0
+        self._panic_price_history = {"UP": [], "DOWN": []}
+        self._clear_pending_panic_buy()
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -839,6 +1046,92 @@ class PolyBot:
             if down_price > 0:
                 self._cached_down = down_price
 
+    def _update_realtime_history(self, now: float, btc_price: float):
+        market = self._current_market
+        if not market or btc_price <= 0:
+            return
+        up = self._live_token_price(market.token_id_up)
+        down = self._live_token_price(market.token_id_down)
+        up_ask = up.best_ask if up else 0.0
+        up_bid = up.best_bid if up else 0.0
+        down_ask = down.best_ask if down else 0.0
+        down_bid = down.best_bid if down else 0.0
+        if up_ask <= 0 and down_ask <= 0:
+            return
+        self._realtime_history.append({
+            "ts": now,
+            "btc": btc_price,
+            "UP_ask": up_ask,
+            "UP_bid": up_bid,
+            "DOWN_ask": down_ask,
+            "DOWN_bid": down_bid,
+        })
+        cutoff = now - max(self._realtime_to_save, 1)
+        while self._realtime_history and self._realtime_history[0]["ts"] < cutoff:
+            self._realtime_history.pop(0)
+
+    def _history_row_at_or_before(self, target_ts: float):
+        candidate = None
+        for row in self._realtime_history:
+            if row["ts"] <= target_ts:
+                candidate = row
+            else:
+                break
+        return candidate or (self._realtime_history[0] if self._realtime_history else None)
+
+    def _relative_expected_poly_move(self, side: str, btc_delta_pct: float, current_ts: float):
+        actuals = []
+        for row in self._realtime_history[:-1]:
+            base = self._history_row_at_or_before(row["ts"] - self._relative_lookback_seconds)
+            if not base or base is row or base["btc"] <= 0:
+                continue
+            base_price = base.get(f"{side}_ask", 0.0)
+            row_price = row.get(f"{side}_ask", 0.0)
+            if base_price <= 0 or row_price <= 0:
+                continue
+            hist_btc_delta = ((row["btc"] - base["btc"]) / base["btc"]) * 100
+            if abs(hist_btc_delta) < self._relative_min_btc_move_pct:
+                continue
+            if hist_btc_delta * btc_delta_pct <= 0:
+                continue
+            actuals.append(row_price - base_price)
+
+        if actuals:
+            return statistics.median(actuals)
+
+        # Fallback until enough same-direction history exists in the saved buffer.
+        direction = 1 if btc_delta_pct > 0 else -1
+        side_sign = 1 if side == "UP" else -1
+        return direction * side_sign * 0.20
+
+    def _relative_reaction_signal(self):
+        if len(self._realtime_history) < 3 or not self._current_market:
+            return None
+        now = time.time()
+        current = self._realtime_history[-1]
+        baseline = self._history_row_at_or_before(now - self._relative_lookback_seconds)
+        if not baseline or baseline["btc"] <= 0:
+            return None
+        btc_delta_pct = ((current["btc"] - baseline["btc"]) / baseline["btc"]) * 100
+        if abs(btc_delta_pct) < self._relative_min_btc_move_pct:
+            return None
+
+        candidates = []
+        for side, token_id in (("UP", self._current_market.token_id_up), ("DOWN", self._current_market.token_id_down)):
+            base_ask = baseline.get(f"{side}_ask", 0.0)
+            current_ask = current.get(f"{side}_ask", 0.0)
+            if base_ask <= 0 or current_ask <= 0:
+                continue
+            actual_move = current_ask - base_ask
+            expected_move = self._relative_expected_poly_move(side, btc_delta_pct, now)
+            gap = actual_move - expected_move
+            if gap <= -self._relative_overreaction_price:
+                candidates.append((abs(gap), side, token_id, current_ask, actual_move, expected_move, btc_delta_pct))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0]
+
     def _get_live_sell_price(self, token_id: str, fallback_prob: float) -> float:
         price = self._live_token_price(token_id)
         if price and price.best_bid > 0:
@@ -860,6 +1153,27 @@ class PolyBot:
         pct_target = self._cheap_price * (1.0 + self._cheap_min_profit_pct)
         fixed_target = self._cheap_take_profit_price if self._cheap_take_profit_price > 0 else 0.0
         return round(max(pct_target, fixed_target), 2)
+
+    def _panic_profit_target_price(self) -> float:
+        pct_target = self._panic_price * (1.0 + self._panic_min_profit_pct)
+        fixed_target = self._panic_take_profit_price if self._panic_take_profit_price > 0 else 0.0
+        return round(max(pct_target, fixed_target), 2)
+
+    def _update_panic_price_history(self, now: float):
+        market = self._current_market
+        if not market:
+            return
+        for side, token_id in (("UP", market.token_id_up), ("DOWN", market.token_id_down)):
+            price = self._live_token_price(token_id)
+            ask = price.best_ask if price else 0.0
+            bid = price.best_bid if price else 0.0
+            if ask <= 0:
+                continue
+            history = self._panic_price_history[side]
+            history.append((now, ask, bid))
+            cutoff = now - max(self._panic_lookback_seconds, 1)
+            while history and history[0][0] < cutoff:
+                history.pop(0)
 
     def _cheap_scalp_candidate(self):
         market = self._current_market
@@ -894,10 +1208,21 @@ class PolyBot:
         self._cheap_cost = amount
         self._cheap_shares = shares
         self.stats.bankroll -= amount
+        self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_cheap_buy()
         print(
             f"  Cheap scalp bought: {shares:.0f} {side} "
             f"@ ${price:.3f} = ${amount:.2f}"
+        )
+        self.telegram.strategy_trade_alert(
+            strategy="Cheap scalp",
+            side=side,
+            price=price,
+            amount=amount,
+            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
+            dry_run=self.dry_run,
+            strategy_pnl=self._strategy_pnl.get("cheap", 0.0),
+            total_pnl=self.stats.total_pnl,
         )
 
     def _check_pending_cheap_buy(self, now: float):
@@ -939,6 +1264,9 @@ class PolyBot:
 
     def _try_cheap_scalp_entry(self, seconds_remaining: float):
         if not self._cheap_scalp_enabled:
+            return
+        if not self._check_risk_limits("cheap", "cheap scalp"):
+            self._cheap_trade_attempted = True
             return
         if not self.dry_run and not self.executor._initialized:
             return
@@ -1034,6 +1362,7 @@ class PolyBot:
             self._cheap_exit_revenue += result.amount_usd
             self.stats.bankroll += result.amount_usd
             profit = self._cheap_exit_revenue - self._cheap_cost
+            self._record_cheap_result(profit)
             print(
                 f"  Cheap scalp exit: {result.shares:.0f} {self._cheap_side} "
                 f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
@@ -1053,15 +1382,417 @@ class PolyBot:
                 claim = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=0.99)
                 revenue = claim.amount_usd if claim.success else self._cheap_shares
             profit = revenue - self._cheap_cost
-            self.stats.bankroll += self._cheap_cost
-            self.stats.record_win(profit)
+            self.stats.bankroll += revenue
+            self._record_cheap_result(profit)
             print(f"  Cheap scalp resolved WIN +${profit:.2f}")
         else:
             loss = self._cheap_cost - self._cheap_exit_revenue
-            self.stats.bankroll += self._cheap_cost
-            self.stats.record_loss(loss)
+            self._record_cheap_result(-loss)
             print(f"  Cheap scalp resolved LOSS -${loss:.2f}")
         self._cheap_exited = True
+
+    def _relative_profit_target_price(self) -> float:
+        pct_target = self._relative_price * (1.0 + self._relative_min_profit_pct)
+        fixed_target = self._relative_take_profit_price if self._relative_take_profit_price > 0 else 0.0
+        return round(max(pct_target, fixed_target), 2)
+
+    def _clear_pending_relative_buy(self):
+        self._relative_pending_side = ""
+        self._relative_pending_token_id = ""
+        self._relative_pending_order_id = ""
+        self._relative_pending_price = 0.0
+        self._relative_pending_amount = 0.0
+        self._relative_pending_shares = 0.0
+        self._relative_pending_balance_before = 0.0
+        self._relative_pending_last_check = 0.0
+
+    def _activate_relative_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
+        self._relative_traded = True
+        self._relative_side = side
+        self._relative_token_id = token_id
+        self._relative_price = price
+        self._relative_cost = amount
+        self._relative_shares = shares
+        self.stats.bankroll -= amount
+        self.stats.hourly.record_trade(0.0, 0.0)
+        self._clear_pending_relative_buy()
+        print(f"  Relative overreaction bought: {shares:.0f} {side} @ ${price:.3f} = ${amount:.2f}")
+        self.telegram.strategy_trade_alert(
+            strategy="Relative overreaction",
+            side=side,
+            price=price,
+            amount=amount,
+            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
+            dry_run=self.dry_run,
+            strategy_pnl=self._strategy_pnl.get("relative", 0.0),
+            total_pnl=self.stats.total_pnl,
+        )
+
+    def _check_pending_relative_buy(self, now: float):
+        if not self._relative_pending_side or self._relative_traded or self.dry_run:
+            return
+        if now - self._relative_pending_last_check < 2.0:
+            return
+        self._relative_pending_last_check = now
+
+        if self._relative_pending_order_id and self.executor._initialized:
+            matched = self.executor.check_buy_fill(
+                self._relative_pending_order_id,
+                self._relative_pending_price,
+            )
+            if matched:
+                self._activate_relative_buy(
+                    self._relative_pending_side,
+                    self._relative_pending_token_id,
+                    matched[0],
+                    matched[1],
+                    matched[2],
+                )
+                return
+
+        if self.executor._initialized and self._relative_pending_balance_before > 0:
+            real_bal = self.executor.get_balance()
+            spent = self._relative_pending_balance_before - real_bal if real_bal > 0 else 0.0
+            if spent > 1.0:
+                shares = spent / self._relative_pending_price if self._relative_pending_price > 0 else self._relative_pending_shares
+                self.stats.bankroll = real_bal + spent
+                self._last_real_balance = real_bal
+                self._activate_relative_buy(
+                    self._relative_pending_side,
+                    self._relative_pending_token_id,
+                    self._relative_pending_price,
+                    spent,
+                    shares,
+                )
+
+    def _try_relative_reaction_entry(self, seconds_remaining: float):
+        if not self._relative_enabled:
+            return
+        if not self._check_risk_limits("relative", "relative overreaction"):
+            self._relative_trade_attempted = True
+            return
+        if not self.dry_run and not self.executor._initialized:
+            return
+        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
+        if elapsed < 0:
+            return
+        if elapsed > self._relative_entry_window_seconds:
+            self._relative_trade_attempted = True
+            return
+        signal = self._relative_reaction_signal()
+        if not signal:
+            return
+        gap_abs, side, token_id, ws_ask, actual_move, expected_move, btc_delta_pct = signal
+        trade_amount = round(min(self._relative_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
+        if trade_amount < self.strategy_config.min_bet:
+            return
+        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
+        if actual_price <= 0:
+            return
+        cap_price = min(self._relative_max_buy_price, max_buy_price())
+        if actual_price > cap_price:
+            print(f"  Relative skip {side}: executable ${actual_price:.3f} > cap ${cap_price:.2f}")
+            return
+
+        print(
+            f"\n  Relative overreaction {side}: BTC {btc_delta_pct:+.3f}% | "
+            f"poly actual {actual_move:+.3f}, expected {expected_move:+.3f}, gap -${gap_abs:.3f}"
+        )
+        self._relative_trade_attempted = True
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._relative_pending_side = side
+                self._relative_pending_token_id = token_id
+                self._relative_pending_order_id = result.order_id
+                self._relative_pending_price = result.price
+                self._relative_pending_amount = result.amount_usd
+                self._relative_pending_shares = result.shares
+                self._relative_pending_balance_before = self.stats.bankroll
+                self._relative_pending_last_check = 0.0
+                print("  Relative overreaction buy unverified - will poll order API and balance")
+                return
+            print(f"  Relative overreaction buy failed: {result.error}")
+            return
+        self._activate_relative_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
+    def _relative_is_overbought_exit(self) -> bool:
+        if not self._relative_traded or len(self._realtime_history) < 3:
+            return False
+        now = time.time()
+        current = self._realtime_history[-1]
+        baseline = self._history_row_at_or_before(now - self._relative_lookback_seconds)
+        if not baseline or baseline["btc"] <= 0:
+            return False
+        btc_delta_pct = ((current["btc"] - baseline["btc"]) / baseline["btc"]) * 100
+        if abs(btc_delta_pct) < self._relative_min_btc_move_pct:
+            return False
+        base_ask = baseline.get(f"{self._relative_side}_ask", 0.0)
+        current_bid = current.get(f"{self._relative_side}_bid", 0.0)
+        if base_ask <= 0 or current_bid <= 0:
+            return False
+        actual_move = current_bid - base_ask
+        expected_move = self._relative_expected_poly_move(self._relative_side, btc_delta_pct, now)
+        return (actual_move - expected_move) >= self._relative_overreaction_price
+
+    def _manage_relative_reaction(self, seconds_remaining: float, now: float):
+        if not self._relative_traded or self._relative_exited:
+            return
+        if now - self._relative_last_check < POSITION_CHECK_INTERVAL:
+            return
+        self._relative_last_check = now
+        live = self._live_token_price(self._relative_token_id)
+        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
+        if sell_price <= 0 and not self.dry_run and self.executor._initialized:
+            probe = max(round(self._relative_shares * self._relative_price, 2), 1.0)
+            sell_price = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
+        if sell_price <= 0:
+            return
+        pnl = self._relative_shares * sell_price - self._relative_cost
+        target = self._relative_profit_target_price()
+        if (sell_price < target and not self._relative_is_overbought_exit()) or pnl < self._relative_min_profit_usd:
+            return
+        if self._relative_shares * sell_price < 5.0:
+            return
+        if not self.dry_run and self._confirm_ws_sell_price:
+            probe = max(round(self._relative_shares * sell_price, 2), 1.0)
+            confirmed = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
+            if confirmed > 0:
+                sell_price = confirmed
+                pnl = self._relative_shares * sell_price - self._relative_cost
+        if pnl < self._relative_min_profit_usd:
+            return
+        result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
+        if result.success:
+            self._relative_exited = True
+            self._relative_exit_revenue += result.amount_usd
+            self.stats.bankroll += result.amount_usd
+            profit = self._relative_exit_revenue - self._relative_cost
+            self._record_relative_result(profit)
+            print(f"  Relative overreaction exit: {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+
+    def _resolve_relative_reaction(self, closing_btc_price: float):
+        if not self._relative_traded or self._relative_exited:
+            return
+        won = False
+        if self._opening_price > 0 and closing_btc_price > 0:
+            won = (closing_btc_price >= self._opening_price) == (self._relative_side == "UP")
+        if won:
+            if self.dry_run:
+                revenue = self._relative_shares
+            else:
+                claim = self.executor.sell(self._relative_token_id, self._relative_shares, price=0.99)
+                revenue = claim.amount_usd if claim.success else self._relative_shares
+            profit = revenue - self._relative_cost
+            self.stats.bankroll += revenue
+            self._record_relative_result(profit)
+            print(f"  Relative overreaction resolved WIN +${profit:.2f}")
+        else:
+            loss = self._relative_cost - self._relative_exit_revenue
+            self._record_relative_result(-loss)
+            print(f"  Relative overreaction resolved LOSS -${loss:.2f}")
+        self._relative_exited = True
+
+    def _panic_candidate(self, btc_price: float):
+        if not self._current_market or self._opening_price <= 0:
+            return None
+        btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
+        candidates = []
+        for side in ("UP", "DOWN"):
+            history = self._panic_price_history.get(side, [])
+            if len(history) < 2:
+                continue
+            current_ask = history[-1][1]
+            recent_high = max(row[1] for row in history)
+            if current_ask <= 0 or recent_high <= 0:
+                continue
+            drop_pct = (recent_high - current_ask) / recent_high
+            if drop_pct < self._panic_drop_pct or current_ask > self._panic_max_buy_price:
+                continue
+            if side == "UP" and btc_delta_pct < -self._panic_max_btc_against_pct:
+                continue
+            if side == "DOWN" and btc_delta_pct > self._panic_max_btc_against_pct:
+                continue
+            token_id = self._current_market.token_id_up if side == "UP" else self._current_market.token_id_down
+            candidates.append((drop_pct, current_ask, recent_high, side, token_id, btc_delta_pct))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        return candidates[0]
+
+    def _clear_pending_panic_buy(self):
+        self._panic_pending_side = ""
+        self._panic_pending_token_id = ""
+        self._panic_pending_order_id = ""
+        self._panic_pending_price = 0.0
+        self._panic_pending_amount = 0.0
+        self._panic_pending_shares = 0.0
+        self._panic_pending_balance_before = 0.0
+        self._panic_pending_last_check = 0.0
+
+    def _activate_panic_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
+        self._panic_traded = True
+        self._panic_side = side
+        self._panic_token_id = token_id
+        self._panic_price = price
+        self._panic_cost = amount
+        self._panic_shares = shares
+        self.stats.bankroll -= amount
+        self.stats.hourly.record_trade(0.0, 0.0)
+        self._clear_pending_panic_buy()
+        print(f"  Panic rebound bought: {shares:.0f} {side} @ ${price:.3f} = ${amount:.2f}")
+        self.telegram.strategy_trade_alert(
+            strategy="Panic rebound",
+            side=side,
+            price=price,
+            amount=amount,
+            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
+            dry_run=self.dry_run,
+            strategy_pnl=self._strategy_pnl.get("panic", 0.0),
+            total_pnl=self.stats.total_pnl,
+        )
+
+    def _check_pending_panic_buy(self, now: float):
+        if not self._panic_pending_side or self._panic_traded or self.dry_run:
+            return
+        if now - self._panic_pending_last_check < 2.0:
+            return
+        self._panic_pending_last_check = now
+
+        if self._panic_pending_order_id and self.executor._initialized:
+            matched = self.executor.check_buy_fill(
+                self._panic_pending_order_id,
+                self._panic_pending_price,
+            )
+            if matched:
+                self._activate_panic_buy(
+                    self._panic_pending_side,
+                    self._panic_pending_token_id,
+                    matched[0],
+                    matched[1],
+                    matched[2],
+                )
+                return
+
+        if self.executor._initialized and self._panic_pending_balance_before > 0:
+            real_bal = self.executor.get_balance()
+            spent = self._panic_pending_balance_before - real_bal if real_bal > 0 else 0.0
+            if spent > 1.0:
+                shares = spent / self._panic_pending_price if self._panic_pending_price > 0 else self._panic_pending_shares
+                self.stats.bankroll = real_bal + spent
+                self._last_real_balance = real_bal
+                self._activate_panic_buy(
+                    self._panic_pending_side,
+                    self._panic_pending_token_id,
+                    self._panic_pending_price,
+                    spent,
+                    shares,
+                )
+
+    def _try_panic_rebound_entry(self, btc_price: float, seconds_remaining: float):
+        if not self._panic_enabled:
+            return
+        if not self._check_risk_limits("panic", "panic rebound"):
+            self._panic_trade_attempted = True
+            return
+        if not self.dry_run and not self.executor._initialized:
+            return
+        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
+        if elapsed < 0:
+            return
+        if elapsed > self._panic_entry_window_seconds:
+            self._panic_trade_attempted = True
+            return
+        candidate = self._panic_candidate(btc_price)
+        if not candidate:
+            return
+        drop_pct, ws_ask, recent_high, side, token_id, btc_delta_pct = candidate
+        trade_amount = round(min(self._panic_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
+        if trade_amount < self.strategy_config.min_bet:
+            return
+        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
+        if actual_price <= 0:
+            return
+        cap_price = min(self._panic_max_buy_price, max_buy_price())
+        if actual_price > cap_price:
+            print(f"  Panic skip {side}: WS ask ${ws_ask:.3f}, executable ${actual_price:.3f} > cap ${cap_price:.2f}")
+            return
+        print(f"\n  Panic rebound {side}: ask ${ws_ask:.3f} from high ${recent_high:.3f} drop {drop_pct:.0%}, BTC {btc_delta_pct:+.3f}%")
+        self._panic_trade_attempted = True
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._panic_pending_side = side
+                self._panic_pending_token_id = token_id
+                self._panic_pending_order_id = result.order_id
+                self._panic_pending_price = result.price
+                self._panic_pending_amount = result.amount_usd
+                self._panic_pending_shares = result.shares
+                self._panic_pending_balance_before = self.stats.bankroll
+                self._panic_pending_last_check = 0.0
+                print("  Panic rebound buy unverified - will poll order API and balance")
+                return
+            print(f"  Panic rebound buy failed: {result.error}")
+            return
+        self._activate_panic_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
+    def _manage_panic_rebound(self, seconds_remaining: float, now: float):
+        if not self._panic_traded or self._panic_exited:
+            return
+        if now - self._panic_last_check < POSITION_CHECK_INTERVAL:
+            return
+        self._panic_last_check = now
+        live = self._live_token_price(self._panic_token_id)
+        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
+        if sell_price <= 0 and not self.dry_run and self.executor._initialized:
+            probe = max(round(self._panic_shares * self._panic_price, 2), 1.0)
+            sell_price = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
+        if sell_price <= 0:
+            return
+        target = self._panic_profit_target_price()
+        pnl = self._panic_shares * sell_price - self._panic_cost
+        if sell_price < target or pnl < self._panic_min_profit_usd:
+            return
+        if self._panic_shares * sell_price < 5.0:
+            return
+        if not self.dry_run and self._confirm_ws_sell_price:
+            probe = max(round(self._panic_shares * sell_price, 2), 1.0)
+            confirmed = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
+            if confirmed > 0:
+                sell_price = confirmed
+                pnl = self._panic_shares * sell_price - self._panic_cost
+        if sell_price < target or pnl < self._panic_min_profit_usd:
+            return
+        result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
+        if result.success:
+            self._panic_exited = True
+            self._panic_exit_revenue += result.amount_usd
+            self.stats.bankroll += result.amount_usd
+            profit = self._panic_exit_revenue - self._panic_cost
+            self._record_panic_result(profit)
+            print(f"  Panic rebound exit: {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+
+    def _resolve_panic_rebound(self, closing_btc_price: float):
+        if not self._panic_traded or self._panic_exited:
+            return
+        won = False
+        if self._opening_price > 0 and closing_btc_price > 0:
+            won = (closing_btc_price >= self._opening_price) == (self._panic_side == "UP")
+        if won:
+            if self.dry_run:
+                revenue = self._panic_shares
+            else:
+                claim = self.executor.sell(self._panic_token_id, self._panic_shares, price=0.99)
+                revenue = claim.amount_usd if claim.success else self._panic_shares
+            profit = revenue - self._panic_cost
+            self.stats.bankroll += revenue
+            self._record_panic_result(profit)
+            print(f"  Panic rebound resolved WIN +${profit:.2f}")
+        else:
+            loss = self._panic_cost - self._panic_exit_revenue
+            self._record_panic_result(-loss)
+            print(f"  Panic rebound resolved LOSS -${loss:.2f}")
+        self._panic_exited = True
 
     # ── Market prices (cached, complement engine) ───────────────────
 
@@ -1168,6 +1899,9 @@ class PolyBot:
                    f"(limit -${self._daily_loss_limit:.0f}) — stopping trades")
             print(f"\n  {msg}")
             self.telegram.status_update({"alert": msg})
+            return
+
+        if not self._check_risk_limits("trend", "trend trade"):
             return
 
         market = self._ensure_market_subscription() if not self.dry_run else None
@@ -1300,10 +2034,15 @@ class PolyBot:
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
             print(f"     Watching live Polymarket bid for profit exit")
 
-            self.telegram.trade_alert(
-                side=sig.side, price=result.price, amount=result.amount_usd,
-                market_slug=slug, dry_run=self.dry_run,
-                edge=sig.edge, kelly_size=sig.kelly_size,
+            self.telegram.strategy_trade_alert(
+                strategy="Trend follow",
+                side=sig.side,
+                price=result.price,
+                amount=result.amount_usd,
+                market_slug=slug,
+                dry_run=self.dry_run,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
             )
         else:
             if result.error == "UNVERIFIED_BUY":
@@ -1342,15 +2081,18 @@ class PolyBot:
                 self.stats.record_win(profit)
             else:
                 self.stats.record_loss(abs(profit))
+            self._update_strategy_pnl("trend", "Trend follow", profit)
             result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
             residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
             print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            if profit > 0:
-                self.telegram.win_alert(profit, self.stats.total_pnl)
-            else:
-                self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
+            self.telegram.strategy_result_alert(
+                strategy="Trend follow",
+                profit=profit,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
+            )
             btc_price, _ = self.price_feed.get_price()
             self.tracker.log_trade_resolve(
                 btc_final_price=btc_price,
@@ -1537,21 +2279,33 @@ class PolyBot:
                 self._unclaimed_winnings += resolution_payout
             profit = total_received - original_cost
             self.stats.record_win(profit)
+            self._update_strategy_pnl("trend", "Trend follow", profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             claimed_note = " (claimed)" if claim_revenue > 0 else " (unclaimed)"
             print(f"  ✅ WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.win_alert(profit, self.stats.total_pnl)
+            self.telegram.strategy_result_alert(
+                strategy="Trend follow",
+                profit=profit,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
+            )
         else:
             net_loss = original_cost - self._exit_revenue
             profit = -net_loss
             self.stats.record_loss(net_loss)
+            self._update_strategy_pnl("trend", "Trend follow", profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+            self.telegram.strategy_result_alert(
+                strategy="Trend follow",
+                profit=profit,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
+            )
 
         btc_price, _ = self.price_feed.get_price()
         self.tracker.log_trade_resolve(

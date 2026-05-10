@@ -56,6 +56,32 @@ class TelegramNotifier:
     def loss_alert(self, loss: float, total_pnl: float):
         self.send(f"❌ *LOSS* -${abs(loss):.2f}\nTotal P&L: ${total_pnl:.2f}")
 
+    def strategy_trade_alert(
+        self, strategy: str, side: str, price: float, amount: float,
+        market_slug: str, dry_run: bool, strategy_pnl: float, total_pnl: float,
+    ):
+        mode = "PAPER" if dry_run else "LIVE"
+        self.send(
+            f"*{mode} TRADE*\n"
+            f"Strategy: *{strategy}*\n"
+            f"Side: *{side}*\n"
+            f"Price: ${price:.4f}\n"
+            f"Amount: ${amount:.2f}\n"
+            f"Strategy P&L: ${strategy_pnl:+.2f}\n"
+            f"Total P&L: ${total_pnl:+.2f}\n"
+            f"Market: `{market_slug}`"
+        )
+
+    def strategy_result_alert(self, strategy: str, profit: float, strategy_pnl: float, total_pnl: float):
+        label = "WIN" if profit > 0 else "LOSS"
+        sign = "+" if profit > 0 else "-"
+        self.send(
+            f"*{label}* {sign}${abs(profit):.2f}\n"
+            f"Strategy: *{strategy}*\n"
+            f"Strategy P&L: ${strategy_pnl:+.2f}\n"
+            f"Total P&L: ${total_pnl:+.2f}"
+        )
+
     def hourly_summary(self, hourly: dict, overall: dict):
         """Send the full hourly report with all metrics."""
         h = hourly
