@@ -12,7 +12,7 @@ Safety systems:
   1. CLOB health check: get_ok() before every trade; 3 consecutive
      failures halt trading and send Telegram alert. Auto-recovers
      when API comes back at next window boundary.
-  2. Daily loss limit: if session P&L <= -DAILY_LOSS_LIMIT, halt trading.
+  2. Daily loss limit: if balance retreats from its daily peak by DAILY_LOSS_LIMIT_RETREAT, halt trading.
   3. Balance-verified buys: snapshot USDC before/after; ghost fills
      caught even when API throws. Never cancels on timeout — returns
      UNVERIFIED_BUY for pending detection at next window boundary.
@@ -82,7 +82,7 @@ class PolyBot:
         )
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
-        self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
+        self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT_RETREAT", os.getenv("DAILY_LOSS_LIMIT", "30.0")))
         self._peak_loss_drop = float(os.getenv("PEAK_LOSS_DROP", "0.0"))
         self._cooling_down_period = float(os.getenv("COOLING_DOWN_PERIOD", "10800"))
         self._strategy_daily_loss_limits = {
@@ -221,6 +221,7 @@ class PolyBot:
         self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
         self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False}
         self._total_pnl_peak: float = 0.0
+        self._balance_peak: float = initial_bankroll
         self._bot_cooldown_until: float = 0.0
         self._strategy_pnl_peaks = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
         self._strategy_cooldown_until = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
@@ -327,7 +328,7 @@ class PolyBot:
               f"drop {self._panic_drop_pct:.0%} / buy <= ${self._panic_max_buy_price:.2f}")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
         print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
-        print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
+        print(f"  Daily balance retreat hard stop: ${self._daily_loss_limit:.0f}")
         print(
             f"  Peak drawdown cooldown: bot ${self._peak_loss_drop:.0f} drop / "
             f"{self._format_duration(self._cooling_down_period)}"
@@ -360,11 +361,13 @@ class PolyBot:
             self.stats.bankroll = balance
             self._session_start_balance = balance
             self._last_real_balance = balance
+            self._balance_peak = balance
             self.tracker.set_session_balance(balance)
         else:
             print("  [dry run — no wallet connection]")
             self._session_start_balance = self.stats.bankroll
             self._last_real_balance = self.stats.bankroll
+            self._balance_peak = self.stats.bankroll
             self.tracker.set_session_balance(self.stats.bankroll)
 
         self.price_feed.start()
@@ -532,14 +535,18 @@ class PolyBot:
     def _check_daily_loss_limit(self, label: str = "trade") -> bool:
         if self._daily_loss_halted:
             print(f"  DAILY LOSS LIMIT - skipping {label} "
-                  f"(session P&L ${self.stats.total_pnl:+.2f})")
+                  f"(balance ${self.stats.bankroll:.2f}, peak ${self._balance_peak:.2f})")
             return False
 
-        session_pnl = self.stats.bankroll - self._session_start_balance
-        if session_pnl <= -self._daily_loss_limit:
+        self._balance_peak = max(self._balance_peak, self.stats.bankroll)
+        retreat = self._balance_peak - self.stats.bankroll
+        if retreat >= self._daily_loss_limit:
             self._daily_loss_halted = True
-            msg = (f"DAILY LOSS LIMIT HIT: ${session_pnl:+.2f} "
-                   f"(limit -${self._daily_loss_limit:.0f}) - stopping trades")
+            msg = (
+                f"DAILY BALANCE RETREAT LIMIT HIT: current balance ${self.stats.bankroll:.2f} "
+                f"retreated ${retreat:.2f} from peak ${self._balance_peak:.2f} "
+                f"(limit ${self._daily_loss_limit:.0f}) - stopping all trades for manual review"
+            )
             print(f"\n  {msg}")
             self.telegram.status_update({"alert": msg})
             return False
@@ -662,6 +669,7 @@ class PolyBot:
         self._check_strategy_daily_loss_limit(key, label)
         self._check_strategy_peak_drawdown(key, label)
         self._check_total_peak_drawdown()
+        self._check_daily_loss_limit(label)
 
     def _record_cheap_result(self, profit: float):
         self._record_strategy_result("cheap", "Cheap scalp", profit)
@@ -2172,21 +2180,6 @@ class PolyBot:
                     print(f"\n  {msg}")
                     self.telegram.status_update({"alert": msg})
                 return
-
-        # ── Daily loss limit ─────────────────────────────────────
-        if self._daily_loss_halted:
-            print(f"  🛑 DAILY LOSS LIMIT — session P&L ${self.stats.total_pnl:+.2f} "
-                  f"exceeds -${self._daily_loss_limit:.0f}")
-            return
-
-        session_pnl = self.stats.bankroll - self._session_start_balance
-        if session_pnl <= -self._daily_loss_limit:
-            self._daily_loss_halted = True
-            msg = (f"🛑 DAILY LOSS LIMIT HIT: ${session_pnl:+.2f} "
-                   f"(limit -${self._daily_loss_limit:.0f}) — stopping trades")
-            print(f"\n  {msg}")
-            self.telegram.status_update({"alert": msg})
-            return
 
         market = self._ensure_market_subscription() if not self.dry_run else None
         token_id = ""
