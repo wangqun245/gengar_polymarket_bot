@@ -77,6 +77,7 @@ class PolyBot:
             trend_entry_threshold_pct=float(os.getenv("TREND_ENTRY_THRESHOLD_PCT", "0.03")),
             trend_entry_skip_threshold_pct=float(os.getenv("TREND_ENTRY_SKIP_THRESHOLD_PCT", "0.20")),
             trend_trade_amount=float(os.getenv("TREND_TRADE_AMOUNT", os.getenv("MAX_BET", "25.0"))),
+            invert_trend_entry=os.getenv("INVERT_TREND_ENTRY", "false").lower() == "true",
         )
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
@@ -108,6 +109,13 @@ class PolyBot:
         self._min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.10"))
         self._min_profit_usd = float(os.getenv("MIN_PROFIT_USD", "1.00"))
         self._confirm_ws_sell_price = os.getenv("CONFIRM_WS_SELL_PRICE", "true").lower() == "true"
+        self._cheap_scalp_enabled = os.getenv("CHEAP_SCALP_ENABLED", "true").lower() == "true"
+        self._cheap_entry_price = float(os.getenv("CHEAP_ENTRY_PRICE", "0.20"))
+        self._cheap_entry_window_seconds = int(os.getenv("CHEAP_ENTRY_WINDOW_SECONDS", "150"))
+        self._cheap_trade_amount = float(os.getenv("CHEAP_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
+        self._cheap_take_profit_price = float(os.getenv("CHEAP_BUY_TAKE_PROFIT_PRICE", "0.30"))
+        self._cheap_min_profit_pct = float(os.getenv("CHEAP_BUY_MIN_PROFIT_PCT", "0.10"))
+        self._cheap_min_profit_usd = float(os.getenv("CHEAP_BUY_MIN_PROFIT_USD", "1.00"))
 
         self._running = False
         self._current_window: int = 0
@@ -138,6 +146,26 @@ class PolyBot:
         self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
+        # Secondary strategy: cheap Polymarket price scalp
+        self._cheap_traded: bool = False
+        self._cheap_trade_attempted: bool = False
+        self._cheap_exited: bool = False
+        self._cheap_side: str = ""
+        self._cheap_token_id: str = ""
+        self._cheap_price: float = 0.0
+        self._cheap_cost: float = 0.0
+        self._cheap_shares: float = 0.0
+        self._cheap_exit_revenue: float = 0.0
+        self._cheap_last_check: float = 0.0
+        self._cheap_pending_side: str = ""
+        self._cheap_pending_token_id: str = ""
+        self._cheap_pending_order_id: str = ""
+        self._cheap_pending_price: float = 0.0
+        self._cheap_pending_amount: float = 0.0
+        self._cheap_pending_shares: float = 0.0
+        self._cheap_pending_balance_before: float = 0.0
+        self._cheap_pending_last_check: float = 0.0
+
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
         # Resolved at next window boundary once Polygon settlement has had time to land.
         self._pending_phantom: dict = {}
@@ -150,6 +178,8 @@ class PolyBot:
         self._pending_buy_token_id: str = ""
         self._pending_buy_edge: float = 0.0
         self._pending_buy_delta: float = 0.0
+        self._pending_buy_order_id: str = ""
+        self._pending_buy_last_check: float = 0.0
         self._balance_before_buy: float = 0.0
 
         # Unclaimed
@@ -180,6 +210,7 @@ class PolyBot:
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
         print(f"  Entry mode: Binance trend scalp")
+        print(f"  Entry direction: {'inverse trend' if self.strategy_config.invert_trend_entry else 'trend follow'}")
         print(f"  Trend trigger: {self.strategy_config.trend_entry_threshold_pct:.3f}% | "
               f"Skip chase: >{self.strategy_config.trend_entry_skip_threshold_pct:.3f}%")
         print(f"  Entry window: first {self.strategy_config.trend_entry_window_seconds}s | "
@@ -187,6 +218,10 @@ class PolyBot:
         print(f"  Max buy price: ${max_buy_price():.2f}")
         print(f"  Polymarket WS: {'on' if self._poly_ws_enabled else 'off'} | "
               f"Take profit: ${self._take_profit_price:.2f} or {self._min_profit_pct:.0%}+")
+        print(f"  Cheap scalp: {'on' if self._cheap_scalp_enabled else 'off'} | "
+              f"entry <= ${self._cheap_entry_price:.2f} for first {self._cheap_entry_window_seconds}s")
+        print(f"  Cheap scalp exit: ${self._cheap_take_profit_price:.2f} or "
+              f"{self._cheap_min_profit_pct:.0%}+ / ${self._cheap_min_profit_usd:.2f}+")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
         print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
@@ -256,6 +291,9 @@ class PolyBot:
         if not is_fresh or btc_price <= 0:
             return
 
+        self._check_pending_buy_fill(now)
+        self._check_pending_cheap_buy(now)
+
         if window_ts != self._current_window:
             self._on_new_window(window_ts, closing_btc_price=btc_price)
 
@@ -267,6 +305,10 @@ class PolyBot:
 
         self._ensure_market_subscription()
         self._refresh_cached_ws_prices()
+
+        self._manage_cheap_scalp(seconds_remaining, now)
+        if not self._cheap_traded and not self._cheap_trade_attempted:
+            self._try_cheap_scalp_entry(seconds_remaining)
 
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
@@ -550,6 +592,9 @@ class PolyBot:
             # Detect pending buy that settled after our verification timeout
             if self._pending_buy_side and not self._traded:
                 if not self.dry_run and self.executor._initialized:
+                    self._pending_buy_last_check = 0.0
+                    self._check_pending_buy_fill(time.time())
+                if self._pending_buy_side and not self._traded and not self.dry_run and self.executor._initialized:
                     real_bal = self.executor.get_balance()
                     if real_bal > 0 and self._balance_before_buy > 0:
                         spent = self._balance_before_buy - real_bal
@@ -570,6 +615,9 @@ class PolyBot:
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
                                 self._pending_buy_edge, self._pending_buy_delta)
+
+            if self._cheap_traded and not self._cheap_exited:
+                self._resolve_cheap_scalp(closing_btc_price)
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -624,6 +672,17 @@ class PolyBot:
         self._exit_retries = 0
         self._exit_gave_up = False
         self._last_sell_price_seen = 0.0
+        self._cheap_traded = False
+        self._cheap_trade_attempted = False
+        self._cheap_exited = False
+        self._cheap_side = ""
+        self._cheap_token_id = ""
+        self._cheap_price = 0.0
+        self._cheap_cost = 0.0
+        self._cheap_shares = 0.0
+        self._cheap_exit_revenue = 0.0
+        self._cheap_last_check = 0.0
+        self._clear_pending_cheap_buy()
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -634,6 +693,8 @@ class PolyBot:
         self._pending_buy_token_id = ""
         self._pending_buy_edge = 0.0
         self._pending_buy_delta = 0.0
+        self._pending_buy_order_id = ""
+        self._pending_buy_last_check = 0.0
         self._balance_before_buy = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
@@ -654,6 +715,88 @@ class PolyBot:
                 print(f"  🔌 CLOB health check still failing — staying halted")
 
     # ── Polymarket live prices ──────────────────────────────────────
+
+    def _clear_pending_buy(self):
+        self._pending_buy_side = ""
+        self._pending_buy_price = 0.0
+        self._pending_buy_amount = 0.0
+        self._pending_buy_shares = 0.0
+        self._pending_buy_token_id = ""
+        self._pending_buy_edge = 0.0
+        self._pending_buy_delta = 0.0
+        self._pending_buy_order_id = ""
+        self._pending_buy_last_check = 0.0
+        self._balance_before_buy = 0.0
+
+    def _activate_pending_buy(
+        self, price: float, amount: float, shares: float,
+        source: str, balance_already_synced: bool = False,
+    ):
+        if not self._pending_buy_side or self._traded:
+            return
+        self._traded = True
+        self._trade_side = self._pending_buy_side
+        self._trade_price = price
+        self._trade_cost = amount
+        self._trade_shares = shares
+        self._trade_token_id = self._pending_buy_token_id
+        if not balance_already_synced:
+            self.stats.bankroll -= amount
+        self.stats.hourly.record_trade(self._pending_buy_edge, self._pending_buy_delta)
+        print(
+            f"  ✅ Pending buy verified [{source}]: ~{shares:.0f} shares "
+            f"{self._trade_side} @ ${price:.3f} = ${amount:.2f}"
+        )
+        self.tracker.log_trade_entry(
+            window_ts=self._current_window,
+            side=self._trade_side,
+            entry_price=price,
+            entry_shares=shares,
+            entry_cost=amount,
+            edge=self._pending_buy_edge,
+            prob=1.0,
+            btc_delta=self._pending_buy_delta,
+            seconds_remaining=0.0,
+            entry_delta_pct=self._pending_buy_delta,
+            entry_seconds_remaining=0.0,
+        )
+        self._clear_pending_buy()
+
+    def _check_pending_buy_fill(self, now: float):
+        if not self._pending_buy_side or self._traded or self.dry_run:
+            return
+        if now - self._pending_buy_last_check < 2.0:
+            return
+        self._pending_buy_last_check = now
+
+        if self._pending_buy_order_id and self.executor._initialized:
+            matched = self.executor.check_buy_fill(
+                self._pending_buy_order_id,
+                self._pending_buy_price,
+            )
+            if matched:
+                self._activate_pending_buy(
+                    price=matched[0],
+                    amount=matched[1],
+                    shares=matched[2],
+                    source="order_api",
+                )
+                return
+
+        if self.executor._initialized and self._balance_before_buy > 0:
+            real_bal = self.executor.get_balance()
+            spent = self._balance_before_buy - real_bal if real_bal > 0 else 0.0
+            if spent > 1.0:
+                shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else self._pending_buy_shares
+                self.stats.bankroll = real_bal
+                self._last_real_balance = real_bal
+                self._activate_pending_buy(
+                    price=self._pending_buy_price,
+                    amount=spent,
+                    shares=shares,
+                    source="balance",
+                    balance_already_synced=True,
+                )
 
     def _ensure_market_subscription(self):
         if self._current_market:
@@ -705,10 +848,220 @@ class PolyBot:
         sell_probe = round(self._trade_shares * self._trade_price, 2)
         return self.executor.get_market_price(token_id, "SELL", max(sell_probe, 1.0))
 
-    def _profit_target_price(self) -> float:
-        pct_target = self._trade_price * (1.0 + self._min_profit_pct)
+    def _profit_target_for_price(self, entry_price: float) -> float:
+        pct_target = entry_price * (1.0 + self._min_profit_pct)
         fixed_target = self._take_profit_price if self._take_profit_price > 0 else 0.0
         return round(max(pct_target, fixed_target), 2)
+
+    def _profit_target_price(self) -> float:
+        return self._profit_target_for_price(self._trade_price)
+
+    def _cheap_profit_target_price(self) -> float:
+        pct_target = self._cheap_price * (1.0 + self._cheap_min_profit_pct)
+        fixed_target = self._cheap_take_profit_price if self._cheap_take_profit_price > 0 else 0.0
+        return round(max(pct_target, fixed_target), 2)
+
+    def _cheap_scalp_candidate(self):
+        market = self._current_market
+        if not market:
+            return None
+        candidates = []
+        for side, token_id in (("UP", market.token_id_up), ("DOWN", market.token_id_down)):
+            price = self._live_token_price(token_id)
+            ask = price.best_ask if price else 0.0
+            if ask > 0 and ask <= self._cheap_entry_price:
+                candidates.append((ask, side, token_id))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0]
+
+    def _clear_pending_cheap_buy(self):
+        self._cheap_pending_side = ""
+        self._cheap_pending_token_id = ""
+        self._cheap_pending_order_id = ""
+        self._cheap_pending_price = 0.0
+        self._cheap_pending_amount = 0.0
+        self._cheap_pending_shares = 0.0
+        self._cheap_pending_balance_before = 0.0
+        self._cheap_pending_last_check = 0.0
+
+    def _activate_cheap_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
+        self._cheap_traded = True
+        self._cheap_side = side
+        self._cheap_token_id = token_id
+        self._cheap_price = price
+        self._cheap_cost = amount
+        self._cheap_shares = shares
+        self.stats.bankroll -= amount
+        self._clear_pending_cheap_buy()
+        print(
+            f"  Cheap scalp bought: {shares:.0f} {side} "
+            f"@ ${price:.3f} = ${amount:.2f}"
+        )
+
+    def _check_pending_cheap_buy(self, now: float):
+        if not self._cheap_pending_side or self._cheap_traded or self.dry_run:
+            return
+        if now - self._cheap_pending_last_check < 2.0:
+            return
+        self._cheap_pending_last_check = now
+
+        if self._cheap_pending_order_id and self.executor._initialized:
+            matched = self.executor.check_buy_fill(
+                self._cheap_pending_order_id,
+                self._cheap_pending_price,
+            )
+            if matched:
+                self._activate_cheap_buy(
+                    self._cheap_pending_side,
+                    self._cheap_pending_token_id,
+                    matched[0],
+                    matched[1],
+                    matched[2],
+                )
+                return
+
+        if self.executor._initialized and self._cheap_pending_balance_before > 0:
+            real_bal = self.executor.get_balance()
+            spent = self._cheap_pending_balance_before - real_bal if real_bal > 0 else 0.0
+            if spent > 1.0:
+                shares = spent / self._cheap_pending_price if self._cheap_pending_price > 0 else self._cheap_pending_shares
+                self.stats.bankroll = real_bal + spent
+                self._last_real_balance = real_bal
+                self._activate_cheap_buy(
+                    self._cheap_pending_side,
+                    self._cheap_pending_token_id,
+                    self._cheap_pending_price,
+                    spent,
+                    shares,
+                )
+
+    def _try_cheap_scalp_entry(self, seconds_remaining: float):
+        if not self._cheap_scalp_enabled:
+            return
+        if not self.dry_run and not self.executor._initialized:
+            return
+        if not self._current_market:
+            return
+        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
+        if elapsed < 0:
+            return
+        if elapsed > self._cheap_entry_window_seconds:
+            self._cheap_trade_attempted = True
+            return
+
+        candidate = self._cheap_scalp_candidate()
+        if not candidate:
+            return
+
+        ws_ask, side, token_id = candidate
+        trade_amount = round(min(self._cheap_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
+        if trade_amount < self.strategy_config.min_bet:
+            return
+
+        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
+        if actual_price <= 0:
+            return
+
+        cap_price = min(self._cheap_entry_price, max_buy_price())
+        if actual_price > cap_price:
+            print(
+                f"  Cheap scalp skip {side}: WS ask ${ws_ask:.3f}, "
+                f"executable ${actual_price:.3f} > cap ${cap_price:.2f}"
+            )
+            return
+
+        print(
+            f"\n  Cheap scalp {side}: WS ask ${ws_ask:.3f}, "
+            f"executable ${actual_price:.3f}, amount ${trade_amount:.2f}"
+        )
+        self._cheap_trade_attempted = True
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._cheap_pending_side = side
+                self._cheap_pending_token_id = token_id
+                self._cheap_pending_order_id = result.order_id
+                self._cheap_pending_price = result.price
+                self._cheap_pending_amount = result.amount_usd
+                self._cheap_pending_shares = result.shares
+                self._cheap_pending_balance_before = self.stats.bankroll
+                self._cheap_pending_last_check = 0.0
+                print("  Cheap scalp buy unverified - will poll order API and balance")
+                return
+            print(f"  Cheap scalp buy failed: {result.error}")
+            return
+
+        self._activate_cheap_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
+    def _manage_cheap_scalp(self, seconds_remaining: float, now: float):
+        if not self._cheap_traded or self._cheap_exited:
+            return
+        if now - self._cheap_last_check < POSITION_CHECK_INTERVAL:
+            return
+        self._cheap_last_check = now
+
+        live = self._live_token_price(self._cheap_token_id)
+        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
+        if sell_price <= 0:
+            if self.executor._initialized and not self.dry_run:
+                probe = max(round(self._cheap_shares * self._cheap_price, 2), 1.0)
+                sell_price = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
+        if sell_price <= 0:
+            return
+
+        target = self._cheap_profit_target_price()
+        pnl = self._cheap_shares * sell_price - self._cheap_cost
+        if sell_price < target or pnl < self._cheap_min_profit_usd:
+            return
+
+        if self._cheap_shares * sell_price < 5.0:
+            return
+
+        if not self.dry_run and self._confirm_ws_sell_price:
+            probe = max(round(self._cheap_shares * sell_price, 2), 1.0)
+            confirmed = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
+            if confirmed > 0:
+                sell_price = confirmed
+                pnl = self._cheap_shares * sell_price - self._cheap_cost
+        if sell_price < target or pnl < self._cheap_min_profit_usd:
+            return
+
+        result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
+        if result.success:
+            self._cheap_exited = True
+            self._cheap_exit_revenue += result.amount_usd
+            self.stats.bankroll += result.amount_usd
+            profit = self._cheap_exit_revenue - self._cheap_cost
+            print(
+                f"  Cheap scalp exit: {result.shares:.0f} {self._cheap_side} "
+                f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+            )
+
+    def _resolve_cheap_scalp(self, closing_btc_price: float):
+        if not self._cheap_traded or self._cheap_exited:
+            return
+        won = False
+        if self._opening_price > 0 and closing_btc_price > 0:
+            won = (closing_btc_price >= self._opening_price) == (self._cheap_side == "UP")
+
+        if won:
+            if self.dry_run:
+                revenue = self._cheap_shares
+            else:
+                claim = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=0.99)
+                revenue = claim.amount_usd if claim.success else self._cheap_shares
+            profit = revenue - self._cheap_cost
+            self.stats.bankroll += self._cheap_cost
+            self.stats.record_win(profit)
+            print(f"  Cheap scalp resolved WIN +${profit:.2f}")
+        else:
+            loss = self._cheap_cost - self._cheap_exit_revenue
+            self.stats.bankroll += self._cheap_cost
+            self.stats.record_loss(loss)
+            print(f"  Cheap scalp resolved LOSS -${loss:.2f}")
+        self._cheap_exited = True
 
     # ── Market prices (cached, complement engine) ───────────────────
 
@@ -837,10 +1190,19 @@ class PolyBot:
         if self.dry_run:
             hint_price = self._cached_up if sig.side == "UP" else self._cached_down
         elif self.executor._initialized:
+            live_price = self._live_token_price(token_id)
+            if live_price:
+                print(
+                    f"  WS {sig.side}: bid ${live_price.best_bid:.3f} | "
+                    f"ask ${live_price.best_ask:.3f} | last ${live_price.last_trade:.3f}"
+                )
             actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price > 0:
                 actual_edge = sig.true_prob - actual_price
-                print(f"  📊 Actual price: ${actual_price:.3f} (edge: {actual_edge:.3f})")
+                print(
+                    f"  Executable buy price for ${trade_amount:.2f}: "
+                    f"${actual_price:.3f} (edge: {actual_edge:.3f})"
+                )
 
                 if False and actual_edge < self.strategy_config.min_edge:
                     print(f"  ⚠️  Edge gone at market price — skipping")
@@ -954,8 +1316,10 @@ class PolyBot:
                 self._pending_buy_token_id = token_id
                 self._pending_buy_edge = sig.edge
                 self._pending_buy_delta = sig.btc_delta_pct
+                self._pending_buy_order_id = result.order_id
+                self._pending_buy_last_check = 0.0
                 self._balance_before_buy = self.stats.bankroll
-                print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
+                print(f"  Buy sent but unverified - will poll order API and balance")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
                 # Circuit breaker: track consecutive API failures

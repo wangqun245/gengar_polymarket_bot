@@ -40,6 +40,7 @@ class StrategyConfig:
     trend_entry_threshold_pct: float = 0.03
     trend_entry_skip_threshold_pct: float = 0.20
     trend_trade_amount: float = 25.0
+    invert_trend_entry: bool = False
 
 
 @dataclass
@@ -301,7 +302,10 @@ def evaluate_trend_entry(
     if abs_delta > config.trend_entry_skip_threshold_pct:
         return None
 
-    side = "UP" if btc_delta_pct > 0 else "DOWN"
+    if config.invert_trend_entry:
+        side = "DOWN" if btc_delta_pct > 0 else "UP"
+    else:
+        side = "UP" if btc_delta_pct > 0 else "DOWN"
     trade_amount = min(config.trend_trade_amount, config.max_bet, bankroll)
     trade_amount = max(trade_amount, config.min_bet)
 

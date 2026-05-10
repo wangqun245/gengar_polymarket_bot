@@ -578,6 +578,12 @@ class Executor:
             print(f"[executor] Order check failed: {e}")
             return None
 
+    def check_buy_fill(self, order_id: str, fallback_price: float) -> Optional[tuple]:
+        fill = self._check_order(order_id)
+        if not fill:
+            return None
+        return self._extract_fill(fill, fallback_price)
+
     def cancel_order(self, order_id: str) -> bool:
         if self.dry_run or not self._initialized:
             return True
