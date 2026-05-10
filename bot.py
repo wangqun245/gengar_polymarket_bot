@@ -83,11 +83,25 @@ class PolyBot:
 
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
         self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
+        self._peak_loss_drop = float(os.getenv("PEAK_LOSS_DROP", "0.0"))
+        self._cooling_down_period = float(os.getenv("COOLING_DOWN_PERIOD", "10800"))
         self._strategy_daily_loss_limits = {
             "trend": float(os.getenv("TREND_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
             "cheap": float(os.getenv("CHEAP_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
             "panic": float(os.getenv("PANIC_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
             "relative": float(os.getenv("RELATIVE_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+        }
+        self._strategy_peak_loss_drops = {
+            "trend": float(os.getenv("TREND_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
+            "cheap": float(os.getenv("CHEAP_PEAK_LOSS_DROP", os.getenv("CHEAP_SCALP_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0")))),
+            "panic": float(os.getenv("PANIC_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
+            "relative": float(os.getenv("RELATIVE_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
+        }
+        self._strategy_cooling_down_periods = {
+            "trend": float(os.getenv("TREND_COOLING_DOWN_PERIOD", "5400")),
+            "cheap": float(os.getenv("CHEAP_COOLING_DOWN_PERIOD", os.getenv("CHEAP_SCALP_COOLING_DOWN_PERIOD", "5400"))),
+            "panic": float(os.getenv("PANIC_COOLING_DOWN_PERIOD", "5400")),
+            "relative": float(os.getenv("RELATIVE_COOLING_DOWN_PERIOD", "5400")),
         }
         self._rolling_vol_windows = int(os.getenv("ROLLING_VOL_WINDOWS", "12"))
         self._vol_floor = float(os.getenv("VOL_FLOOR", "0.06"))
@@ -206,6 +220,10 @@ class PolyBot:
         # Strategy-level risk and P&L
         self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
         self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False}
+        self._total_pnl_peak: float = 0.0
+        self._bot_cooldown_until: float = 0.0
+        self._strategy_pnl_peaks = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
+        self._strategy_cooldown_until = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
 
         # Fourth strategy: Binance/Polymarket relative overreaction
         self._realtime_history = []
@@ -311,11 +329,22 @@ class PolyBot:
         print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(
+            f"  Peak drawdown cooldown: bot ${self._peak_loss_drop:.0f} drop / "
+            f"{self._format_duration(self._cooling_down_period)}"
+        )
+        print(
             "  Strategy loss limits: "
             f"trend ${self._strategy_daily_loss_limits['trend']:.0f} | "
             f"cheap ${self._strategy_daily_loss_limits['cheap']:.0f} | "
             f"panic ${self._strategy_daily_loss_limits['panic']:.0f} | "
             f"relative ${self._strategy_daily_loss_limits['relative']:.0f}"
+        )
+        print(
+            "  Strategy peak drawdown cooldowns: "
+            f"trend ${self._strategy_peak_loss_drops['trend']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['trend'])} | "
+            f"cheap ${self._strategy_peak_loss_drops['cheap']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['cheap'])} | "
+            f"panic ${self._strategy_peak_loss_drops['panic']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['panic'])} | "
+            f"relative ${self._strategy_peak_loss_drops['relative']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['relative'])}"
         )
         print(f"  Relative overreaction: {'on' if self._relative_enabled else 'off'} | "
               f"entry first {self._relative_entry_window_seconds}s | save {self._realtime_to_save}s")
@@ -538,15 +567,101 @@ class PolyBot:
             return False
         return True
 
+    def _format_duration(self, seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, rem = divmod(seconds, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {secs}s"
+        return f"{secs}s"
+
+    def _check_bot_cooldown(self, label: str = "trade") -> bool:
+        if self._bot_cooldown_until <= 0:
+            return True
+        remaining = self._bot_cooldown_until - time.time()
+        if remaining > 0:
+            print(
+                f"  BOT COOLING DOWN - skipping {label} "
+                f"(remaining {self._format_duration(remaining)}, total P&L ${self.stats.total_pnl:+.2f})"
+            )
+            return False
+        self._bot_cooldown_until = 0.0
+        print("  Bot cooldown expired - trading can resume if other risk checks pass")
+        return True
+
+    def _check_strategy_cooldown(self, key: str, label: str) -> bool:
+        cooldown_until = self._strategy_cooldown_until.get(key, 0.0)
+        if cooldown_until <= 0:
+            return True
+        remaining = cooldown_until - time.time()
+        if remaining > 0:
+            print(
+                f"  {label.upper()} COOLING DOWN - skipping "
+                f"(remaining {self._format_duration(remaining)}, strategy P&L ${self._strategy_pnl.get(key, 0.0):+.2f})"
+            )
+            return False
+        self._strategy_cooldown_until[key] = 0.0
+        print(f"  {label} cooldown expired - strategy can resume if other risk checks pass")
+        return True
+
+    def _check_total_peak_drawdown(self):
+        self._total_pnl_peak = max(self._total_pnl_peak, self.stats.total_pnl)
+        if self._peak_loss_drop <= 0:
+            return
+        if self._bot_cooldown_until > time.time():
+            return
+        drawdown = self._total_pnl_peak - self.stats.total_pnl
+        if drawdown < self._peak_loss_drop:
+            return
+
+        self._bot_cooldown_until = time.time() + self._cooling_down_period
+        msg = (
+            f"BOT PEAK DRAWDOWN COOLDOWN: total P&L ${self.stats.total_pnl:+.2f} "
+            f"dropped ${drawdown:.2f} from peak ${self._total_pnl_peak:+.2f}. "
+            f"Pausing all strategies for {self._format_duration(self._cooling_down_period)}."
+        )
+        print(f"\n  {msg}")
+        self.telegram.status_update({"alert": msg})
+        self._total_pnl_peak = self.stats.total_pnl
+
+    def _check_strategy_peak_drawdown(self, key: str, label: str):
+        strategy_pnl = self._strategy_pnl.get(key, 0.0)
+        self._strategy_pnl_peaks[key] = max(self._strategy_pnl_peaks.get(key, 0.0), strategy_pnl)
+        drop_limit = self._strategy_peak_loss_drops.get(key, 0.0)
+        if drop_limit <= 0:
+            return
+        if self._strategy_cooldown_until.get(key, 0.0) > time.time():
+            return
+        drawdown = self._strategy_pnl_peaks[key] - strategy_pnl
+        if drawdown < drop_limit:
+            return
+
+        period = self._strategy_cooling_down_periods.get(key, 5400.0)
+        self._strategy_cooldown_until[key] = time.time() + period
+        msg = (
+            f"{label} PEAK DRAWDOWN COOLDOWN: strategy P&L ${strategy_pnl:+.2f} "
+            f"dropped ${drawdown:.2f} from peak ${self._strategy_pnl_peaks[key]:+.2f}. "
+            f"Pausing this strategy for {self._format_duration(period)}."
+        )
+        print(f"\n  {msg}")
+        self.telegram.status_update({"alert": msg})
+        self._strategy_pnl_peaks[key] = strategy_pnl
+
     def _check_risk_limits(self, key: str, label: str) -> bool:
         return (
             self._check_daily_loss_limit(label)
+            and self._check_bot_cooldown(label)
             and self._check_strategy_daily_loss_limit(key, label)
+            and self._check_strategy_cooldown(key, label)
         )
 
     def _update_strategy_pnl(self, key: str, label: str, profit: float):
         self._strategy_pnl[key] = self._strategy_pnl.get(key, 0.0) + profit
         self._check_strategy_daily_loss_limit(key, label)
+        self._check_strategy_peak_drawdown(key, label)
+        self._check_total_peak_drawdown()
 
     def _record_cheap_result(self, profit: float):
         self._record_strategy_result("cheap", "Cheap scalp", profit)
@@ -558,7 +673,6 @@ class PolyBot:
         self._record_strategy_result("relative", "Relative overreaction", profit)
 
     def _record_strategy_result(self, key: str, label: str, profit: float):
-        self._update_strategy_pnl(key, label, profit)
         self.stats.total_trades += 1
         if profit > 0:
             self.stats.wins += 1
@@ -569,6 +683,7 @@ class PolyBot:
             self.stats.losses += 1
             self.stats.total_pnl -= loss
             self.stats.hourly.record_result(-loss, won=False)
+        self._update_strategy_pnl(key, label, profit)
         self.telegram.strategy_result_alert(
             strategy=label,
             profit=profit,
@@ -2036,6 +2151,9 @@ class PolyBot:
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
 
+        if not self._check_risk_limits("trend", "trend trade"):
+            return
+
         # ── Circuit breaker: CLOB health check ───────────────────
         if self._clob_halted:
             print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
@@ -2068,9 +2186,6 @@ class PolyBot:
                    f"(limit -${self._daily_loss_limit:.0f}) — stopping trades")
             print(f"\n  {msg}")
             self.telegram.status_update({"alert": msg})
-            return
-
-        if not self._check_risk_limits("trend", "trend trade"):
             return
 
         market = self._ensure_market_subscription() if not self.dry_run else None
