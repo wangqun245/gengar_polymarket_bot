@@ -66,6 +66,81 @@ def fetch_market_by_slug(slug: str) -> Optional[dict]:
         return None
 
 
+def _json_field(value, default=None):
+    if default is None:
+        default = []
+    if isinstance(value, str) and value:
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return value if value not in ("", None) else default
+
+
+def _normalize_outcome(value: str) -> str:
+    value = str(value or "").strip().lower()
+    if value in {"up", "higher", "yes"}:
+        return "UP"
+    if value in {"down", "lower", "no"}:
+        return "DOWN"
+    return ""
+
+
+def extract_winning_outcome(event_data: dict) -> Optional[str]:
+    """Return the resolved winning side ("UP"/"DOWN") from Gamma event data.
+
+    Gamma fields have changed over time, so this checks explicit winner fields
+    first and then falls back to resolved outcome prices where the winner trades
+    near $1 and the loser near $0.
+    """
+    markets = event_data.get("markets", []) if event_data else []
+    market = markets[0] if markets else {}
+
+    for source in (event_data, market):
+        for key in (
+            "winningOutcome", "winning_outcome", "winner",
+            "resolvedOutcome", "resolved_outcome", "result",
+        ):
+            winner = _normalize_outcome(source.get(key, ""))
+            if winner:
+                return winner
+
+    outcomes = _json_field(market.get("outcomes", []), [])
+    outcome_prices = _json_field(market.get("outcomePrices", []), [])
+    if not isinstance(outcomes, list) or not isinstance(outcome_prices, list):
+        return None
+
+    resolved = bool(
+        market.get("resolved")
+        or market.get("closed")
+        or event_data.get("resolved")
+        or event_data.get("closed")
+    )
+    best = ("", 0.0)
+    for i, outcome in enumerate(outcomes):
+        if i >= len(outcome_prices):
+            continue
+        try:
+            price = float(outcome_prices[i])
+        except Exception:
+            continue
+        side = _normalize_outcome(outcome)
+        if side and price > best[1]:
+            best = (side, price)
+
+    if best[0] and (best[1] >= 0.95 or resolved and best[1] >= 0.90):
+        return best[0]
+    return None
+
+
+def get_market_winner(period_minutes: int = 5, window_ts: int = None) -> Optional[str]:
+    """Fetch the Polymarket final winner for a BTC Up/Down window."""
+    event = fetch_market_by_slug(market_slug(period_minutes, window_ts))
+    if not event:
+        return None
+    return extract_winning_outcome(event)
+
+
 def extract_token_ids(event_data: dict) -> tuple[str, str]:
     """Extract UP and DOWN token IDs from event data.
     

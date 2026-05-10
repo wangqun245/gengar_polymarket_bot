@@ -30,12 +30,13 @@ import time
 import signal
 import math
 import statistics
+from typing import Optional
 from dotenv import load_dotenv
 
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import get_current_market, current_window_ts, PERIOD_SECONDS
+from market import get_current_market, get_market_winner, current_window_ts, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from polymarket_ws import PolymarketMarketFeed
 from strategy import (
@@ -151,6 +152,8 @@ class PolyBot:
         self._current_market = None
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
+        self._winner_cache: dict = {}
+        self._dry_pending_resolutions: list = []
 
         # Trade state
         self._traded: bool = False
@@ -560,6 +563,66 @@ class PolyBot:
             total_pnl=self.stats.total_pnl,
         )
 
+    def _polymarket_winner_for_window(self, window_ts: int = None) -> str:
+        window_ts = window_ts or self._current_window
+        if window_ts <= 0:
+            return ""
+        if window_ts in self._winner_cache:
+            return self._winner_cache[window_ts]
+        winner = get_market_winner(self.period, window_ts) or ""
+        if winner:
+            print(f"  Polymarket final result: {winner} for {window_ts}")
+            self._winner_cache[window_ts] = winner
+        else:
+            print(f"  Polymarket final result not available yet for {window_ts}")
+        return winner
+
+    def _dry_run_resolution_won(self, side: str) -> Optional[bool]:
+        winner = self._polymarket_winner_for_window()
+        if not winner:
+            return None
+        return winner == side
+
+    def _queue_dry_resolution(
+        self, key: str, label: str, side: str, shares: float,
+        cost: float, exit_revenue: float, window_ts: int,
+    ):
+        if any(item["key"] == key and item["window_ts"] == window_ts for item in self._dry_pending_resolutions):
+            return
+        self._dry_pending_resolutions.append({
+            "key": key,
+            "label": label,
+            "side": side,
+            "shares": shares,
+            "cost": cost,
+            "exit_revenue": exit_revenue,
+            "window_ts": window_ts,
+        })
+
+    def _process_dry_pending_resolutions(self):
+        if not self.dry_run or not self._dry_pending_resolutions:
+            return
+        remaining = []
+        for item in self._dry_pending_resolutions:
+            winner = self._polymarket_winner_for_window(item["window_ts"])
+            if not winner:
+                remaining.append(item)
+                continue
+            won = winner == item["side"]
+            if won:
+                revenue = item["shares"]
+                profit = revenue - item["cost"]
+                self.stats.bankroll += revenue
+            else:
+                profit = -(item["cost"] - item["exit_revenue"])
+            self._record_strategy_result(item["key"], item["label"], profit)
+            result = "WIN" if won else "LOSS"
+            print(
+                f"  {item['label']} dry-run pending resolved {result} "
+                f"{profit:+.2f} via Polymarket final result"
+            )
+        self._dry_pending_resolutions = remaining
+
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
         """Monitor only — all trades hold to resolution. No stops.
         Tracker logs hold-period stats for future optimization.
@@ -700,6 +763,7 @@ class PolyBot:
     # ── Window management ───────────────────────────────────────────
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
+        self._process_dry_pending_resolutions()
         if self._current_window > 0:
             # Resolve any pending phantom sell from the previous window.
             # Must run before trade state is reset below.
@@ -1385,16 +1449,31 @@ class PolyBot:
     def _resolve_cheap_scalp(self, closing_btc_price: float):
         if not self._cheap_traded or self._cheap_exited:
             return
-        won = False
-        if self._opening_price > 0 and closing_btc_price > 0:
-            won = (closing_btc_price >= self._opening_price) == (self._cheap_side == "UP")
+        if self.dry_run:
+            won = self._dry_run_resolution_won(self._cheap_side)
+            if won is None:
+                print("  Cheap scalp dry-run resolution pending Polymarket final result")
+                self._queue_dry_resolution(
+                    "cheap", "Cheap scalp", self._cheap_side,
+                    self._cheap_shares, self._cheap_cost,
+                    self._cheap_exit_revenue, self._current_window,
+                )
+                self._cheap_exited = True
+                return
+        else:
+            won = False
+            if self._opening_price > 0 and closing_btc_price > 0:
+                won = (closing_btc_price >= self._opening_price) == (self._cheap_side == "UP")
 
         if won:
             if self.dry_run:
                 revenue = self._cheap_shares
             else:
                 claim = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=0.99)
-                revenue = claim.amount_usd if claim.success else self._cheap_shares
+                if not claim.success:
+                    print(f"  Cheap scalp claim not verified: {claim.error} - not booking win yet")
+                    return
+                revenue = claim.amount_usd
             profit = revenue - self._cheap_cost
             self.stats.bankroll += revenue
             self._record_cheap_result(profit)
@@ -1588,15 +1667,30 @@ class PolyBot:
     def _resolve_relative_reaction(self, closing_btc_price: float):
         if not self._relative_traded or self._relative_exited:
             return
-        won = False
-        if self._opening_price > 0 and closing_btc_price > 0:
-            won = (closing_btc_price >= self._opening_price) == (self._relative_side == "UP")
+        if self.dry_run:
+            won = self._dry_run_resolution_won(self._relative_side)
+            if won is None:
+                print("  Relative overreaction dry-run resolution pending Polymarket final result")
+                self._queue_dry_resolution(
+                    "relative", "Relative overreaction", self._relative_side,
+                    self._relative_shares, self._relative_cost,
+                    self._relative_exit_revenue, self._current_window,
+                )
+                self._relative_exited = True
+                return
+        else:
+            won = False
+            if self._opening_price > 0 and closing_btc_price > 0:
+                won = (closing_btc_price >= self._opening_price) == (self._relative_side == "UP")
         if won:
             if self.dry_run:
                 revenue = self._relative_shares
             else:
                 claim = self.executor.sell(self._relative_token_id, self._relative_shares, price=0.99)
-                revenue = claim.amount_usd if claim.success else self._relative_shares
+                if not claim.success:
+                    print(f"  Relative overreaction claim not verified: {claim.error} - not booking win yet")
+                    return
+                revenue = claim.amount_usd
             profit = revenue - self._relative_cost
             self.stats.bankroll += revenue
             self._record_relative_result(profit)
@@ -1789,15 +1883,30 @@ class PolyBot:
     def _resolve_panic_rebound(self, closing_btc_price: float):
         if not self._panic_traded or self._panic_exited:
             return
-        won = False
-        if self._opening_price > 0 and closing_btc_price > 0:
-            won = (closing_btc_price >= self._opening_price) == (self._panic_side == "UP")
+        if self.dry_run:
+            won = self._dry_run_resolution_won(self._panic_side)
+            if won is None:
+                print("  Panic rebound dry-run resolution pending Polymarket final result")
+                self._queue_dry_resolution(
+                    "panic", "Panic rebound", self._panic_side,
+                    self._panic_shares, self._panic_cost,
+                    self._panic_exit_revenue, self._current_window,
+                )
+                self._panic_exited = True
+                return
+        else:
+            won = False
+            if self._opening_price > 0 and closing_btc_price > 0:
+                won = (closing_btc_price >= self._opening_price) == (self._panic_side == "UP")
         if won:
             if self.dry_run:
                 revenue = self._panic_shares
             else:
                 claim = self.executor.sell(self._panic_token_id, self._panic_shares, price=0.99)
-                revenue = claim.amount_usd if claim.success else self._panic_shares
+                if not claim.success:
+                    print(f"  Panic rebound claim not verified: {claim.error} - not booking win yet")
+                    return
+                revenue = claim.amount_usd
             profit = revenue - self._panic_cost
             self.stats.bankroll += revenue
             self._record_panic_result(profit)
@@ -2123,16 +2232,22 @@ class PolyBot:
 
         # ── Dry run: Binance price fallback ──────────────────────────
         if self.dry_run:
-            btc_price, _ = self.price_feed.get_price()
-            if self._opening_price <= 0 or btc_price <= 0:
+            won = self._dry_run_resolution_won(self._trade_side)
+            if won is None:
+                print("  Trend follow dry-run resolution pending Polymarket final result")
+                self._queue_dry_resolution(
+                    "trend", "Trend follow", self._trade_side,
+                    remaining_shares, original_cost,
+                    self._exit_revenue, self._current_window,
+                )
                 return
-            won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
             self._record_resolution(
                 won=won,
                 original_cost=original_cost,
                 remaining_shares=remaining_shares,
-                resolution_method="binance_fallback",
+                resolution_method="polymarket_gamma",
                 claim_revenue=0.0,
+                claim_result="gamma_final",
             )
             return
 
