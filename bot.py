@@ -1529,13 +1529,15 @@ class PolyBot:
             "meta": meta or {},
         }
         self._delayed_entries[key] = entry
-        self._entry_price_history[token_id] = []
+        self._entry_price_history[token_id] = [(time.time(), condition_price)]
         print(
-            f"  BUY CONDITION TRIGGERED [{label}]: {side} ask ${condition_price:.3f}, "
-            f"cap ${cap_price:.3f} - waiting for lower price then rebound"
+            f"  BUY CONDITION TRIGGERED [{label}]: {side} trigger ask ${condition_price:.3f}, "
+            f"max buy ${cap_price:.3f} - watching until cost stops getting cheaper"
         )
 
-    def _entry_price_trend_rising(self, token_id: str, now: float, price: float) -> bool:
+    def _entry_price_stopped_getting_cheaper(
+        self, token_id: str, now: float, price: float, best_price: float
+    ) -> bool:
         history = self._entry_price_history.setdefault(token_id, [])
         source = self._live_token_price(token_id)
         sample_ts = source.timestamp if source else now
@@ -1545,13 +1547,26 @@ class PolyBot:
         if len(history) > max_samples:
             del history[:-max_samples]
 
+        previous_tick = history[-2][1] if len(history) >= 2 else price
+        if price > best_price and price >= previous_tick:
+            return True
+
         recent = [row for row in history if now - row[0] <= self._entry_price_trend_window_seconds]
         samples = recent if len(recent) >= self._entry_price_trend_min_samples else history[-max_samples:]
         if len(samples) < self._entry_price_trend_min_samples:
             return False
-        avg = sum(row[1] for row in samples) / len(samples)
-        previous = samples[-2][1]
-        return price > avg and price > previous
+        if len(samples) >= self._entry_price_trend_min_samples * 2:
+            split = len(samples) // 2
+            previous_samples = samples[:split]
+            current_samples = samples[split:]
+        else:
+            previous_samples = samples[:-1]
+            current_samples = samples[1:]
+        if not previous_samples or not current_samples:
+            return False
+        previous_avg = sum(row[1] for row in previous_samples) / len(previous_samples)
+        current_avg = sum(row[1] for row in current_samples) / len(current_samples)
+        return current_avg >= previous_avg and price >= previous_tick
 
     def _manage_delayed_entries(self, seconds_remaining: float, now: float):
         if not self._delayed_entries:
@@ -1563,22 +1578,24 @@ class PolyBot:
             price = self._live_buy_price(entry["token_id"])
             if price <= 0:
                 continue
-            if price > entry["condition_price"] or price > entry["cap_price"]:
+            if price > entry["cap_price"]:
                 print(
                     f"  {entry['label']} delayed entry cancelled: ask ${price:.3f} "
-                    f"> allowed ${min(entry['condition_price'], entry['cap_price']):.3f}"
+                    f"> max buy ${entry['cap_price']:.3f}"
                 )
                 self._delayed_entries.pop(key, None)
                 continue
             if entry["min_price"] > 0 and price < entry["min_price"]:
                 entry["best_price"] = min(entry["best_price"], price)
-                self._entry_price_trend_rising(entry["token_id"], now, price)
+                self._entry_price_stopped_getting_cheaper(entry["token_id"], now, price, entry["best_price"])
                 continue
             if price < entry["best_price"]:
                 entry["best_price"] = price
-                self._entry_price_trend_rising(entry["token_id"], now, price)
+                self._entry_price_stopped_getting_cheaper(entry["token_id"], now, price, entry["best_price"])
                 continue
-            if not self._entry_price_trend_rising(entry["token_id"], now, price):
+            if not self._entry_price_stopped_getting_cheaper(
+                entry["token_id"], now, price, entry["best_price"]
+            ):
                 continue
             self._delayed_entries.pop(key, None)
             self._execute_delayed_entry(entry, price, seconds_remaining)
@@ -1601,7 +1618,7 @@ class PolyBot:
         print(
             f"  EXECUTING BUY [{entry['label']}]: {entry['side']} "
             f"best ${entry['best_price']:.3f}, rebound ask ${price:.3f}, "
-            f"condition cap ${entry['condition_price']:.3f}"
+            f"trigger ${entry['condition_price']:.3f}, max buy ${entry['cap_price']:.3f}"
         )
         if key == "trend":
             self._place_trend_buy(entry["meta"]["signal"], seconds_remaining, entry["token_id"], price)
