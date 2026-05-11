@@ -193,6 +193,9 @@ class PolyBot:
         self._entry_price_trend_window_seconds = float(os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50")) / 1000.0
         self._entry_price_trend_samples = int(os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50"))
         self._entry_price_trend_min_samples = int(os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3"))
+        self._exit_profit_avg_window_seconds = float(os.getenv("EXIT_PROFIT_AVG_WINDOW_MS", os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50"))) / 1000.0
+        self._exit_profit_avg_samples = int(os.getenv("EXIT_PROFIT_AVG_SAMPLES", os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50")))
+        self._exit_profit_avg_min_samples = int(os.getenv("EXIT_PROFIT_AVG_MIN_SAMPLES", os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3")))
 
         self._running = False
         self._current_window: int = 0
@@ -208,6 +211,7 @@ class PolyBot:
         self._resolving_window_winner: str = ""
         self._delayed_entries: dict = {}
         self._entry_price_history: dict = {}
+        self._exit_profit_history: dict = {}
 
         # Trade state
         self._traded: bool = False
@@ -838,9 +842,10 @@ class PolyBot:
 
     def _trailing_profit_exit_ready(
         self, label: str, pnl: float, threshold_reached: bool,
-        retreat_pct: float, armed_attr: str, peak_attr: str,
+        retreat_pct: float, armed_attr: str, peak_attr: str, history_key: str = "",
     ) -> bool:
-        if pnl <= 0:
+        avg_pnl = self._average_exit_profit(history_key or label, pnl)
+        if avg_pnl <= 0:
             return False
 
         armed = getattr(self, armed_attr)
@@ -850,27 +855,43 @@ class PolyBot:
             if not threshold_reached:
                 return False
             setattr(self, armed_attr, True)
-            setattr(self, peak_attr, pnl)
+            setattr(self, peak_attr, avg_pnl)
             print(
-                f"  {label} trailing profit armed: peak profit ${pnl:+.2f}, "
+                f"  {label} trailing profit armed: avg peak profit ${avg_pnl:+.2f}, "
                 f"retreat trigger {retreat_pct:.0%}"
             )
             return retreat_pct <= 0
 
-        if pnl > peak:
-            setattr(self, peak_attr, pnl)
+        if avg_pnl > peak:
+            setattr(self, peak_attr, avg_pnl)
             return False
 
         if peak <= 0:
             return False
-        retreat = (peak - pnl) / peak
+        retreat = (peak - avg_pnl) / peak
         if retreat >= retreat_pct:
             print(
-                f"  {label} trailing profit retreat: peak ${peak:+.2f} -> "
-                f"${pnl:+.2f} ({retreat:.0%})"
+                f"  {label} trailing avg profit retreat: peak ${peak:+.2f} -> "
+                f"avg ${avg_pnl:+.2f} / spot ${pnl:+.2f} ({retreat:.0%})"
             )
             return True
         return False
+
+    def _average_exit_profit(self, key: str, pnl: float) -> float:
+        now = time.time()
+        history = self._exit_profit_history.setdefault(key, [])
+        history.append((now, pnl))
+        max_samples = max(self._exit_profit_avg_samples, self._exit_profit_avg_min_samples)
+        if len(history) > max_samples:
+            del history[:-max_samples]
+
+        cutoff = now - max(self._exit_profit_avg_window_seconds, 0.001)
+        recent = [value for ts, value in history if ts >= cutoff]
+        if len(recent) < self._exit_profit_avg_min_samples:
+            recent = [value for _, value in history[-max_samples:]]
+        if not recent:
+            return pnl
+        return sum(recent) / len(recent)
 
     def _polymarket_winner_for_window(self, window_ts: int = None) -> str:
         window_ts = window_ts or self._current_window
@@ -1024,7 +1045,7 @@ class PolyBot:
             if self._trailing_profit_exit_ready(
                 "Trend follow", unrealized_pnl, threshold_reached,
                 self._trend_profit_retreat_pct,
-                "_trend_trailing_armed", "_trend_peak_profit",
+                "_trend_trailing_armed", "_trend_peak_profit", "trend",
             ):
                 self._exit_position(sell_price, seconds_remaining, "trailing_profit")
                 return
@@ -1331,6 +1352,7 @@ class PolyBot:
         self._price_last_fetched = 0.0
         self._delayed_entries = {}
         self._entry_price_history = {}
+        self._exit_profit_history = {}
         self._pending_buy_side = ""
         self._pending_buy_price = 0.0
         self._pending_buy_amount = 0.0
@@ -1387,6 +1409,7 @@ class PolyBot:
         self._trade_token_id = self._pending_buy_token_id
         self._trend_trailing_armed = False
         self._trend_peak_profit = 0.0
+        self._exit_profit_history.pop("trend", None)
         if not balance_already_synced:
             self.stats.bankroll -= amount
         self.stats.hourly.record_trade(self._pending_buy_edge, self._pending_buy_delta)
@@ -1768,6 +1791,7 @@ class PolyBot:
         self._cheap_shares = shares
         self._cheap_trailing_armed = False
         self._cheap_peak_profit = 0.0
+        self._exit_profit_history.pop("cheap", None)
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_cheap_buy()
@@ -1924,7 +1948,7 @@ class PolyBot:
         if not self._trailing_profit_exit_ready(
             "Cheap scalp", pnl, threshold_reached,
             self._cheap_profit_retreat_pct,
-            "_cheap_trailing_armed", "_cheap_peak_profit",
+            "_cheap_trailing_armed", "_cheap_peak_profit", "cheap",
         ):
             return
 
@@ -2002,6 +2026,7 @@ class PolyBot:
         self._relative_shares = shares
         self._relative_trailing_armed = False
         self._relative_peak_profit = 0.0
+        self._exit_profit_history.pop("relative", None)
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_relative_buy()
@@ -2168,7 +2193,7 @@ class PolyBot:
         if not self._trailing_profit_exit_ready(
             "Relative overreaction", pnl, threshold_reached,
             self._relative_profit_retreat_pct,
-            "_relative_trailing_armed", "_relative_peak_profit",
+            "_relative_trailing_armed", "_relative_peak_profit", "relative",
         ):
             return
         result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
@@ -2265,6 +2290,7 @@ class PolyBot:
         self._panic_shares = shares
         self._panic_trailing_armed = False
         self._panic_peak_profit = 0.0
+        self._exit_profit_history.pop("panic", None)
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_panic_buy()
@@ -2400,7 +2426,7 @@ class PolyBot:
         if not self._trailing_profit_exit_ready(
             "Panic rebound", pnl, threshold_reached,
             self._panic_profit_retreat_pct,
-            "_panic_trailing_armed", "_panic_peak_profit",
+            "_panic_trailing_armed", "_panic_peak_profit", "panic",
         ):
             return
         result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
@@ -2534,6 +2560,7 @@ class PolyBot:
             self._trade_token_id = token_id
             self._trend_trailing_armed = False
             self._trend_peak_profit = 0.0
+            self._exit_profit_history.pop("trend", None)
 
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
