@@ -152,6 +152,7 @@ class PolyBot:
         self._take_profit_price = float(os.getenv("TAKE_PROFIT_PRICE", "0.70"))
         self._min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.10"))
         self._min_profit_usd = float(os.getenv("MIN_PROFIT_USD", "1.00"))
+        self._trend_profit_retreat_pct = float(os.getenv("TREND_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20")))
         self._confirm_ws_sell_price = os.getenv("CONFIRM_WS_SELL_PRICE", "true").lower() == "true"
         self._cheap_scalp_enabled = os.getenv("CHEAP_SCALP_ENABLED", "true").lower() == "true"
         self._cheap_entry_price = float(os.getenv("CHEAP_ENTRY_PRICE", "0.20"))
@@ -160,6 +161,7 @@ class PolyBot:
         self._cheap_take_profit_price = float(os.getenv("CHEAP_BUY_TAKE_PROFIT_PRICE", "0.30"))
         self._cheap_min_profit_pct = float(os.getenv("CHEAP_BUY_MIN_PROFIT_PCT", "0.10"))
         self._cheap_min_profit_usd = float(os.getenv("CHEAP_BUY_MIN_PROFIT_USD", "1.00"))
+        self._cheap_profit_retreat_pct = float(os.getenv("CHEAP_PROFIT_RETREAT_PCT", os.getenv("CHEAP_SCALP_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
         self._panic_enabled = os.getenv("PANIC_BUY_ENABLED", "true").lower() == "true"
         self._panic_lookback_seconds = int(os.getenv("PANIC_LOOKBACK_SECONDS", "20"))
         self._panic_drop_pct = float(os.getenv("PANIC_DROP_PCT", "0.25"))
@@ -170,6 +172,7 @@ class PolyBot:
         self._panic_take_profit_price = float(os.getenv("PANIC_TAKE_PROFIT_PRICE", "0.55"))
         self._panic_min_profit_pct = float(os.getenv("PANIC_MIN_PROFIT_PCT", "0.12"))
         self._panic_min_profit_usd = float(os.getenv("PANIC_MIN_PROFIT_USD", "1.00"))
+        self._panic_profit_retreat_pct = float(os.getenv("PANIC_PROFIT_RETREAT_PCT", os.getenv("PANIC_REBOUND_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
         self._realtime_to_save = int(os.getenv("REALTIME_TO_SAVE", "120"))
         self._relative_enabled = os.getenv("RELATIVE_REACTION_ENABLED", "true").lower() == "true"
         self._relative_entry_window_seconds = int(os.getenv("RELATIVE_ENTRY_WINDOW_SECONDS", "120"))
@@ -184,6 +187,7 @@ class PolyBot:
         self._relative_take_profit_price = float(os.getenv("RELATIVE_TAKE_PROFIT_PRICE", "0.55"))
         self._relative_min_profit_pct = float(os.getenv("RELATIVE_MIN_PROFIT_PCT", "0.10"))
         self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
+        self._relative_profit_retreat_pct = float(os.getenv("RELATIVE_PROFIT_RETREAT_PCT", os.getenv("RELATIVE_OVERREACTION_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
         self._poly_ws_warmup_seconds = float(os.getenv("POLYMARKET_WS_WARMUP_SECONDS", "2.0"))
 
         self._running = False
@@ -219,6 +223,8 @@ class PolyBot:
         self._exit_retries: int = 0
         self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
+        self._trend_trailing_armed: bool = False
+        self._trend_peak_profit: float = 0.0
 
         # Secondary strategy: cheap Polymarket price scalp
         self._cheap_traded: bool = False
@@ -231,6 +237,8 @@ class PolyBot:
         self._cheap_shares: float = 0.0
         self._cheap_exit_revenue: float = 0.0
         self._cheap_last_check: float = 0.0
+        self._cheap_trailing_armed: bool = False
+        self._cheap_peak_profit: float = 0.0
         self._cheap_pending_side: str = ""
         self._cheap_pending_token_id: str = ""
         self._cheap_pending_order_id: str = ""
@@ -261,6 +269,8 @@ class PolyBot:
         self._relative_shares: float = 0.0
         self._relative_exit_revenue: float = 0.0
         self._relative_last_check: float = 0.0
+        self._relative_trailing_armed: bool = False
+        self._relative_peak_profit: float = 0.0
         self._relative_pending_side: str = ""
         self._relative_pending_token_id: str = ""
         self._relative_pending_order_id: str = ""
@@ -281,6 +291,8 @@ class PolyBot:
         self._panic_shares: float = 0.0
         self._panic_exit_revenue: float = 0.0
         self._panic_last_check: float = 0.0
+        self._panic_trailing_armed: bool = False
+        self._panic_peak_profit: float = 0.0
         self._panic_price_history = {"UP": [], "DOWN": []}
         self._panic_pending_side: str = ""
         self._panic_pending_token_id: str = ""
@@ -372,7 +384,14 @@ class PolyBot:
         print(f"  Panic rebound: {'on' if self._panic_enabled else 'off'} | "
               f"drop {self._panic_drop_pct:.0%} / buy <= ${self._panic_max_buy_price:.2f}")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
-        print(f"  Exits: sell on live profitable bid; otherwise hold to resolution")
+        print(f"  Exits: arm on profit target, sell on profit retreat; otherwise hold to resolution")
+        print(
+            "  Profit trailing retreats: "
+            f"trend {self._trend_profit_retreat_pct:.0%} | "
+            f"cheap {self._cheap_profit_retreat_pct:.0%} | "
+            f"panic {self._panic_profit_retreat_pct:.0%} | "
+            f"relative {self._relative_profit_retreat_pct:.0%}"
+        )
         print(f"  Daily balance retreat hard stop: ${self._daily_loss_limit:.0f}")
         print(
             f"  Peak drawdown cooldown: bot ${self._peak_loss_drop:.0f} drop / "
@@ -760,6 +779,42 @@ class PolyBot:
         self._record_result_stats_only(profit)
         self._update_strategy_pnl("trend", "Trend follow", profit)
 
+    def _trailing_profit_exit_ready(
+        self, label: str, pnl: float, threshold_reached: bool,
+        retreat_pct: float, armed_attr: str, peak_attr: str,
+    ) -> bool:
+        if pnl <= 0:
+            return False
+
+        armed = getattr(self, armed_attr)
+        peak = getattr(self, peak_attr)
+
+        if not armed:
+            if not threshold_reached:
+                return False
+            setattr(self, armed_attr, True)
+            setattr(self, peak_attr, pnl)
+            print(
+                f"  {label} trailing profit armed: peak profit ${pnl:+.2f}, "
+                f"retreat trigger {retreat_pct:.0%}"
+            )
+            return retreat_pct <= 0
+
+        if pnl > peak:
+            setattr(self, peak_attr, pnl)
+            return False
+
+        if peak <= 0:
+            return False
+        retreat = (peak - pnl) / peak
+        if retreat >= retreat_pct:
+            print(
+                f"  {label} trailing profit retreat: peak ${peak:+.2f} -> "
+                f"${pnl:+.2f} ({retreat:.0%})"
+            )
+            return True
+        return False
+
     def _polymarket_winner_for_window(self, window_ts: int = None) -> str:
         window_ts = window_ts or self._current_window
         if window_ts <= 0:
@@ -878,12 +933,12 @@ class PolyBot:
 
         target_price = self._profit_target_price()
         can_sell_notional = self._trade_shares * current_sell_price >= 5.0
-
-        if (
+        threshold_reached = (
             current_sell_price >= target_price
             and unrealized_pnl >= self._min_profit_usd
-            and can_sell_notional
-        ):
+        )
+
+        if (threshold_reached or self._trend_trailing_armed) and can_sell_notional:
             sell_price = current_sell_price
             if not self.dry_run and self._confirm_ws_sell_price:
                 probe = max(round(self._trade_shares * current_sell_price, 2), 1.0)
@@ -892,8 +947,16 @@ class PolyBot:
                     sell_price = confirmed
                     current_value = self._trade_shares * sell_price
                     unrealized_pnl = current_value - self._trade_cost
-            if sell_price >= target_price and unrealized_pnl >= self._min_profit_usd:
-                self._exit_position(sell_price, seconds_remaining, "take_profit_ws")
+            threshold_reached = (
+                sell_price >= target_price
+                and unrealized_pnl >= self._min_profit_usd
+            )
+            if self._trailing_profit_exit_ready(
+                "Trend follow", unrealized_pnl, threshold_reached,
+                self._trend_profit_retreat_pct,
+                "_trend_trailing_armed", "_trend_peak_profit",
+            ):
+                self._exit_position(sell_price, seconds_remaining, "trailing_profit")
                 return
 
         if now - self._last_status_print < 5:
@@ -1149,6 +1212,8 @@ class PolyBot:
         self._exit_retries = 0
         self._exit_gave_up = False
         self._last_sell_price_seen = 0.0
+        self._trend_trailing_armed = False
+        self._trend_peak_profit = 0.0
         self._cheap_traded = False
         self._cheap_trade_attempted = False
         self._cheap_exited = False
@@ -1159,6 +1224,8 @@ class PolyBot:
         self._cheap_shares = 0.0
         self._cheap_exit_revenue = 0.0
         self._cheap_last_check = 0.0
+        self._cheap_trailing_armed = False
+        self._cheap_peak_profit = 0.0
         self._clear_pending_cheap_buy()
         self._relative_traded = False
         self._relative_trade_attempted = False
@@ -1170,6 +1237,8 @@ class PolyBot:
         self._relative_shares = 0.0
         self._relative_exit_revenue = 0.0
         self._relative_last_check = 0.0
+        self._relative_trailing_armed = False
+        self._relative_peak_profit = 0.0
         self._realtime_history = []
         self._clear_pending_relative_buy()
         self._panic_traded = False
@@ -1182,6 +1251,8 @@ class PolyBot:
         self._panic_shares = 0.0
         self._panic_exit_revenue = 0.0
         self._panic_last_check = 0.0
+        self._panic_trailing_armed = False
+        self._panic_peak_profit = 0.0
         self._panic_price_history = {"UP": [], "DOWN": []}
         self._clear_pending_panic_buy()
         self._cached_up = 0.50
@@ -1241,6 +1312,8 @@ class PolyBot:
         self._trade_cost = amount
         self._trade_shares = shares
         self._trade_token_id = self._pending_buy_token_id
+        self._trend_trailing_armed = False
+        self._trend_peak_profit = 0.0
         if not balance_already_synced:
             self.stats.bankroll -= amount
         self.stats.hourly.record_trade(self._pending_buy_edge, self._pending_buy_delta)
@@ -1506,6 +1579,8 @@ class PolyBot:
         self._cheap_price = price
         self._cheap_cost = amount
         self._cheap_shares = shares
+        self._cheap_trailing_armed = False
+        self._cheap_peak_profit = 0.0
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_cheap_buy()
@@ -1640,7 +1715,8 @@ class PolyBot:
 
         target = self._cheap_profit_target_price()
         pnl = self._cheap_shares * sell_price - self._cheap_cost
-        if sell_price < target or pnl < self._cheap_min_profit_usd:
+        threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
+        if not threshold_reached and not self._cheap_trailing_armed:
             return
 
         if self._cheap_shares * sell_price < 5.0:
@@ -1652,7 +1728,12 @@ class PolyBot:
             if confirmed > 0:
                 sell_price = confirmed
                 pnl = self._cheap_shares * sell_price - self._cheap_cost
-        if sell_price < target or pnl < self._cheap_min_profit_usd:
+        threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
+        if not self._trailing_profit_exit_ready(
+            "Cheap scalp", pnl, threshold_reached,
+            self._cheap_profit_retreat_pct,
+            "_cheap_trailing_armed", "_cheap_peak_profit",
+        ):
             return
 
         result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
@@ -1727,6 +1808,8 @@ class PolyBot:
         self._relative_price = price
         self._relative_cost = amount
         self._relative_shares = shares
+        self._relative_trailing_armed = False
+        self._relative_peak_profit = 0.0
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_relative_buy()
@@ -1870,7 +1953,9 @@ class PolyBot:
             return
         pnl = self._relative_shares * sell_price - self._relative_cost
         target = self._relative_profit_target_price()
-        if (sell_price < target and not self._relative_is_overbought_exit()) or pnl < self._relative_min_profit_usd:
+        overbought_exit = self._relative_is_overbought_exit()
+        threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
+        if not threshold_reached and not self._relative_trailing_armed:
             return
         if self._relative_shares * sell_price < 5.0:
             return
@@ -1880,7 +1965,12 @@ class PolyBot:
             if confirmed > 0:
                 sell_price = confirmed
                 pnl = self._relative_shares * sell_price - self._relative_cost
-        if pnl < self._relative_min_profit_usd:
+        threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
+        if not self._trailing_profit_exit_ready(
+            "Relative overreaction", pnl, threshold_reached,
+            self._relative_profit_retreat_pct,
+            "_relative_trailing_armed", "_relative_peak_profit",
+        ):
             return
         result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
         if result.success:
@@ -1972,6 +2062,8 @@ class PolyBot:
         self._panic_price = price
         self._panic_cost = amount
         self._panic_shares = shares
+        self._panic_trailing_armed = False
+        self._panic_peak_profit = 0.0
         self.stats.bankroll -= amount
         self.stats.hourly.record_trade(0.0, 0.0)
         self._clear_pending_panic_buy()
@@ -2086,7 +2178,8 @@ class PolyBot:
             return
         target = self._panic_profit_target_price()
         pnl = self._panic_shares * sell_price - self._panic_cost
-        if sell_price < target or pnl < self._panic_min_profit_usd:
+        threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
+        if not threshold_reached and not self._panic_trailing_armed:
             return
         if self._panic_shares * sell_price < 5.0:
             return
@@ -2096,7 +2189,12 @@ class PolyBot:
             if confirmed > 0:
                 sell_price = confirmed
                 pnl = self._panic_shares * sell_price - self._panic_cost
-        if sell_price < target or pnl < self._panic_min_profit_usd:
+        threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
+        if not self._trailing_profit_exit_ready(
+            "Panic rebound", pnl, threshold_reached,
+            self._panic_profit_retreat_pct,
+            "_panic_trailing_armed", "_panic_peak_profit",
+        ):
             return
         result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
         if result.success:
@@ -2328,6 +2426,8 @@ class PolyBot:
             self._trade_cost = result.amount_usd
             self._trade_shares = result.shares
             self._trade_token_id = token_id
+            self._trend_trailing_armed = False
+            self._trend_peak_profit = 0.0
 
             self.stats.bankroll -= result.amount_usd
             self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
