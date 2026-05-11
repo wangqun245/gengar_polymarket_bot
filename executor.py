@@ -6,6 +6,7 @@ and retries once if the CLOB reports an order-version mismatch.
 """
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -189,6 +190,16 @@ def _friendly_error(exc: Exception) -> str:
     return message
 
 
+def _balance_from_not_enough_error(message: str) -> float:
+    match = re.search(r"balance:\s*(\d+)\s*,\s*order amount:\s*(\d+)", message)
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1)) / 1e6
+    except Exception:
+        return 0.0
+
+
 def _signature_type(value: int) -> SignatureTypeV2:
     try:
         return SignatureTypeV2(int(value))
@@ -269,6 +280,38 @@ class Executor:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
 
+    def _get_token_balance_optional(self, token_id: str) -> Optional[float]:
+        """Return the wallet's conditional-token balance, or None if unavailable."""
+        if not self._initialized or not token_id:
+            return None
+        try:
+            conditional_type = getattr(AssetType, "CONDITIONAL", None)
+            if conditional_type is None:
+                return None
+            try:
+                params = BalanceAllowanceParams(
+                    asset_type=conditional_type,
+                    token_id=str(token_id),
+                )
+            except TypeError:
+                params = BalanceAllowanceParams(
+                    asset_type=conditional_type,
+                    asset_id=str(token_id),
+                )
+            bal = self.client.get_balance_allowance(params)
+            raw = bal.get("balance", 0) if isinstance(bal, dict) else 0
+            return float(raw) / 1e6
+        except Exception as e:
+            print(f"[executor] Token balance check failed: {e}")
+            return None
+
+    def get_token_balance(self, token_id: str) -> float:
+        """Return the wallet's conditional-token balance for one outcome token."""
+        balance = self._get_token_balance_optional(token_id)
+        if balance is None:
+            return 0.0
+        return balance
+
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
         if not self._initialized:
             return 0.0
@@ -345,6 +388,7 @@ class Executor:
               f"-> {int(shares)} shares for ${clean_amount:.2f}")
 
         balance_before = self.get_balance()
+        token_balance_before = self._get_token_balance_optional(token_id)
         try:
             result = self.client.create_and_post_order(
                 order_args=OrderArgs(
@@ -367,18 +411,36 @@ class Executor:
 
             time.sleep(5)
             return self._verify_buy_via_balance(
-                order_id, market_price, float(shares), token_id, balance_before,
+                order_id, market_price, float(shares), token_id,
+                balance_before, token_balance_before,
             )
         except Exception as e:
             time.sleep(3)
             balance_after = self.get_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0
             if spent > 1.0:
-                actual_shares = spent / market_price if market_price > 0 else 0
+                token_balance_after = self._get_token_balance_optional(token_id)
+                token_delta = (
+                    max(0.0, token_balance_after - token_balance_before)
+                    if token_balance_before is not None and token_balance_after is not None
+                    else None
+                )
+                actual_shares = token_delta if token_delta is not None and token_delta > 0 else (
+                    spent / market_price if token_delta is None and market_price > 0 else 0
+                )
+                if actual_shares < 1:
+                    return OrderResult(
+                        success=False, order_id="ghost-buy-unverified",
+                        status=FAILED, side="BUY", price=market_price,
+                        amount_usd=spent, shares=0.0,
+                        error="USDC balance dropped but token balance/order fill not verified",
+                        token_id=token_id[:16] + "...", dry_run=False,
+                    )
                 print(f"  [order] Ghost buy: balance dropped ${spent:.2f} despite error")
                 return OrderResult(
                     success=True, order_id="ghost-buy",
-                    status=FILLED, side="BUY", price=market_price,
+                    status=FILLED if actual_shares >= shares - 0.001 else PARTIAL,
+                    side="BUY", price=market_price,
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
@@ -389,18 +451,27 @@ class Executor:
 
     def _verify_buy_via_balance(
         self, order_id: str, price: float, shares: float,
-        token_id: str, balance_before: float,
+        token_id: str, balance_before: float, token_balance_before: Optional[float],
     ) -> OrderResult:
         for attempt in range(3):
             balance_after = self.get_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0
-            if spent > 0.50:
-                actual_shares = spent / price if price > 0 else shares
+            token_balance_after = self._get_token_balance_optional(token_id)
+            token_delta = (
+                max(0.0, token_balance_after - token_balance_before)
+                if token_balance_before is not None and token_balance_after is not None
+                else None
+            )
+            if spent > 0.50 and (token_delta is None or token_delta > 0):
+                actual_shares = token_delta if token_delta is not None else (spent / price if price > 0 else shares)
+                status = FILLED if actual_shares >= shares - 0.001 else PARTIAL
                 suffix = f" (attempt {attempt + 1})" if attempt > 0 else ""
                 print(f"  [order] Balance verified{suffix}: spent ${spent:.2f} "
-                      f"(~{actual_shares:.0f} shares @ ${price:.3f})")
+                      f"(~{actual_shares:.0f}/{shares:.0f} shares @ ${price:.3f})")
+                if status == PARTIAL:
+                    print(f"  [order] Partial buy detected: tracking actual {actual_shares:.0f} shares")
                 return OrderResult(
-                    success=True, order_id=order_id, status=FILLED,
+                    success=True, order_id=order_id, status=status,
                     side="BUY", price=price,
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
@@ -459,6 +530,28 @@ class Executor:
 
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+        token_balance = self._get_token_balance_optional(token_id)
+        if token_balance is not None and token_balance > 0:
+            available_shares = int(token_balance)
+            if available_shares < sell_shares:
+                print(
+                    f"  [order] Sell size adjusted to actual token balance: "
+                    f"{sell_shares} -> {available_shares} shares"
+                )
+                sell_shares = available_shares
+        if token_balance is not None and token_balance <= 0:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="No sellable token balance", side="SELL",
+                price=price, shares=0.0, token_id=token_id[:16] + "...",
+            )
+        if sell_shares < 1:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="No sellable token balance", side="SELL",
+                price=price, shares=0.0, token_id=token_id[:16] + "...",
+            )
 
         if price <= 0:
             notional = float(sell_shares) * 0.50
@@ -551,8 +644,60 @@ class Executor:
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
+            err = _friendly_error(e)
+            actual_balance = _balance_from_not_enough_error(err)
+            retry_shares = int(actual_balance)
+            if "not enough balance" in err.lower() and retry_shares >= 1 and retry_shares < sell_shares:
+                retry_amount = round(retry_shares * price, 2)
+                if retry_amount >= POLY_MIN_NOTIONAL:
+                    print(
+                        f"  [order] Retrying sell with actual token balance: "
+                        f"{retry_shares} shares @ ${price:.3f} = ${retry_amount:.2f}"
+                    )
+                    try:
+                        retry_result = self.client.create_and_post_market_order(
+                            order_args=MarketOrderArgs(
+                                token_id=token_id,
+                                amount=float(retry_shares),
+                                side="SELL",
+                                price=round(price, 2),
+                                order_type=OrderType.GTC,
+                            ),
+                            options=_order_options(),
+                            order_type=OrderType.GTC,
+                        )
+                        retry_order_id = retry_result.get("orderID", "")
+                        time.sleep(2)
+                        retry_balance = self.get_balance()
+                        retry_received = retry_balance - balance_before
+                        if retry_received > 0.10:
+                            shares_sold = retry_received / price if price > 0 else retry_shares
+                            return OrderResult(
+                                success=True,
+                                order_id=retry_order_id or "balance-retry-verified",
+                                status=FILLED,
+                                side="SELL", price=price,
+                                amount_usd=retry_received, shares=shares_sold,
+                                shares_remaining=0.0,
+                                token_id=token_id[:16] + "...", dry_run=False,
+                            )
+                    except Exception as retry_error:
+                        err = _friendly_error(retry_error)
+                else:
+                    return OrderResult(
+                        success=False, status=REJECTED,
+                        error=(
+                            f"Actual token balance {retry_shares} shares has "
+                            f"notional ${retry_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min"
+                        ),
+                        side="SELL", price=price,
+                        shares=float(retry_shares),
+                        shares_remaining=float(retry_shares),
+                        token_id=token_id[:16] + "...",
+                    )
+
             return OrderResult(
-                success=False, status=FAILED, error=_friendly_error(e),
+                success=False, status=FAILED, error=err,
                 side="SELL", price=price, token_id=token_id[:16] + "...",
             )
 

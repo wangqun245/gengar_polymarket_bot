@@ -258,6 +258,7 @@ class PolyBot:
         self._cheap_pending_amount: float = 0.0
         self._cheap_pending_shares: float = 0.0
         self._cheap_pending_balance_before: float = 0.0
+        self._cheap_pending_token_balance_before: float = 0.0
         self._cheap_pending_last_check: float = 0.0
 
         # Strategy-level risk and P&L
@@ -290,6 +291,7 @@ class PolyBot:
         self._relative_pending_amount: float = 0.0
         self._relative_pending_shares: float = 0.0
         self._relative_pending_balance_before: float = 0.0
+        self._relative_pending_token_balance_before: float = 0.0
         self._relative_pending_last_check: float = 0.0
 
         # Third strategy: panic sell rebound
@@ -313,6 +315,7 @@ class PolyBot:
         self._panic_pending_amount: float = 0.0
         self._panic_pending_shares: float = 0.0
         self._panic_pending_balance_before: float = 0.0
+        self._panic_pending_token_balance_before: float = 0.0
         self._panic_pending_last_check: float = 0.0
 
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
@@ -330,6 +333,7 @@ class PolyBot:
         self._pending_buy_order_id: str = ""
         self._pending_buy_last_check: float = 0.0
         self._balance_before_buy: float = 0.0
+        self._pending_buy_token_balance_before: float = 0.0
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -1216,7 +1220,14 @@ class PolyBot:
                         spent = self._balance_before_buy - real_bal
                         if spent > 1.0:
                             # The buy DID go through — retroactively track it
-                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            current_tokens = self.executor.get_token_balance(self._pending_buy_token_id)
+                            est_shares = max(0.0, current_tokens - self._pending_buy_token_balance_before)
+                            if est_shares < 1:
+                                print(
+                                    f"\n  Pending trend buy balance dropped ${spent:.2f}, "
+                                    "but no token balance/order fill is verified yet"
+                                )
+                                return
                             print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
                             print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
                                   f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
@@ -1363,6 +1374,7 @@ class PolyBot:
         self._pending_buy_order_id = ""
         self._pending_buy_last_check = 0.0
         self._balance_before_buy = 0.0
+        self._pending_buy_token_balance_before = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
         print(f"\n{'─' * 55}")
@@ -1457,7 +1469,11 @@ class PolyBot:
             real_bal = self.executor.get_balance()
             spent = self._balance_before_buy - real_bal if real_bal > 0 else 0.0
             if spent > 1.0:
-                shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else self._pending_buy_shares
+                current_tokens = self.executor.get_token_balance(self._pending_buy_token_id)
+                shares = max(0.0, current_tokens - self._pending_buy_token_balance_before)
+                if shares < 1:
+                    print("  Pending buy balance moved but no token balance/order fill yet - waiting")
+                    return
                 self.stats.bankroll = real_bal
                 self._last_real_balance = real_bal
                 self._activate_pending_buy(
@@ -1797,6 +1813,7 @@ class PolyBot:
         self._cheap_pending_amount = 0.0
         self._cheap_pending_shares = 0.0
         self._cheap_pending_balance_before = 0.0
+        self._cheap_pending_token_balance_before = 0.0
         self._cheap_pending_last_check = 0.0
 
     def _activate_cheap_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
@@ -1853,7 +1870,11 @@ class PolyBot:
             real_bal = self.executor.get_balance()
             spent = self._cheap_pending_balance_before - real_bal if real_bal > 0 else 0.0
             if spent > 1.0:
-                shares = spent / self._cheap_pending_price if self._cheap_pending_price > 0 else self._cheap_pending_shares
+                current_tokens = self.executor.get_token_balance(self._cheap_pending_token_id)
+                shares = max(0.0, current_tokens - self._cheap_pending_token_balance_before)
+                if shares < 1:
+                    print("  Cheap scalp pending balance moved but no token balance/order fill yet - waiting")
+                    return
                 self.stats.bankroll = real_bal + spent
                 self._last_real_balance = real_bal
                 self._activate_cheap_buy(
@@ -1875,6 +1896,7 @@ class PolyBot:
                 self._cheap_pending_amount = result.amount_usd
                 self._cheap_pending_shares = result.shares
                 self._cheap_pending_balance_before = self.stats.bankroll
+                self._cheap_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._cheap_pending_last_check = 0.0
                 print("  Cheap scalp buy unverified - will poll order API and balance")
                 return
@@ -2032,6 +2054,7 @@ class PolyBot:
         self._relative_pending_amount = 0.0
         self._relative_pending_shares = 0.0
         self._relative_pending_balance_before = 0.0
+        self._relative_pending_token_balance_before = 0.0
         self._relative_pending_last_check = 0.0
 
     def _activate_relative_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
@@ -2085,7 +2108,11 @@ class PolyBot:
             real_bal = self.executor.get_balance()
             spent = self._relative_pending_balance_before - real_bal if real_bal > 0 else 0.0
             if spent > 1.0:
-                shares = spent / self._relative_pending_price if self._relative_pending_price > 0 else self._relative_pending_shares
+                current_tokens = self.executor.get_token_balance(self._relative_pending_token_id)
+                shares = max(0.0, current_tokens - self._relative_pending_token_balance_before)
+                if shares < 1:
+                    print("  Relative overreaction pending balance moved but no token balance/order fill yet - waiting")
+                    return
                 self.stats.bankroll = real_bal + spent
                 self._last_real_balance = real_bal
                 self._activate_relative_buy(
@@ -2107,6 +2134,7 @@ class PolyBot:
                 self._relative_pending_amount = result.amount_usd
                 self._relative_pending_shares = result.shares
                 self._relative_pending_balance_before = self.stats.bankroll
+                self._relative_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._relative_pending_last_check = 0.0
                 print("  Relative overreaction buy unverified - will poll order API and balance")
                 return
@@ -2296,6 +2324,7 @@ class PolyBot:
         self._panic_pending_amount = 0.0
         self._panic_pending_shares = 0.0
         self._panic_pending_balance_before = 0.0
+        self._panic_pending_token_balance_before = 0.0
         self._panic_pending_last_check = 0.0
 
     def _activate_panic_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
@@ -2349,7 +2378,11 @@ class PolyBot:
             real_bal = self.executor.get_balance()
             spent = self._panic_pending_balance_before - real_bal if real_bal > 0 else 0.0
             if spent > 1.0:
-                shares = spent / self._panic_pending_price if self._panic_pending_price > 0 else self._panic_pending_shares
+                current_tokens = self.executor.get_token_balance(self._panic_pending_token_id)
+                shares = max(0.0, current_tokens - self._panic_pending_token_balance_before)
+                if shares < 1:
+                    print("  Panic rebound pending balance moved but no token balance/order fill yet - waiting")
+                    return
                 self.stats.bankroll = real_bal + spent
                 self._last_real_balance = real_bal
                 self._activate_panic_buy(
@@ -2371,6 +2404,7 @@ class PolyBot:
                 self._panic_pending_amount = result.amount_usd
                 self._panic_pending_shares = result.shares
                 self._panic_pending_balance_before = self.stats.bankroll
+                self._panic_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._panic_pending_last_check = 0.0
                 print("  Panic rebound buy unverified - will poll order API and balance")
                 return
@@ -2642,6 +2676,7 @@ class PolyBot:
             self._pending_buy_order_id = result.order_id
             self._pending_buy_last_check = 0.0
             self._balance_before_buy = self.stats.bankroll
+            self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
             print(f"  Buy sent but unverified - will poll order API and balance")
             return
 
@@ -2851,6 +2886,7 @@ class PolyBot:
                 self._pending_buy_order_id = result.order_id
                 self._pending_buy_last_check = 0.0
                 self._balance_before_buy = self.stats.bankroll
+                self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
                 print(f"  Buy sent but unverified - will poll order API and balance")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
