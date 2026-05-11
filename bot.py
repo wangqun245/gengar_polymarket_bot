@@ -190,6 +190,9 @@ class PolyBot:
         self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
         self._relative_profit_retreat_pct = float(os.getenv("RELATIVE_PROFIT_RETREAT_PCT", os.getenv("RELATIVE_OVERREACTION_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
         self._poly_ws_warmup_seconds = float(os.getenv("POLYMARKET_WS_WARMUP_SECONDS", "2.0"))
+        self._entry_price_trend_window_seconds = float(os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50")) / 1000.0
+        self._entry_price_trend_samples = int(os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50"))
+        self._entry_price_trend_min_samples = int(os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3"))
 
         self._running = False
         self._current_window: int = 0
@@ -203,6 +206,8 @@ class PolyBot:
         self._dry_pending_resolutions: list = []
         self._resolving_window_ts: int = 0
         self._resolving_window_winner: str = ""
+        self._delayed_entries: dict = {}
+        self._entry_price_history: dict = {}
 
         # Trade state
         self._traded: bool = False
@@ -513,6 +518,7 @@ class PolyBot:
             self._update_panic_price_history(now)
 
             self._manage_relative_reaction(seconds_remaining, now)
+            self._manage_delayed_entries(seconds_remaining, now)
             if not self._relative_traded and not self._relative_trade_attempted:
                 self._try_relative_reaction_entry(seconds_remaining)
             self._manage_cheap_scalp(seconds_remaining, now)
@@ -1323,6 +1329,8 @@ class PolyBot:
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
+        self._delayed_entries = {}
+        self._entry_price_history = {}
         self._pending_buy_side = ""
         self._pending_buy_price = 0.0
         self._pending_buy_amount = 0.0
@@ -1467,6 +1475,119 @@ class PolyBot:
         if price.best_bid > 0 and price.best_ask > 0 and price.best_bid >= price.best_ask:
             return None
         return price
+
+    def _live_buy_price(self, token_id: str) -> float:
+        if token_id.startswith("DRY-UP"):
+            return self._cached_up
+        if token_id.startswith("DRY-DOWN"):
+            return self._cached_down
+        price = self._live_token_price(token_id)
+        if not price:
+            return 0.0
+        return price.best_ask or price.last_trade or price.mid
+
+    def _arm_delayed_entry(
+        self, key: str, label: str, side: str, token_id: str, amount: float,
+        condition_price: float, cap_price: float, min_price: float = 0.0, meta: dict = None,
+    ):
+        if key in self._delayed_entries:
+            return
+        entry = {
+            "key": key,
+            "label": label,
+            "side": side,
+            "token_id": token_id,
+            "amount": amount,
+            "condition_price": condition_price,
+            "cap_price": cap_price,
+            "min_price": min_price,
+            "best_price": condition_price,
+            "last_sample_ts": 0.0,
+            "meta": meta or {},
+        }
+        self._delayed_entries[key] = entry
+        self._entry_price_history[token_id] = []
+        print(
+            f"  BUY CONDITION TRIGGERED [{label}]: {side} ask ${condition_price:.3f}, "
+            f"cap ${cap_price:.3f} - waiting for lower price then rebound"
+        )
+
+    def _entry_price_trend_rising(self, token_id: str, now: float, price: float) -> bool:
+        history = self._entry_price_history.setdefault(token_id, [])
+        source = self._live_token_price(token_id)
+        sample_ts = source.timestamp if source else now
+        if not history or sample_ts > history[-1][0] or abs(price - history[-1][1]) > 1e-9:
+            history.append((sample_ts, price))
+        max_samples = max(self._entry_price_trend_samples, self._entry_price_trend_min_samples)
+        if len(history) > max_samples:
+            del history[:-max_samples]
+
+        recent = [row for row in history if now - row[0] <= self._entry_price_trend_window_seconds]
+        samples = recent if len(recent) >= self._entry_price_trend_min_samples else history[-max_samples:]
+        if len(samples) < self._entry_price_trend_min_samples:
+            return False
+        avg = sum(row[1] for row in samples) / len(samples)
+        previous = samples[-2][1]
+        return price > avg and price > previous
+
+    def _manage_delayed_entries(self, seconds_remaining: float, now: float):
+        if not self._delayed_entries:
+            return
+        for key, entry in list(self._delayed_entries.items()):
+            if self._delayed_entry_done(key):
+                self._delayed_entries.pop(key, None)
+                continue
+            price = self._live_buy_price(entry["token_id"])
+            if price <= 0:
+                continue
+            if price > entry["condition_price"] or price > entry["cap_price"]:
+                print(
+                    f"  {entry['label']} delayed entry cancelled: ask ${price:.3f} "
+                    f"> allowed ${min(entry['condition_price'], entry['cap_price']):.3f}"
+                )
+                self._delayed_entries.pop(key, None)
+                continue
+            if entry["min_price"] > 0 and price < entry["min_price"]:
+                entry["best_price"] = min(entry["best_price"], price)
+                self._entry_price_trend_rising(entry["token_id"], now, price)
+                continue
+            if price < entry["best_price"]:
+                entry["best_price"] = price
+                self._entry_price_trend_rising(entry["token_id"], now, price)
+                continue
+            if not self._entry_price_trend_rising(entry["token_id"], now, price):
+                continue
+            self._delayed_entries.pop(key, None)
+            self._execute_delayed_entry(entry, price, seconds_remaining)
+
+    def _delayed_entry_done(self, key: str) -> bool:
+        if key == "trend":
+            return self._traded or self._exited
+        if key == "cheap":
+            return self._cheap_traded or self._cheap_exited
+        if key == "relative":
+            return self._relative_traded or self._relative_exited
+        if key == "panic":
+            return self._panic_traded or self._panic_exited
+        return True
+
+    def _execute_delayed_entry(self, entry: dict, price: float, seconds_remaining: float):
+        key = entry["key"]
+        if not self._check_risk_limits(key, entry["label"]):
+            return
+        print(
+            f"  EXECUTING BUY [{entry['label']}]: {entry['side']} "
+            f"best ${entry['best_price']:.3f}, rebound ask ${price:.3f}, "
+            f"condition cap ${entry['condition_price']:.3f}"
+        )
+        if key == "trend":
+            self._place_trend_buy(entry["meta"]["signal"], seconds_remaining, entry["token_id"], price)
+        elif key == "cheap":
+            self._place_cheap_buy(entry["side"], entry["token_id"], entry["amount"], price)
+        elif key == "relative":
+            self._place_relative_buy(entry["side"], entry["token_id"], entry["amount"], price)
+        elif key == "panic":
+            self._place_panic_buy(entry["side"], entry["token_id"], entry["amount"], price)
 
     def _refresh_cached_ws_prices(self):
         market = self._current_market
@@ -1702,6 +1823,24 @@ class PolyBot:
                     shares,
                 )
 
+    def _place_cheap_buy(self, side: str, token_id: str, amount: float, price: float):
+        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._cheap_pending_side = side
+                self._cheap_pending_token_id = token_id
+                self._cheap_pending_order_id = result.order_id
+                self._cheap_pending_price = result.price
+                self._cheap_pending_amount = result.amount_usd
+                self._cheap_pending_shares = result.shares
+                self._cheap_pending_balance_before = self.stats.bankroll
+                self._cheap_pending_last_check = 0.0
+                print("  Cheap scalp buy unverified - will poll order API and balance")
+                return
+            print(f"  Cheap scalp buy failed: {result.error}")
+            return
+        self._activate_cheap_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
     def _try_cheap_scalp_entry(self, seconds_remaining: float):
         if not self._cheap_scalp_enabled:
             return
@@ -1745,23 +1884,10 @@ class PolyBot:
             f"executable ${actual_price:.3f}, amount ${trade_amount:.2f}"
         )
         self._cheap_trade_attempted = True
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._cheap_pending_side = side
-                self._cheap_pending_token_id = token_id
-                self._cheap_pending_order_id = result.order_id
-                self._cheap_pending_price = result.price
-                self._cheap_pending_amount = result.amount_usd
-                self._cheap_pending_shares = result.shares
-                self._cheap_pending_balance_before = self.stats.bankroll
-                self._cheap_pending_last_check = 0.0
-                print("  Cheap scalp buy unverified - will poll order API and balance")
-                return
-            print(f"  Cheap scalp buy failed: {result.error}")
-            return
-
-        self._activate_cheap_buy(side, token_id, result.price, result.amount_usd, result.shares)
+        self._arm_delayed_entry(
+            "cheap", "Cheap scalp", side, token_id, trade_amount,
+            condition_price=cap_price, cap_price=cap_price,
+        )
 
     def _manage_cheap_scalp(self, seconds_remaining: float, now: float):
         if not self._cheap_traded or self._cheap_exited:
@@ -1928,6 +2054,24 @@ class PolyBot:
                     shares,
                 )
 
+    def _place_relative_buy(self, side: str, token_id: str, amount: float, price: float):
+        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._relative_pending_side = side
+                self._relative_pending_token_id = token_id
+                self._relative_pending_order_id = result.order_id
+                self._relative_pending_price = result.price
+                self._relative_pending_amount = result.amount_usd
+                self._relative_pending_shares = result.shares
+                self._relative_pending_balance_before = self.stats.bankroll
+                self._relative_pending_last_check = 0.0
+                print("  Relative overreaction buy unverified - will poll order API and balance")
+                return
+            print(f"  Relative overreaction buy failed: {result.error}")
+            return
+        self._activate_relative_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
     def _try_relative_reaction_entry(self, seconds_remaining: float):
         if not self._relative_enabled:
             return
@@ -1968,22 +2112,11 @@ class PolyBot:
             f"poly actual {actual_move:+.3f}, expected {expected_move:+.3f}, gap -${gap_abs:.3f}"
         )
         self._relative_trade_attempted = True
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._relative_pending_side = side
-                self._relative_pending_token_id = token_id
-                self._relative_pending_order_id = result.order_id
-                self._relative_pending_price = result.price
-                self._relative_pending_amount = result.amount_usd
-                self._relative_pending_shares = result.shares
-                self._relative_pending_balance_before = self.stats.bankroll
-                self._relative_pending_last_check = 0.0
-                print("  Relative overreaction buy unverified - will poll order API and balance")
-                return
-            print(f"  Relative overreaction buy failed: {result.error}")
-            return
-        self._activate_relative_buy(side, token_id, result.price, result.amount_usd, result.shares)
+        self._arm_delayed_entry(
+            "relative", "Relative overreaction", side, token_id, trade_amount,
+            condition_price=cap_price, cap_price=cap_price,
+            min_price=self._relative_min_buy_price,
+        )
 
     def _relative_is_overbought_exit(self) -> bool:
         if not self._relative_traded or len(self._realtime_history) < 3:
@@ -2184,6 +2317,24 @@ class PolyBot:
                     shares,
                 )
 
+    def _place_panic_buy(self, side: str, token_id: str, amount: float, price: float):
+        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._panic_pending_side = side
+                self._panic_pending_token_id = token_id
+                self._panic_pending_order_id = result.order_id
+                self._panic_pending_price = result.price
+                self._panic_pending_amount = result.amount_usd
+                self._panic_pending_shares = result.shares
+                self._panic_pending_balance_before = self.stats.bankroll
+                self._panic_pending_last_check = 0.0
+                print("  Panic rebound buy unverified - will poll order API and balance")
+                return
+            print(f"  Panic rebound buy failed: {result.error}")
+            return
+        self._activate_panic_buy(side, token_id, result.price, result.amount_usd, result.shares)
+
     def _try_panic_rebound_entry(self, btc_price: float, seconds_remaining: float):
         if not self._panic_enabled:
             return
@@ -2214,22 +2365,10 @@ class PolyBot:
             return
         print(f"\n  Panic rebound {side}: ask ${ws_ask:.3f} from high ${recent_high:.3f} drop {drop_pct:.0%}, BTC {btc_delta_pct:+.3f}%")
         self._panic_trade_attempted = True
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=actual_price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._panic_pending_side = side
-                self._panic_pending_token_id = token_id
-                self._panic_pending_order_id = result.order_id
-                self._panic_pending_price = result.price
-                self._panic_pending_amount = result.amount_usd
-                self._panic_pending_shares = result.shares
-                self._panic_pending_balance_before = self.stats.bankroll
-                self._panic_pending_last_check = 0.0
-                print("  Panic rebound buy unverified - will poll order API and balance")
-                return
-            print(f"  Panic rebound buy failed: {result.error}")
-            return
-        self._activate_panic_buy(side, token_id, result.price, result.amount_usd, result.shares)
+        self._arm_delayed_entry(
+            "panic", "Panic rebound", side, token_id, trade_amount,
+            condition_price=cap_price, cap_price=cap_price,
+        )
 
     def _manage_panic_rebound(self, seconds_remaining: float, now: float):
         if not self._panic_traded or self._panic_exited:
@@ -2380,6 +2519,99 @@ class PolyBot:
 
     # ── Entry ───────────────────────────────────────────────────────
 
+    def _place_trend_buy(self, sig, seconds_remaining: float, token_id: str, hint_price: float):
+        slug = f"btc-updown-{self.period}m-{self._current_window}"
+        trade_amount = round(sig.kelly_size, 2)
+        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
+
+        if result.success:
+            self._consecutive_buy_failures = 0
+            self._traded = True
+            self._trade_side = sig.side
+            self._trade_price = result.price
+            self._trade_cost = result.amount_usd
+            self._trade_shares = result.shares
+            self._trade_token_id = token_id
+            self._trend_trailing_armed = False
+            self._trend_peak_profit = 0.0
+
+            self.stats.bankroll -= result.amount_usd
+            self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
+
+            btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+            self.tracker.log_signal(
+                window_ts=self._current_window,
+                btc_price=btc_approx,
+                opening_price=self._opening_price,
+                up_price=self._cached_up,
+                down_price=self._cached_down,
+                seconds_remaining=seconds_remaining,
+                side=sig.side,
+                true_prob=sig.true_prob,
+                market_price=sig.market_price,
+                edge=sig.edge,
+                kelly_size=sig.kelly_size,
+                action="traded",
+                actual_price=result.price,
+                actual_edge=sig.true_prob - result.price,
+                fill_price=result.price,
+            )
+            self.tracker.log_trade_entry(
+                window_ts=self._current_window,
+                side=sig.side,
+                entry_price=result.price,
+                entry_shares=result.shares,
+                entry_cost=result.amount_usd,
+                edge=sig.edge,
+                prob=sig.true_prob,
+                btc_delta=sig.btc_delta_pct,
+                seconds_remaining=seconds_remaining,
+                entry_delta_pct=sig.btc_delta_pct,
+                entry_seconds_remaining=seconds_remaining,
+            )
+
+            mode = "PAPER" if self.dry_run else "LIVE"
+            print(f"  鉁?{mode}: {result.shares:.0f} shares @ "
+                  f"${result.price:.3f} = ${result.amount_usd:.2f}")
+            print(f"     Watching live Polymarket bid for profit exit")
+
+            self.telegram.strategy_trade_alert(
+                strategy="Trend follow",
+                side=sig.side,
+                price=result.price,
+                amount=result.amount_usd,
+                market_slug=slug,
+                dry_run=self.dry_run,
+                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
+                total_pnl=self.stats.total_pnl,
+            )
+            return
+
+        if result.error == "UNVERIFIED_BUY":
+            self._pending_buy_side = sig.side
+            self._pending_buy_price = result.price
+            self._pending_buy_amount = result.amount_usd
+            self._pending_buy_shares = result.shares
+            self._pending_buy_token_id = token_id
+            self._pending_buy_edge = sig.edge
+            self._pending_buy_delta = sig.btc_delta_pct
+            self._pending_buy_order_id = result.order_id
+            self._pending_buy_last_check = 0.0
+            self._balance_before_buy = self.stats.bankroll
+            print(f"  Buy sent but unverified - will poll order API and balance")
+            return
+
+        print(f"  鉂?Buy failed: {result.error}")
+        err = str(result.error).lower()
+        if "request exception" in err or "service not ready" in err or "status_code=none" in err:
+            self._consecutive_buy_failures += 1
+            if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
+                self._clob_halted = True
+                msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
+                       f"consecutive API failures 鈥?stopping trades until restart")
+                print(f"\n  {msg}")
+                self.telegram.status_update({"alert": msg})
+
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
 
@@ -2405,7 +2637,7 @@ class PolyBot:
                     self.telegram.status_update({"alert": msg})
                 return
 
-        market = self._ensure_market_subscription() if not self.dry_run else None
+        market = self._ensure_market_subscription()
         token_id = ""
         if market:
             token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
@@ -2483,6 +2715,20 @@ class PolyBot:
                 actual_price=hint_price,
             )
             return
+
+        if sig.side != "UP":
+            condition_price = hint_price if hint_price > 0 else cap_price
+            self._arm_delayed_entry(
+                "trend", "Trend follow", sig.side, token_id, trade_amount,
+                condition_price=min(condition_price, cap_price),
+                cap_price=cap_price,
+                meta={"signal": sig},
+            )
+            return
+
+        print("  BUY CONDITION TRIGGERED [Trend follow]: UP exception - executing immediately")
+        self._place_trend_buy(sig, seconds_remaining, token_id, hint_price)
+        return
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
 
