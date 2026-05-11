@@ -325,7 +325,7 @@ class Executor:
             return float(price) if price else 0.0
         except Exception as e:
             err = str(e).lower()
-            if "no match" not in err and "none" not in err:
+            if "no match" not in err and "none" not in err and "no orderbook exists" not in err:
                 print(f"[executor] Price check failed: {e}")
             return 0.0
 
