@@ -744,6 +744,22 @@ class PolyBot:
             total_pnl=self.stats.total_pnl,
         )
 
+    def _record_result_stats_only(self, profit: float):
+        self.stats.total_trades += 1
+        if profit > 0:
+            self.stats.wins += 1
+            self.stats.total_pnl += profit
+            self.stats.hourly.record_result(profit, won=True)
+        else:
+            loss = abs(profit)
+            self.stats.losses += 1
+            self.stats.total_pnl -= loss
+            self.stats.hourly.record_result(-loss, won=False)
+
+    def _record_trend_result(self, profit: float):
+        self._record_result_stats_only(profit)
+        self._update_strategy_pnl("trend", "Trend follow", profit)
+
     def _polymarket_winner_for_window(self, window_ts: int = None) -> str:
         window_ts = window_ts or self._current_window
         if window_ts <= 0:
@@ -824,12 +840,12 @@ class PolyBot:
             return
 
         btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
-        updated_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
-
-        if self._trade_side == "DOWN":
-            our_prob = 1.0 - updated_prob
+        direction_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
+        if btc_delta_pct == 0:
+            our_prob = 0.50
         else:
-            our_prob = updated_prob
+            price_direction = "UP" if btc_delta_pct > 0 else "DOWN"
+            our_prob = direction_prob if self._trade_side == price_direction else 1.0 - direction_prob
 
         # Throttled check
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
@@ -975,8 +991,7 @@ class PolyBot:
                         if balance_increase > pp["expected_revenue"] * 0.50:
                             # Settlement landed — it was a real win
                             profit = balance_increase - pp["cost"]
-                            self.stats.record_win(profit)
-                            self._update_strategy_pnl("trend", "Trend follow", profit)
+                            self._record_trend_result(profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
@@ -1000,9 +1015,8 @@ class PolyBot:
                         else:
                             # Balance still hasn't moved — genuine loss
                             net_loss = pp["cost"] - pp["exit_revenue"]
-                            self.stats.record_loss(net_loss)
                             profit = -net_loss
-                            self._update_strategy_pnl("trend", "Trend follow", profit)
+                            self._record_trend_result(profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
                             print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
@@ -1027,8 +1041,7 @@ class PolyBot:
                 else:
                     # Dry run or executor not ready — treat as loss
                     net_loss = pp["cost"] - pp["exit_revenue"]
-                    self.stats.record_loss(net_loss)
-                    self._update_strategy_pnl("trend", "Trend follow", -net_loss)
+                    self._record_trend_result(-net_loss)
                     self._pending_phantom = {}
 
             # Record closing delta for rolling vol calculation
@@ -2399,11 +2412,7 @@ class PolyBot:
     def _resolve_previous_trade(self):
         if self._exited:
             profit = self._exit_revenue - self._trade_cost
-            if profit > 0:
-                self.stats.record_win(profit)
-            else:
-                self.stats.record_loss(abs(profit))
-            self._update_strategy_pnl("trend", "Trend follow", profit)
+            self._record_trend_result(profit)
             result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
             residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
             print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
@@ -2470,12 +2479,11 @@ class PolyBot:
         if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
             net_loss = original_cost - self._exit_revenue
             profit = -net_loss
-            self.stats.record_loss(net_loss)
+            self._record_trend_result(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
-            self._update_strategy_pnl("trend", "Trend follow", profit)
             self.telegram.strategy_result_alert(
                 strategy="Trend follow",
                 profit=profit,
@@ -2604,6 +2612,7 @@ class PolyBot:
     ):
         """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
         if won:
+            resolution_payout = 0.0
             if claim_revenue > 0:
                 total_received = self._exit_revenue + claim_revenue
             else:
@@ -2612,10 +2621,13 @@ class PolyBot:
                 self.stats.bankroll += resolution_payout
                 self._unclaimed_winnings += resolution_payout
             profit = total_received - original_cost
-            self.stats.record_win(profit)
-            self._update_strategy_pnl("trend", "Trend follow", profit)
+            self._record_trend_result(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            claimed_note = " (claimed)" if claim_revenue > 0 else " (unclaimed)"
+            claimed_note = (
+                f" (claimed ${claim_revenue:.2f})"
+                if claim_revenue > 0
+                else f" (unclaimed payout ${resolution_payout:.2f})"
+            )
             print(f"  ✅ WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
@@ -2628,8 +2640,7 @@ class PolyBot:
         else:
             net_loss = original_cost - self._exit_revenue
             profit = -net_loss
-            self.stats.record_loss(net_loss)
-            self._update_strategy_pnl("trend", "Trend follow", profit)
+            self._record_trend_result(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
             print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "

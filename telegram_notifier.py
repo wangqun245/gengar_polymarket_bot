@@ -118,6 +118,11 @@ class TelegramNotifier:
         self.send("\n".join(lines))
 
     def status_update(self, stats: dict):
+        alert = stats.get("alert", "")
+        if alert:
+            self.send(f"*ALERT*\n{alert}", silent=False)
+            return
+
         self.send(
             f"📊 *Status*\n"
             f"Trades: {stats.get('total_trades', 0)}\n"
