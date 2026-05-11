@@ -58,9 +58,32 @@ MAX_EXIT_RETRIES = 3
 EXIT_RETRY_COOLDOWN = 10
 
 
+class TeeStream:
+    """Write console output to both the original stream and a log file."""
+
+    def __init__(self, console, log_file):
+        self.console = console
+        self.log_file = log_file
+
+    def write(self, data):
+        self.console.write(data)
+        self.log_file.write(data)
+        self.flush()
+
+    def flush(self):
+        self.console.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return hasattr(self.console, "isatty") and self.console.isatty()
+
+
 class PolyBot:
     def __init__(self):
         load_dotenv()
+
+        self._runtime_log_file = None
+        self._setup_runtime_log()
 
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         self.period = int(os.getenv("MARKET_PERIOD", "5"))
@@ -302,6 +325,28 @@ class PolyBot:
         self._clob_halted: bool = False
         self._HALT_AFTER_FAILURES: int = 3
         self._daily_loss_halted: bool = False
+
+    def _setup_runtime_log(self):
+        if os.getenv("BOT_RUNTIME_LOG_ENABLED", "true").lower() != "true":
+            return
+        if isinstance(sys.stdout, TeeStream):
+            return
+
+        log_dir = os.getenv("LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        configured_path = os.getenv("BOT_RUNTIME_LOG_FILE", "").strip()
+        if configured_path:
+            log_path = configured_path
+            parent = os.path.dirname(log_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        else:
+            log_path = os.path.join(log_dir, f"bot_{time.strftime('%Y%m%d')}.log")
+
+        self._runtime_log_file = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        sys.stdout = TeeStream(sys.stdout, self._runtime_log_file)
+        sys.stderr = TeeStream(sys.stderr, self._runtime_log_file)
+        print(f"  Runtime log file: {log_path}")
 
     def start(self):
         if not self.dry_run:
