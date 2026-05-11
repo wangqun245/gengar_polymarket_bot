@@ -197,6 +197,8 @@ class PolyBot:
         self._opening_price: float = 0.0
         self._last_hour_check: int = 0
         self._winner_cache: dict = {}
+        self._winner_source_cache: dict = {}
+        self._polymarket_window_prices: dict = {}
         self._dry_pending_resolutions: list = []
         self._resolving_window_ts: int = 0
         self._resolving_window_winner: str = ""
@@ -779,6 +781,53 @@ class PolyBot:
         self._record_result_stats_only(profit)
         self._update_strategy_pnl("trend", "Trend follow", profit)
 
+    def _poly_row_price(self, row: dict, side: str) -> float:
+        bid = row.get(f"{side}_bid", 0.0) or 0.0
+        ask = row.get(f"{side}_ask", 0.0) or 0.0
+        if bid > 0 and ask > 0 and bid < ask:
+            return round((bid + ask) / 2, 4)
+        return ask or bid
+
+    def _remember_polymarket_window_price(self, window_ts: int, row: dict, is_end: bool = False):
+        if window_ts <= 0 or not row:
+            return
+        up_price = self._poly_row_price(row, "UP")
+        down_price = self._poly_row_price(row, "DOWN")
+        if up_price <= 0 and down_price <= 0:
+            return
+        prices = self._polymarket_window_prices.setdefault(window_ts, {})
+        if "start_up" not in prices:
+            prices["start_ts"] = row.get("ts", time.time())
+            prices["start_up"] = up_price
+            prices["start_down"] = down_price
+            t = time.strftime("%H:%M", time.localtime(window_ts))
+            print(f"  Polymarket event start price {t}: UP ${up_price:.3f}, DOWN ${down_price:.3f}")
+        prices["end_ts"] = row.get("ts", time.time())
+        prices["end_up"] = up_price
+        prices["end_down"] = down_price
+        if is_end:
+            t = time.strftime("%H:%M", time.localtime(window_ts))
+            print(f"  Polymarket event end price {t}: UP ${up_price:.3f}, DOWN ${down_price:.3f}")
+
+    def _record_current_polymarket_window_end(self, window_ts: int):
+        if window_ts <= 0:
+            return
+        row = self._realtime_history[-1] if self._realtime_history else None
+        if row:
+            self._remember_polymarket_window_price(window_ts, row, is_end=True)
+
+    def _polymarket_price_fallback_winner(self, window_ts: int) -> str:
+        prices = self._polymarket_window_prices.get(window_ts, {})
+        start_up = prices.get("start_up", 0.0)
+        end_up = prices.get("end_up", 0.0)
+        if start_up <= 0 or end_up <= 0:
+            return ""
+        return "UP" if end_up >= start_up else "DOWN"
+
+    def _winner_resolution_method(self, window_ts: int) -> str:
+        source = self._winner_source_cache.get(window_ts, "")
+        return "polymarket_price_fallback" if source == "price_fallback" else "polymarket_gamma"
+
     def _trailing_profit_exit_ready(
         self, label: str, pnl: float, threshold_reached: bool,
         retreat_pct: float, armed_attr: str, peak_attr: str,
@@ -833,8 +882,20 @@ class PolyBot:
         if winner:
             print(f"  Polymarket final result: {winner} for {window_label} ({window_ts})")
             self._winner_cache[window_ts] = winner
+            self._winner_source_cache[window_ts] = "gamma"
         else:
             print(f"  Polymarket final result not available after 3 tries for {window_label} ({window_ts})")
+            winner = self._polymarket_price_fallback_winner(window_ts)
+            if winner:
+                prices = self._polymarket_window_prices.get(window_ts, {})
+                print(
+                    f"  Polymarket price fallback result: {winner} for {window_label} "
+                    f"(UP ${prices.get('start_up', 0.0):.3f} -> ${prices.get('end_up', 0.0):.3f})"
+                )
+                self._winner_cache[window_ts] = winner
+                self._winner_source_cache[window_ts] = "price_fallback"
+            else:
+                print(f"  Polymarket price fallback not available for {window_label} ({window_ts})")
         return winner
 
     def _dry_run_resolution_won(self, side: str, window_ts: int = None) -> Optional[bool]:
@@ -881,9 +942,10 @@ class PolyBot:
                 profit = -(item["cost"] - item["exit_revenue"])
             self._record_strategy_result(item["key"], item["label"], profit)
             result = "WIN" if won else "LOSS"
+            method = self._winner_resolution_method(item["window_ts"])
             print(
                 f"  {item['label']} dry-run pending resolved {result} "
-                f"{profit:+.2f} via Polymarket final result"
+                f"{profit:+.2f} via {method}"
             )
         self._dry_pending_resolutions = remaining
 
@@ -1037,6 +1099,7 @@ class PolyBot:
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         self._process_dry_pending_resolutions()
         if self._current_window > 0:
+            self._record_current_polymarket_window_end(self._current_window)
             self._resolving_window_ts = self._current_window
             self._resolving_window_winner = (
                 self._polymarket_winner_for_window(self._current_window)
@@ -1438,6 +1501,7 @@ class PolyBot:
             "DOWN_ask": down_ask,
             "DOWN_bid": down_bid,
         })
+        self._remember_polymarket_window_price(self._current_window, self._realtime_history[-1])
         cutoff = now - max(self._realtime_to_save, 1)
         while self._realtime_history and self._realtime_history[0]["ts"] < cutoff:
             self._realtime_history.pop(0)
@@ -2553,9 +2617,9 @@ class PolyBot:
                 won=won,
                 original_cost=original_cost,
                 remaining_shares=remaining_shares,
-                resolution_method="polymarket_gamma",
+                resolution_method=self._winner_resolution_method(self._current_window),
                 claim_revenue=0.0,
-                claim_result="gamma_final",
+                claim_result=self._winner_source_cache.get(self._current_window, "gamma_final"),
             )
             return
 
