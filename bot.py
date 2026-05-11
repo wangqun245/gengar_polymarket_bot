@@ -165,6 +165,7 @@ class PolyBot:
         self._panic_enabled = os.getenv("PANIC_BUY_ENABLED", "true").lower() == "true"
         self._panic_lookback_seconds = int(os.getenv("PANIC_LOOKBACK_SECONDS", "20"))
         self._panic_drop_pct = float(os.getenv("PANIC_DROP_PCT", "0.25"))
+        self._panic_min_high_price = float(os.getenv("PANIC_MIN_HIGH_PRICE", "0.50"))
         self._panic_max_buy_price = float(os.getenv("PANIC_MAX_BUY_PRICE", "0.45"))
         self._panic_max_btc_against_pct = float(os.getenv("PANIC_MAX_BTC_AGAINST_PCT", "0.08"))
         self._panic_entry_window_seconds = int(os.getenv("PANIC_ENTRY_WINDOW_SECONDS", "240"))
@@ -384,7 +385,8 @@ class PolyBot:
         print(f"  Cheap scalp exit: ${self._cheap_take_profit_price:.2f} or "
               f"{self._cheap_min_profit_pct:.0%}+ / ${self._cheap_min_profit_usd:.2f}+")
         print(f"  Panic rebound: {'on' if self._panic_enabled else 'off'} | "
-              f"drop {self._panic_drop_pct:.0%} / buy <= ${self._panic_max_buy_price:.2f}")
+              f"drop {self._panic_drop_pct:.0%} from >= ${self._panic_min_high_price:.2f} / "
+              f"buy <= ${self._panic_max_buy_price:.2f}")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
         print(f"  Exits: arm on profit target, sell on profit retreat; otherwise hold to resolution")
         print(
@@ -2094,6 +2096,8 @@ class PolyBot:
             current_ask = history[-1][1]
             recent_high = max(row[1] for row in history)
             if current_ask <= 0 or recent_high <= 0:
+                continue
+            if recent_high < self._panic_min_high_price:
                 continue
             drop_pct = (recent_high - current_ask) / recent_high
             if drop_pct < self._panic_drop_pct or current_ask > self._panic_max_buy_price:
