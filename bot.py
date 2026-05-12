@@ -30,6 +30,7 @@ import time
 import signal
 import math
 import statistics
+import builtins
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -57,6 +58,54 @@ POSITION_CHECK_INTERVAL = 0.25
 MAX_EXIT_RETRIES = 3
 EXIT_RETRY_COOLDOWN = 10
 PENDING_BUY_STATUS_LOG_INTERVAL = 30.0
+
+
+_RAW_PRINT = builtins.print
+
+
+def _sanitize_console_text(value) -> str:
+    """Keep systemd/journalctl logs readable even if old source text is mojibake."""
+    text = str(value)
+    replacements = {
+        "鈹€": "-",
+        "═": "=",
+        "鈥?": "-",
+        "鈫?": "->",
+        "鈴?": "[TIME]",
+        "鉁?": "[OK]",
+        "鉂?": "[ERROR]",
+        "鈿狅笍": "[WARN]",
+        "馃敶": "LIVE",
+        "馃殌": "[RUN]",
+        "馃晲": "[WINDOW]",
+        "馃搶": "[INFO]",
+        "馃搳": "[SUMMARY]",
+        "馃挵": "[MONEY]",
+        "馃搱": "[UP]",
+        "馃搲": "[DOWN]",
+        "馃洃": "[STOP]",
+        "馃攧": "[SYNC]",
+        "馃攲": "[HALT]",
+        "馃幆": "[TRADE]",
+        "馃懟": "[LATE_FILL]",
+        "閴?": "[ORDER]",
+        "↑": "UP",
+        "↓": "DOWN",
+        "→": "FLAT",
+        "—": "-",
+        "–": "-",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return "".join(ch if ord(ch) < 128 else "" for ch in text)
+
+
+def _safe_print(*args, **kwargs):
+    args = tuple(_sanitize_console_text(arg) for arg in args)
+    _RAW_PRINT(*args, **kwargs)
+
+
+builtins.print = _safe_print
 
 
 class TeeStream:
