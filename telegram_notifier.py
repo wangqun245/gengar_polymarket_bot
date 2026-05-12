@@ -12,6 +12,7 @@ class TelegramNotifier:
     def __init__(self, bot_token: str = None, chat_id: str = None):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+        self.title_suffix = os.getenv("TELEGRAM_TITLE_SUFFIX", "_EU")
         self.enabled = bool(self.bot_token and self.chat_id)
         if not self.enabled:
             print("[telegram] No token/chat_id configured — notifications disabled")
@@ -19,9 +20,28 @@ class TelegramNotifier:
     def send(self, message: str, silent: bool = False):
         if not self.enabled:
             return
+        message = self._add_title_suffix(message)
         threading.Thread(
             target=self._send_sync, args=(message, silent), daemon=True
         ).start()
+
+    def _add_title_suffix(self, message: str) -> str:
+        suffix = self.title_suffix.strip()
+        if not suffix or not message:
+            return message
+        lines = message.splitlines()
+        if not lines:
+            return message
+        first = lines[0]
+        if suffix in first:
+            return message
+        if "*" in first:
+            last_star = first.rfind("*")
+            if last_star > 0:
+                lines[0] = first[:last_star] + suffix + first[last_star:]
+                return "\n".join(lines)
+        lines[0] = first + suffix
+        return "\n".join(lines)
 
     def _send_sync(self, message: str, silent: bool):
         try:
