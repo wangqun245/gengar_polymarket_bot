@@ -3061,17 +3061,7 @@ class PolyBot:
             )
             return
 
-        if sig.side != "UP":
-            condition_price = hint_price if hint_price > 0 else cap_price
-            self._arm_delayed_entry(
-                "trend", "Trend follow", sig.side, token_id, trade_amount,
-                condition_price=min(condition_price, cap_price),
-                cap_price=cap_price,
-                meta={"signal": sig},
-            )
-            return
-
-        print("  BUY CONDITION TRIGGERED [Trend follow]: UP exception - executing immediately")
+        print(f"  BUY CONDITION TRIGGERED [Trend follow]: {sig.side} - executing immediately")
         self._place_trend_buy(sig, seconds_remaining, token_id, hint_price)
         return
 
