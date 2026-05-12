@@ -56,7 +56,7 @@ FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 0.25
 MAX_EXIT_RETRIES = 3
 EXIT_RETRY_COOLDOWN = 10
-PENDING_BUY_VERIFY_TTL = 10.0
+PENDING_BUY_VERIFY_TTL = 120.0
 
 
 class TeeStream:
@@ -262,6 +262,7 @@ class PolyBot:
         self._cheap_pending_token_balance_before: float = 0.0
         self._cheap_pending_last_check: float = 0.0
         self._cheap_pending_started_at: float = 0.0
+        self._cheap_pending_window: int = 0
 
         # Strategy-level risk and P&L
         self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
@@ -296,6 +297,7 @@ class PolyBot:
         self._relative_pending_token_balance_before: float = 0.0
         self._relative_pending_last_check: float = 0.0
         self._relative_pending_started_at: float = 0.0
+        self._relative_pending_window: int = 0
 
         # Third strategy: panic sell rebound
         self._panic_traded: bool = False
@@ -321,6 +323,7 @@ class PolyBot:
         self._panic_pending_token_balance_before: float = 0.0
         self._panic_pending_last_check: float = 0.0
         self._panic_pending_started_at: float = 0.0
+        self._panic_pending_window: int = 0
 
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
         # Resolved at next window boundary once Polygon settlement has had time to land.
@@ -339,6 +342,7 @@ class PolyBot:
         self._balance_before_buy: float = 0.0
         self._pending_buy_token_balance_before: float = 0.0
         self._pending_buy_started_at: float = 0.0
+        self._pending_buy_window: int = 0
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -1221,7 +1225,7 @@ class PolyBot:
                     self._check_pending_buy_fill(time.time())
                 if False and self._pending_buy_side and not self._traded and not self.dry_run and self.executor._initialized:
                     now = time.time()
-                    if self._pending_buy_expired(self._pending_buy_started_at, now, "Trend follow"):
+                    if self._pending_buy_expired(self._pending_buy_started_at, self._pending_buy_window, now, "Trend follow"):
                         self._clear_pending_buy()
                     if not self._pending_buy_side:
                         pass
@@ -1420,8 +1424,14 @@ class PolyBot:
         self._balance_before_buy = 0.0
         self._pending_buy_token_balance_before = 0.0
         self._pending_buy_started_at = 0.0
+        self._pending_buy_window = 0
 
-    def _pending_buy_expired(self, started_at: float, now: float, label: str) -> bool:
+    def _pending_buy_expired(
+        self, started_at: float, pending_window: int, now: float, label: str
+    ) -> bool:
+        if pending_window > 0 and pending_window != self._current_window:
+            print(f"  {label} pending buy moved to a new event - clearing pending state")
+            return True
         if started_at <= 0 or now - started_at <= PENDING_BUY_VERIFY_TTL:
             return False
         print(
@@ -1472,7 +1482,9 @@ class PolyBot:
             return
         if self._pending_buy_started_at <= 0:
             self._pending_buy_started_at = now
-        if self._pending_buy_expired(self._pending_buy_started_at, now, "Trend follow"):
+        if self._pending_buy_expired(
+            self._pending_buy_started_at, self._pending_buy_window, now, "Trend follow"
+        ):
             self._clear_pending_buy()
             return
         if now - self._pending_buy_last_check < 2.0:
@@ -1844,6 +1856,7 @@ class PolyBot:
         self._cheap_pending_token_balance_before = 0.0
         self._cheap_pending_last_check = 0.0
         self._cheap_pending_started_at = 0.0
+        self._cheap_pending_window = 0
 
     def _activate_cheap_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
         self._cheap_traded = True
@@ -1878,7 +1891,9 @@ class PolyBot:
             return
         if self._cheap_pending_started_at <= 0:
             self._cheap_pending_started_at = now
-        if self._pending_buy_expired(self._cheap_pending_started_at, now, "Cheap scalp"):
+        if self._pending_buy_expired(
+            self._cheap_pending_started_at, self._cheap_pending_window, now, "Cheap scalp"
+        ):
             self._clear_pending_cheap_buy()
             return
         if now - self._cheap_pending_last_check < 2.0:
@@ -1933,6 +1948,7 @@ class PolyBot:
                 self._cheap_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._cheap_pending_last_check = 0.0
                 self._cheap_pending_started_at = time.time()
+                self._cheap_pending_window = self._current_window
                 print("  Cheap scalp buy unverified - will poll order API and balance")
                 return
             print(f"  Cheap scalp buy failed: {result.error}")
@@ -2092,6 +2108,7 @@ class PolyBot:
         self._relative_pending_token_balance_before = 0.0
         self._relative_pending_last_check = 0.0
         self._relative_pending_started_at = 0.0
+        self._relative_pending_window = 0
 
     def _activate_relative_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
         self._relative_traded = True
@@ -2123,7 +2140,9 @@ class PolyBot:
             return
         if self._relative_pending_started_at <= 0:
             self._relative_pending_started_at = now
-        if self._pending_buy_expired(self._relative_pending_started_at, now, "Relative overreaction"):
+        if self._pending_buy_expired(
+            self._relative_pending_started_at, self._relative_pending_window, now, "Relative overreaction"
+        ):
             self._clear_pending_relative_buy()
             return
         if now - self._relative_pending_last_check < 2.0:
@@ -2178,6 +2197,7 @@ class PolyBot:
                 self._relative_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._relative_pending_last_check = 0.0
                 self._relative_pending_started_at = time.time()
+                self._relative_pending_window = self._current_window
                 print("  Relative overreaction buy unverified - will poll order API and balance")
                 return
             print(f"  Relative overreaction buy failed: {result.error}")
@@ -2369,6 +2389,7 @@ class PolyBot:
         self._panic_pending_token_balance_before = 0.0
         self._panic_pending_last_check = 0.0
         self._panic_pending_started_at = 0.0
+        self._panic_pending_window = 0
 
     def _activate_panic_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
         self._panic_traded = True
@@ -2400,7 +2421,9 @@ class PolyBot:
             return
         if self._panic_pending_started_at <= 0:
             self._panic_pending_started_at = now
-        if self._pending_buy_expired(self._panic_pending_started_at, now, "Panic rebound"):
+        if self._pending_buy_expired(
+            self._panic_pending_started_at, self._panic_pending_window, now, "Panic rebound"
+        ):
             self._clear_pending_panic_buy()
             return
         if now - self._panic_pending_last_check < 2.0:
@@ -2455,6 +2478,7 @@ class PolyBot:
                 self._panic_pending_token_balance_before = self.executor.get_token_balance(token_id)
                 self._panic_pending_last_check = 0.0
                 self._panic_pending_started_at = time.time()
+                self._panic_pending_window = self._current_window
                 print("  Panic rebound buy unverified - will poll order API and balance")
                 return
             print(f"  Panic rebound buy failed: {result.error}")
@@ -2727,6 +2751,7 @@ class PolyBot:
             self._balance_before_buy = self.stats.bankroll
             self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
             self._pending_buy_started_at = time.time()
+            self._pending_buy_window = self._current_window
             print(f"  Buy sent but unverified - will poll order API and balance")
             return
 
@@ -2938,6 +2963,7 @@ class PolyBot:
                 self._balance_before_buy = self.stats.bankroll
                 self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
                 self._pending_buy_started_at = time.time()
+                self._pending_buy_window = self._current_window
                 print(f"  Buy sent but unverified - will poll order API and balance")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
