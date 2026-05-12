@@ -1,12 +1,12 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-PolyBot v13 — Recalibrated + Safety Systems
+PolyBot v13 鈥?Recalibrated + Safety Systems
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
   - Entry gate: model confidence >= 80%, market price <= true_prob * 0.85
-  - Position sizing: quarter-Kelly, $5–$25 per trade
-  - Exit: hold all positions to resolution — no stops, no take-profit
+  - Position sizing: quarter-Kelly, $5鈥?25 per trade
+  - Exit: hold all positions to resolution 鈥?no stops, no take-profit
 
 Safety systems:
   1. CLOB health check: get_ok() before every trade; 3 consecutive
@@ -14,7 +14,7 @@ Safety systems:
      when API comes back at next window boundary.
   2. Daily loss limit: if balance retreats from its daily peak by DAILY_LOSS_LIMIT_RETREAT, halt trading.
   3. Balance-verified buys: snapshot USDC before/after; ghost fills
-     caught even when API throws. Never cancels on timeout — returns
+     caught even when API throws. Never cancels on timeout 鈥?returns
      UNVERIFIED_BUY for pending detection at next window boundary.
   4. Pending buy safety net: if buy unverified, check balance at next
      window boundary; retroactively track as filled if balance dropped.
@@ -332,7 +332,7 @@ class PolyBot:
         # Resolved at next window boundary once Polygon settlement has had time to land.
         self._pending_phantom: dict = {}
 
-        # Pending buy (unverified — Polygon settlement too slow)
+        # Pending buy (unverified 鈥?Polygon settlement too slow)
         self._pending_buy_side: str = ""
         self._pending_buy_price: float = 0.0
         self._pending_buy_amount: float = 0.0
@@ -361,7 +361,7 @@ class PolyBot:
         self._price_last_fetched: float = 0.0
         self._PRICE_REFRESH: float = 5.0
 
-        # Circuit breaker — detects CLOB API degradation
+        # Circuit breaker 鈥?detects CLOB API degradation
         self._consecutive_buy_failures: int = 0
         self._clob_halted: bool = False
         self._HALT_AFTER_FAILURES: int = 3
@@ -394,9 +394,9 @@ class PolyBot:
             print("  Direct CLOB connection enabled (Tor disabled)")
 
         print("=" * 55)
-        print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
-        print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
-        print(f"  Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
+        print(f"  PolyBot v13 鈥?Recalibrated (vol=0.12)")
+        print(f"  Mode: {'DRY RUN' if self.dry_run else '馃敶 LIVE TRADING'}")
+        print(f"  Bets: ${self.strategy_config.min_bet:.0f}鈥?{self.strategy_config.max_bet:.0f}")
         print(f"  Entry mode: Binance trend scalp")
         print(f"  Entry direction: {'inverse trend' if self.strategy_config.invert_trend_entry else 'trend follow'}")
         print(f"  Trend trigger: {self.strategy_config.trend_entry_threshold_pct:.3f}% | "
@@ -448,7 +448,7 @@ class PolyBot:
 
         if not self.dry_run:
             if not self.executor.initialize():
-                print("\n❌ Failed to initialize. Check credentials.")
+                print("\n鉂?Failed to initialize. Check credentials.")
                 return
             balance = self.executor.get_balance()
             print(f"  USDC balance: ${balance:.2f}")
@@ -458,7 +458,7 @@ class PolyBot:
             self._balance_peak = balance
             self.tracker.set_session_balance(balance)
         else:
-            print("  [dry run — no wallet connection]")
+            print("  [dry run 鈥?no wallet connection]")
             self._session_start_balance = self.stats.bankroll
             self._last_real_balance = self.stats.bankroll
             self._balance_peak = self.stats.bankroll
@@ -467,12 +467,12 @@ class PolyBot:
         self.price_feed.start()
         if self._poly_ws_enabled:
             self.poly_feed.start()
-        print("\n⏳ Waiting for BTC price...")
+        print("\n鈴?Waiting for BTC price...")
         price = self.price_feed.wait_for_price(timeout=30)
         if not price:
-            print("❌ No price feed. Check internet.")
+            print("鉂?No price feed. Check internet.")
             return
-        print(f"✅ BTC: ${price:,.2f} ({self.price_feed.state.source})")
+        print(f"鉁?BTC: ${price:,.2f} ({self.price_feed.state.source})")
 
         self.telegram.startup_alert({
             "dry_run": self.dry_run,
@@ -489,7 +489,7 @@ class PolyBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-        print("\n🚀 Running. Ctrl+C to stop.\n")
+        print("\n馃殌 Running. Ctrl+C to stop.\n")
         self._main_loop()
 
     def _main_loop(self):
@@ -523,7 +523,7 @@ class PolyBot:
 
         if self._opening_price <= 0:
             self._opening_price = btc_price
-            print(f"  📌 Open: ${btc_price:,.2f}")
+            print(f"  馃搶 Open: ${btc_price:,.2f}")
 
         self._ensure_market_subscription()
         ws_warmed = (
@@ -600,7 +600,7 @@ class PolyBot:
         if now - self._last_status_print >= 30:
             self._last_status_print = now
             delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
-            d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+            d = "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT"
             if self._traded:
                 state = "HOLDING"
             elif skip_reason == "trend_below_threshold":
@@ -617,15 +617,15 @@ class PolyBot:
             n = len(self._recent_window_deltas)
             vol_label = f"{self._compute_realized_vol():.3f}({'r' if n >= 6 else f'fb,n={n}'})"
             print(
-                f"  ⏱  T-{seconds_remaining:5.1f}s | "
+                f"  鈴? T-{seconds_remaining:5.1f}s | "
                 f"BTC ${btc_price:,.2f} {d}{abs(delta):.3f}% | "
                 f"UP ${self._cached_up:.3f} DN ${self._cached_down:.3f} | "
                 f"vol={vol_label} | P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
-    # ── Active position management ──────────────────────────────────
+    # 鈹€鈹€ Active position management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-    # ── Position monitoring (hold to resolution) ────────────────────
+    # 鈹€鈹€ Position monitoring (hold to resolution) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _check_daily_loss_limit(self, label: str = "trade") -> bool:
         if self._daily_loss_halted:
@@ -897,18 +897,18 @@ class PolyBot:
     def _exit_price_is_profitable(
         self, label: str, shares: float, cost: float, sell_price: float,
         min_profit_usd: float, notice_key: str, token_id: str = "",
-        allow_below_min_profit: bool = False,
+        allow_below_min_profit: bool = False, realized_revenue: float = 0.0,
     ) -> bool:
         sellable_shares = shares
         if token_id and not self.dry_run and self.executor._initialized:
             token_balance = self.executor.get_token_balance(token_id)
             if token_balance > 0:
                 sellable_shares = min(shares, float(int(token_balance)))
-        pnl = sellable_shares * sell_price - cost
+        pnl = realized_revenue + sellable_shares * sell_price - cost
         required_profit = max(float(min_profit_usd), 0.0)
         if allow_below_min_profit:
             required_profit = 0.0
-        if pnl >= required_profit and sell_price > 0:
+        if pnl >= required_profit - 0.01 and sell_price > 0:
             return True
         now = time.time()
         last_notice = self._exit_guard_last_notice.get(notice_key, 0.0)
@@ -924,7 +924,7 @@ class PolyBot:
     def _profit_floor_exit_ready(
         self, label: str, shares: float, cost: float, sell_price: float,
         target_price: float, min_profit_usd: float, armed_attr: str,
-        notice_key: str, token_id: str = "",
+        notice_key: str, token_id: str = "", realized_revenue: float = 0.0,
     ) -> bool:
         if not getattr(self, armed_attr):
             return False
@@ -933,9 +933,9 @@ class PolyBot:
             token_balance = self.executor.get_token_balance(token_id)
             if token_balance > 0:
                 sellable_shares = min(shares, float(int(token_balance)))
-        pnl = sellable_shares * sell_price - cost
+        pnl = realized_revenue + sellable_shares * sell_price - cost
         below_floor = sell_price < target_price or pnl < max(float(min_profit_usd), 0.0)
-        if not below_floor or pnl <= 0:
+        if not below_floor or pnl < -0.01:
             return False
         now = time.time()
         last_notice = self._exit_guard_last_notice.get(f"{notice_key}_floor", 0.0)
@@ -1050,7 +1050,7 @@ class PolyBot:
         self._dry_pending_resolutions = remaining
 
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
-        """Monitor only — all trades hold to resolution. No stops.
+        """Monitor only 鈥?all trades hold to resolution. No stops.
         Tracker logs hold-period stats for future optimization.
         """
         if self._opening_price <= 0:
@@ -1068,12 +1068,12 @@ class PolyBot:
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
             if now - self._last_status_print >= 30:
                 self._last_status_print = now
-                d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
+                d = "UP" if btc_delta_pct > 0 else "DOWN" if btc_delta_pct < 0 else "FLAT"
                 print(
-                    f"  ⏱  T-{seconds_remaining:5.1f}s | "
+                    f"  鈴? T-{seconds_remaining:5.1f}s | "
                     f"BTC {d}{abs(btc_delta_pct):.3f}% | "
                     f"Prob: {our_prob:.2f} | "
-                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING→RES]"
+                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING鈫扲ES]"
                 )
             return
 
@@ -1090,11 +1090,27 @@ class PolyBot:
         self.tracker.update_hold_stats(our_prob, current_sell_price)
 
         current_value = self._trade_shares * current_sell_price
-        unrealized_pnl = current_value - self._trade_cost
+        unrealized_pnl = self._exit_revenue + current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
         target_price = self._profit_target_price()
         can_sell_notional = self._trade_shares * current_sell_price >= 5.0
+
+        if self._exit_revenue > 0 and can_sell_notional:
+            sell_price = current_sell_price
+            if not self.dry_run and self._confirm_ws_sell_price:
+                probe = max(round(self._trade_shares * current_sell_price, 2), 1.0)
+                confirmed = self.executor.get_market_price(self._trade_token_id, "SELL", probe)
+                if confirmed > 0:
+                    sell_price = confirmed
+            partial_recovery_pnl = self._exit_revenue + self._trade_shares * sell_price - self._trade_cost
+            if partial_recovery_pnl >= -0.01:
+                self._exit_position(
+                    sell_price, seconds_remaining, "partial_recovery",
+                    allow_below_min_profit=True,
+                )
+                return
+
         threshold_reached = (
             current_sell_price >= target_price
             and unrealized_pnl >= self._min_profit_usd
@@ -1108,7 +1124,7 @@ class PolyBot:
                 if confirmed > 0:
                     sell_price = confirmed
                     current_value = self._trade_shares * sell_price
-                    unrealized_pnl = current_value - self._trade_cost
+                    unrealized_pnl = self._exit_revenue + current_value - self._trade_cost
             threshold_reached = (
                 sell_price >= target_price
                 and unrealized_pnl >= self._min_profit_usd
@@ -1117,11 +1133,12 @@ class PolyBot:
                 "Trend follow", self._trade_shares, self._trade_cost,
                 sell_price, target_price, self._min_profit_usd,
                 "_trend_trailing_armed", "trend", self._trade_token_id,
+                realized_revenue=self._exit_revenue,
             ):
                 if not self._exit_price_is_profitable(
                     "Trend follow", self._trade_shares, self._trade_cost,
                     sell_price, self._min_profit_usd, "trend", self._trade_token_id,
-                    allow_below_min_profit=True,
+                    allow_below_min_profit=True, realized_revenue=self._exit_revenue,
                 ):
                     return
                 self._exit_position(
@@ -1137,6 +1154,7 @@ class PolyBot:
                 if not self._exit_price_is_profitable(
                     "Trend follow", self._trade_shares, self._trade_cost,
                     sell_price, self._min_profit_usd, "trend", self._trade_token_id,
+                    realized_revenue=self._exit_revenue,
                 ):
                     return
                 self._exit_position(sell_price, seconds_remaining, "trailing_profit")
@@ -1147,8 +1165,8 @@ class PolyBot:
         self._last_status_print = now
 
         # Status line
-        d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
-        pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
+        d = "UP" if btc_delta_pct > 0 else "DOWN" if btc_delta_pct < 0 else "FLAT"
+        pnl_emoji = "馃搱" if unrealized_pnl > 0 else "馃搲"
         print(
             f"  {pnl_emoji} T-{seconds_remaining:5.1f}s | "
             f"BTC {d}{abs(btc_delta_pct):.3f}% | "
@@ -1158,7 +1176,7 @@ class PolyBot:
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
         )
 
-    # ── Execute exit (balance-verified, partial fill aware) ─────────
+    # 鈹€鈹€ Execute exit (balance-verified, partial fill aware) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _exit_position(
         self, sell_price: float, seconds_remaining: float, reason: str,
@@ -1168,6 +1186,7 @@ class PolyBot:
             "Trend follow", self._trade_shares, self._trade_cost,
             sell_price, self._min_profit_usd, "trend", self._trade_token_id,
             allow_below_min_profit=allow_below_min_profit,
+            realized_revenue=self._exit_revenue,
         ):
             return
         if self.dry_run:
@@ -1176,7 +1195,7 @@ class PolyBot:
             self._exit_revenue = revenue
             self.stats.bankroll += revenue
             profit = revenue - self._trade_cost
-            print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
+            print(f"  馃挵 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
                   f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
             return
 
@@ -1194,37 +1213,36 @@ class PolyBot:
 
             if result.status == PARTIAL and result.shares_remaining >= 1:
                 # Partial fill: got some USDC back, still have shares
-                print(f"  💰 EXIT ({reason}, partial): ~{result.shares:.0f} shares @ "
+                print(f"  馃挵 EXIT ({reason}, partial): ~{result.shares:.0f} shares @ "
                       f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"~{result.shares_remaining:.0f} shares remaining → holding to resolution")
+                      f"~{result.shares_remaining:.0f} shares remaining -> keep monitoring")
                 # Update shares but keep original cost for clean P&L math
                 self._trade_shares = result.shares_remaining
-                # Mark exited — residual resolves at window close
-                self._exited = True
+                self._exited = False
             else:
                 # Full fill (or residual < 1 share)
                 self._exited = True
                 profit = self._exit_revenue - self._trade_cost
-                print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
+                print(f"  馃挵 EXIT ({reason}): {result.shares:.0f} shares @ "
                       f"${result.price:.3f} = ${result.amount_usd:.2f} | "
                       f"Profit: ${profit:+.2f}")
         elif "hold to resolution" in result.error:
-            # Below $5 minimum — can't sell, hold to resolution
+            # Below $5 minimum 鈥?can't sell, hold to resolution
             notional = self._trade_shares * sell_price
-            print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
+            print(f"  馃搶 Can't sell: ${notional:.2f} below $5 minimum 鈥?holding to resolution")
             self._exit_gave_up = True  # Skip further exit attempts
         else:
             self._exit_retries += 1
             if self._exit_retries >= MAX_EXIT_RETRIES:
-                print(f"  ❌ Exit failed {MAX_EXIT_RETRIES} times ({reason}) — "
+                print(f"  鉂?Exit failed {MAX_EXIT_RETRIES} times ({reason}) 鈥?"
                       f"holding to resolution")
                 self._exit_gave_up = True
             else:
-                print(f"  ⚠️  Exit failed ({reason}, attempt "
+                print(f"  鈿狅笍  Exit failed ({reason}, attempt "
                       f"{self._exit_retries}/{MAX_EXIT_RETRIES}): {result.error}")
                 self._last_position_check = time.time() + EXIT_RETRY_COOLDOWN - POSITION_CHECK_INTERVAL
 
-    # ── Window management ───────────────────────────────────────────
+    # 鈹€鈹€ Window management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         self._process_dry_pending_resolutions()
@@ -1245,12 +1263,12 @@ class PolyBot:
                     if real_bal > 0:
                         balance_increase = max(0.0, real_bal - pp["pre_sell_balance"])
                         if balance_increase > pp["expected_revenue"] * 0.50:
-                            # Settlement landed — it was a real win
+                            # Settlement landed 鈥?it was a real win
                             profit = balance_increase - pp["cost"]
                             self._record_trend_result(profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
-                            print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
+                            print(f"  鉁?Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
                             self.telegram.strategy_result_alert(
                                 strategy="Trend follow",
@@ -1269,13 +1287,13 @@ class PolyBot:
                                 claim_result="phantom_resolved",
                             )
                         else:
-                            # Balance still hasn't moved — genuine loss
+                            # Balance still hasn't moved 鈥?genuine loss
                             net_loss = pp["cost"] - pp["exit_revenue"]
                             profit = -net_loss
                             self._record_trend_result(profit)
                             self.stats.bankroll = real_bal
                             self._last_real_balance = real_bal
-                            print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
+                            print(f"  鉂?Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
                             self.telegram.strategy_result_alert(
                                 strategy="Trend follow",
@@ -1295,7 +1313,7 @@ class PolyBot:
                             )
                         self._pending_phantom = {}
                 else:
-                    # Dry run or executor not ready — treat as loss
+                    # Dry run or executor not ready 鈥?treat as loss
                     net_loss = pp["cost"] - pp["exit_revenue"]
                     self._record_trend_result(-net_loss)
                     self._pending_phantom = {}
@@ -1322,7 +1340,7 @@ class PolyBot:
                         if real_bal > 0 and self._balance_before_buy > 0:
                             spent = self._balance_before_buy - real_bal
                             if spent > 1.0:
-                            # The buy DID go through — retroactively track it
+                            # The buy DID go through 鈥?retroactively track it
                                 current_tokens = self.executor.get_token_balance(self._pending_buy_token_id)
                                 est_shares = max(0.0, current_tokens - self._pending_buy_token_balance_before)
                                 if est_shares < 1:
@@ -1331,7 +1349,7 @@ class PolyBot:
                                         "but no token balance/order fill is verified yet"
                                     )
                                     return
-                            print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
+                            print(f"\n  馃懟 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
                             print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
                                   f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
 
@@ -1396,7 +1414,7 @@ class PolyBot:
                 if real_bal > 0:
                     drift = abs(real_bal - self.stats.bankroll)
                     if drift > 0.50:
-                        print(f"  🔄 Balance sync: ${self.stats.bankroll:.2f} → "
+                        print(f"  馃攧 Balance sync: ${self.stats.bankroll:.2f} 鈫?"
                               f"${real_bal:.2f} (drift ${drift:.2f})")
                     self.stats.bankroll = real_bal
                     self._last_real_balance = real_bal
@@ -1482,11 +1500,11 @@ class PolyBot:
         self._pending_buy_started_at = 0.0
 
         t = time.strftime("%H:%M:%S", time.localtime(window_ts))
-        print(f"\n{'─' * 55}")
-        print(f"🕐 {t} | Trades: {self.stats.total_trades} | "
+        print(f"\n{'鈹€' * 55}")
+        print(f"馃晲 {t} | Trades: {self.stats.total_trades} | "
               f"W/L: {self.stats.wins}/{self.stats.losses} | "
               f"P&L: ${self.stats.total_pnl:+.2f}")
-        print(f"{'─' * 55}")
+        print(f"{'鈹€' * 55}")
 
         # Circuit breaker auto-recovery: ping CLOB each new window
         if self._clob_halted and not self.dry_run and self.executor._initialized:
@@ -1494,11 +1512,11 @@ class PolyBot:
                 self.executor.client.get_ok()
                 self._clob_halted = False
                 self._consecutive_buy_failures = 0
-                print(f"  ✅ CLOB recovered (health check OK) — resuming trades")
+                print(f"  鉁?CLOB recovered (health check OK) 鈥?resuming trades")
             except Exception:
-                print(f"  🔌 CLOB health check still failing — staying halted")
+                print(f"  馃攲 CLOB health check still failing 鈥?staying halted")
 
-    # ── Polymarket live prices ──────────────────────────────────────
+    # 鈹€鈹€ Polymarket live prices 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _clear_pending_buy(self):
         self._pending_buy_side = ""
@@ -1553,7 +1571,7 @@ class PolyBot:
             self.stats.bankroll -= amount
         self.stats.hourly.record_trade(self._pending_buy_edge, self._pending_buy_delta)
         print(
-            f"  ✅ Pending buy verified [{source}]: ~{shares:.0f} shares "
+            f"  鉁?Pending buy verified [{source}]: ~{shares:.0f} shares "
             f"{self._trade_side} @ ${price:.3f} = ${amount:.2f}"
         )
         self.tracker.log_trade_entry(
@@ -2123,7 +2141,36 @@ class PolyBot:
             return
 
         target = self._cheap_profit_target_price()
-        pnl = self._cheap_shares * sell_price - self._cheap_cost
+        pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
+        if self._cheap_exit_revenue > 0 and self._cheap_shares * sell_price >= 5.0:
+            if not self.dry_run and self._confirm_ws_sell_price:
+                probe = max(round(self._cheap_shares * sell_price, 2), 1.0)
+                confirmed = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
+                if confirmed > 0:
+                    sell_price = confirmed
+                    pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
+            if pnl >= -0.01:
+                result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
+                if result.success:
+                    self._cheap_exit_revenue += result.amount_usd
+                    self.stats.bankroll += result.amount_usd
+                    if result.status == PARTIAL and result.shares_remaining >= 1:
+                        self._cheap_shares = result.shares_remaining
+                        self._cheap_exited = False
+                        print(
+                            f"  Cheap scalp exit (partial_recovery, partial): {result.shares:.0f} {self._cheap_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                        )
+                    else:
+                        self._cheap_exited = True
+                        profit = self._cheap_exit_revenue - self._cheap_cost
+                        self._record_cheap_result(profit)
+                        print(
+                            f"  Cheap scalp exit (partial_recovery): {result.shares:.0f} {self._cheap_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+                        )
+                return
         threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
         if not threshold_reached and not self._cheap_trailing_armed:
             return
@@ -2136,30 +2183,40 @@ class PolyBot:
             confirmed = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
             if confirmed > 0:
                 sell_price = confirmed
-                pnl = self._cheap_shares * sell_price - self._cheap_cost
+                pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
         threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
         if self._profit_floor_exit_ready(
             "Cheap scalp", self._cheap_shares, self._cheap_cost,
             sell_price, target, self._cheap_min_profit_usd,
             "_cheap_trailing_armed", "cheap", self._cheap_token_id,
+            realized_revenue=self._cheap_exit_revenue,
         ):
             if not self._exit_price_is_profitable(
                 "Cheap scalp", self._cheap_shares, self._cheap_cost,
                 sell_price, self._cheap_min_profit_usd, "cheap", self._cheap_token_id,
-                allow_below_min_profit=True,
+                allow_below_min_profit=True, realized_revenue=self._cheap_exit_revenue,
             ):
                 return
             result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
             if result.success:
-                self._cheap_exited = True
                 self._cheap_exit_revenue += result.amount_usd
                 self.stats.bankroll += result.amount_usd
-                profit = self._cheap_exit_revenue - self._cheap_cost
-                self._record_cheap_result(profit)
-                print(
-                    f"  Cheap scalp exit (profit_floor): {result.shares:.0f} {self._cheap_side} "
-                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                )
+                if result.status == PARTIAL and result.shares_remaining >= 1:
+                    self._cheap_shares = result.shares_remaining
+                    self._cheap_exited = False
+                    print(
+                        f"  Cheap scalp exit (profit_floor, partial): {result.shares:.0f} {self._cheap_side} "
+                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                    )
+                else:
+                    self._cheap_exited = True
+                    profit = self._cheap_exit_revenue - self._cheap_cost
+                    self._record_cheap_result(profit)
+                    print(
+                        f"  Cheap scalp exit (profit_floor): {result.shares:.0f} {self._cheap_side} "
+                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+                    )
             return
         if not self._trailing_profit_exit_ready(
             "Cheap scalp", pnl, threshold_reached,
@@ -2170,20 +2227,30 @@ class PolyBot:
         if not self._exit_price_is_profitable(
             "Cheap scalp", self._cheap_shares, self._cheap_cost,
             sell_price, self._cheap_min_profit_usd, "cheap", self._cheap_token_id,
+            realized_revenue=self._cheap_exit_revenue,
         ):
             return
 
         result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
         if result.success:
-            self._cheap_exited = True
             self._cheap_exit_revenue += result.amount_usd
             self.stats.bankroll += result.amount_usd
-            profit = self._cheap_exit_revenue - self._cheap_cost
-            self._record_cheap_result(profit)
-            print(
-                f"  Cheap scalp exit: {result.shares:.0f} {self._cheap_side} "
-                f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-            )
+            if result.status == PARTIAL and result.shares_remaining >= 1:
+                self._cheap_shares = result.shares_remaining
+                self._cheap_exited = False
+                print(
+                    f"  Cheap scalp exit (partial): {result.shares:.0f} {self._cheap_side} "
+                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                )
+            else:
+                self._cheap_exited = True
+                profit = self._cheap_exit_revenue - self._cheap_cost
+                self._record_cheap_result(profit)
+                print(
+                    f"  Cheap scalp exit: {result.shares:.0f} {self._cheap_side} "
+                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+                )
 
     def _resolve_cheap_scalp(self, closing_btc_price: float):
         if not self._cheap_traded or self._cheap_exited:
@@ -2418,7 +2485,36 @@ class PolyBot:
             sell_price = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
         if sell_price <= 0:
             return
-        pnl = self._relative_shares * sell_price - self._relative_cost
+        pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
+        if self._relative_exit_revenue > 0 and self._relative_shares * sell_price >= 5.0:
+            if not self.dry_run and self._confirm_ws_sell_price:
+                probe = max(round(self._relative_shares * sell_price, 2), 1.0)
+                confirmed = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
+                if confirmed > 0:
+                    sell_price = confirmed
+                    pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
+            if pnl >= -0.01:
+                result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
+                if result.success:
+                    self._relative_exit_revenue += result.amount_usd
+                    self.stats.bankroll += result.amount_usd
+                    if result.status == PARTIAL and result.shares_remaining >= 1:
+                        self._relative_shares = result.shares_remaining
+                        self._relative_exited = False
+                        print(
+                            f"  Relative overreaction exit (partial_recovery, partial): {result.shares:.0f} {self._relative_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                        )
+                    else:
+                        self._relative_exited = True
+                        profit = self._relative_exit_revenue - self._relative_cost
+                        self._record_relative_result(profit)
+                        print(
+                            f"  Relative overreaction exit (partial_recovery): {result.shares:.0f} {self._relative_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+                        )
+                return
         target = self._relative_profit_target_price()
         overbought_exit = self._relative_is_overbought_exit()
         threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
@@ -2431,27 +2527,37 @@ class PolyBot:
             confirmed = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
             if confirmed > 0:
                 sell_price = confirmed
-                pnl = self._relative_shares * sell_price - self._relative_cost
+                pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
         threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
         if self._profit_floor_exit_ready(
             "Relative overreaction", self._relative_shares, self._relative_cost,
             sell_price, target, self._relative_min_profit_usd,
             "_relative_trailing_armed", "relative", self._relative_token_id,
+            realized_revenue=self._relative_exit_revenue,
         ):
             if not self._exit_price_is_profitable(
                 "Relative overreaction", self._relative_shares, self._relative_cost,
                 sell_price, self._relative_min_profit_usd, "relative", self._relative_token_id,
-                allow_below_min_profit=True,
+                allow_below_min_profit=True, realized_revenue=self._relative_exit_revenue,
             ):
                 return
             result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
             if result.success:
-                self._relative_exited = True
                 self._relative_exit_revenue += result.amount_usd
                 self.stats.bankroll += result.amount_usd
-                profit = self._relative_exit_revenue - self._relative_cost
-                self._record_relative_result(profit)
-                print(f"  Relative overreaction exit (profit_floor): {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+                if result.status == PARTIAL and result.shares_remaining >= 1:
+                    self._relative_shares = result.shares_remaining
+                    self._relative_exited = False
+                    print(
+                        f"  Relative overreaction exit (profit_floor, partial): {result.shares:.0f} {self._relative_side} "
+                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                    )
+                else:
+                    self._relative_exited = True
+                    profit = self._relative_exit_revenue - self._relative_cost
+                    self._record_relative_result(profit)
+                    print(f"  Relative overreaction exit (profit_floor): {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
             return
         if not self._trailing_profit_exit_ready(
             "Relative overreaction", pnl, threshold_reached,
@@ -2462,16 +2568,26 @@ class PolyBot:
         if not self._exit_price_is_profitable(
             "Relative overreaction", self._relative_shares, self._relative_cost,
             sell_price, self._relative_min_profit_usd, "relative", self._relative_token_id,
+            realized_revenue=self._relative_exit_revenue,
         ):
             return
         result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
         if result.success:
-            self._relative_exited = True
             self._relative_exit_revenue += result.amount_usd
             self.stats.bankroll += result.amount_usd
-            profit = self._relative_exit_revenue - self._relative_cost
-            self._record_relative_result(profit)
-            print(f"  Relative overreaction exit: {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+            if result.status == PARTIAL and result.shares_remaining >= 1:
+                self._relative_shares = result.shares_remaining
+                self._relative_exited = False
+                print(
+                    f"  Relative overreaction exit (partial): {result.shares:.0f} {self._relative_side} "
+                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                )
+            else:
+                self._relative_exited = True
+                profit = self._relative_exit_revenue - self._relative_cost
+                self._record_relative_result(profit)
+                print(f"  Relative overreaction exit: {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
 
     def _resolve_relative_reaction(self, closing_btc_price: float):
         if not self._relative_traded or self._relative_exited:
@@ -2700,7 +2816,36 @@ class PolyBot:
         if sell_price <= 0:
             return
         target = self._panic_profit_target_price()
-        pnl = self._panic_shares * sell_price - self._panic_cost
+        pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
+        if self._panic_exit_revenue > 0 and self._panic_shares * sell_price >= 5.0:
+            if not self.dry_run and self._confirm_ws_sell_price:
+                probe = max(round(self._panic_shares * sell_price, 2), 1.0)
+                confirmed = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
+                if confirmed > 0:
+                    sell_price = confirmed
+                    pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
+            if pnl >= -0.01:
+                result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
+                if result.success:
+                    self._panic_exit_revenue += result.amount_usd
+                    self.stats.bankroll += result.amount_usd
+                    if result.status == PARTIAL and result.shares_remaining >= 1:
+                        self._panic_shares = result.shares_remaining
+                        self._panic_exited = False
+                        print(
+                            f"  Panic rebound exit (partial_recovery, partial): {result.shares:.0f} {self._panic_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                        )
+                    else:
+                        self._panic_exited = True
+                        profit = self._panic_exit_revenue - self._panic_cost
+                        self._record_panic_result(profit)
+                        print(
+                            f"  Panic rebound exit (partial_recovery): {result.shares:.0f} {self._panic_side} "
+                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
+                        )
+                return
         threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
         if not threshold_reached and not self._panic_trailing_armed:
             return
@@ -2711,27 +2856,37 @@ class PolyBot:
             confirmed = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
             if confirmed > 0:
                 sell_price = confirmed
-                pnl = self._panic_shares * sell_price - self._panic_cost
+                pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
         threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
         if self._profit_floor_exit_ready(
             "Panic rebound", self._panic_shares, self._panic_cost,
             sell_price, target, self._panic_min_profit_usd,
             "_panic_trailing_armed", "panic", self._panic_token_id,
+            realized_revenue=self._panic_exit_revenue,
         ):
             if not self._exit_price_is_profitable(
                 "Panic rebound", self._panic_shares, self._panic_cost,
                 sell_price, self._panic_min_profit_usd, "panic", self._panic_token_id,
-                allow_below_min_profit=True,
+                allow_below_min_profit=True, realized_revenue=self._panic_exit_revenue,
             ):
                 return
             result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
             if result.success:
-                self._panic_exited = True
                 self._panic_exit_revenue += result.amount_usd
                 self.stats.bankroll += result.amount_usd
-                profit = self._panic_exit_revenue - self._panic_cost
-                self._record_panic_result(profit)
-                print(f"  Panic rebound exit (profit_floor): {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+                if result.status == PARTIAL and result.shares_remaining >= 1:
+                    self._panic_shares = result.shares_remaining
+                    self._panic_exited = False
+                    print(
+                        f"  Panic rebound exit (profit_floor, partial): {result.shares:.0f} {self._panic_side} "
+                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                    )
+                else:
+                    self._panic_exited = True
+                    profit = self._panic_exit_revenue - self._panic_cost
+                    self._record_panic_result(profit)
+                    print(f"  Panic rebound exit (profit_floor): {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
             return
         if not self._trailing_profit_exit_ready(
             "Panic rebound", pnl, threshold_reached,
@@ -2742,16 +2897,26 @@ class PolyBot:
         if not self._exit_price_is_profitable(
             "Panic rebound", self._panic_shares, self._panic_cost,
             sell_price, self._panic_min_profit_usd, "panic", self._panic_token_id,
+            realized_revenue=self._panic_exit_revenue,
         ):
             return
         result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
         if result.success:
-            self._panic_exited = True
             self._panic_exit_revenue += result.amount_usd
             self.stats.bankroll += result.amount_usd
-            profit = self._panic_exit_revenue - self._panic_cost
-            self._record_panic_result(profit)
-            print(f"  Panic rebound exit: {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+            if result.status == PARTIAL and result.shares_remaining >= 1:
+                self._panic_shares = result.shares_remaining
+                self._panic_exited = False
+                print(
+                    f"  Panic rebound exit (partial): {result.shares:.0f} {self._panic_side} "
+                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
+                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
+                )
+            else:
+                self._panic_exited = True
+                profit = self._panic_exit_revenue - self._panic_cost
+                self._record_panic_result(profit)
+                print(f"  Panic rebound exit: {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
 
     def _resolve_panic_rebound(self, closing_btc_price: float):
         if not self._panic_traded or self._panic_exited:
@@ -2790,7 +2955,7 @@ class PolyBot:
             print(f"  Panic rebound resolved LOSS -${loss:.2f}")
         self._panic_exited = True
 
-    # ── Market prices (cached, complement engine) ───────────────────
+    # 鈹€鈹€ Market prices (cached, complement engine) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _compute_realized_vol(self) -> float:
         """Rolling std dev of recent window closing deltas.
@@ -2858,7 +3023,7 @@ class PolyBot:
             print(f"[price] Error: {e}")
             return self._cached_up, self._cached_down
 
-    # ── Entry ───────────────────────────────────────────────────────
+    # 鈹€鈹€ Entry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _place_trend_buy(self, sig, seconds_remaining: float, token_id: str, hint_price: float):
         slug = f"btc-updown-{self.period}m-{self._current_window}"
@@ -2913,7 +3078,7 @@ class PolyBot:
             )
 
             mode = "PAPER" if self.dry_run else "LIVE"
-            print(f"  鉁?{mode}: {result.shares:.0f} shares @ "
+            print(f"  閴?{mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
             print(f"     Watching live Polymarket bid for profit exit")
 
@@ -2946,14 +3111,14 @@ class PolyBot:
             print(f"  Buy sent but unverified - will poll order API and balance")
             return
 
-        print(f"  鉂?Buy failed: {result.error}")
+        print(f"  閴?Buy failed: {result.error}")
         err = str(result.error).lower()
         if "request exception" in err or "service not ready" in err or "status_code=none" in err:
             self._consecutive_buy_failures += 1
             if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
                 self._clob_halted = True
-                msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
-                       f"consecutive API failures 鈥?stopping trades until restart")
+                msg = (f"棣冩敳 CLOB HALTED after {self._consecutive_buy_failures} "
+                       f"consecutive API failures 閳?stopping trades until restart")
                 print(f"\n  {msg}")
                 self.telegram.status_update({"alert": msg})
 
@@ -2963,9 +3128,9 @@ class PolyBot:
         if not self._check_risk_limits("trend", "trend trade"):
             return
 
-        # ── Circuit breaker: CLOB health check ───────────────────
+        # 鈹€鈹€ Circuit breaker: CLOB health check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         if self._clob_halted:
-            print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
+            print(f"  馃攲 CLOB HALTED 鈥?skipping trade ({self._consecutive_buy_failures} consecutive failures)")
             return
 
         if not self.dry_run and self.executor._initialized:
@@ -2973,11 +3138,11 @@ class PolyBot:
                 self.executor.client.get_ok()
             except Exception as e:
                 self._consecutive_buy_failures += 1
-                print(f"  🔌 CLOB health check failed: {e}")
+                print(f"  馃攲 CLOB health check failed: {e}")
                 if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
                     self._clob_halted = True
-                    msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
-                           f"consecutive health check failures — stopping trades until recovery")
+                    msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
+                           f"consecutive health check failures 鈥?stopping trades until recovery")
                     print(f"\n  {msg}")
                     self.telegram.status_update({"alert": msg})
                 return
@@ -2992,8 +3157,8 @@ class PolyBot:
         slug = f"btc-updown-{self.period}m-{self._current_window}"
         trade_amount = round(sig.kelly_size, 2)
 
-        print(f"\n  🎯 {sig.side} | edge={sig.edge:.3f} | "
-              f"prob={sig.true_prob:.2f} | BTC Δ={sig.btc_delta_pct:+.3f}%")
+        print(f"\n  馃幆 {sig.side} | edge={sig.edge:.3f} | "
+              f"prob={sig.true_prob:.2f} | BTC 螖={sig.btc_delta_pct:+.3f}%")
         print(f"     Amount: ${trade_amount:.2f} | T-{seconds_remaining:.0f}s")
 
         # Preview actual market price, re-check edge, then pass price into buy()
@@ -3017,7 +3182,7 @@ class PolyBot:
                 )
 
                 if False and actual_edge < self.strategy_config.min_edge:
-                    print(f"  ⚠️  Edge gone at market price — skipping")
+                    print(f"  鈿狅笍  Edge gone at market price 鈥?skipping")
                     btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
                     self.tracker.log_signal(
                         window_ts=self._current_window,
@@ -3114,7 +3279,7 @@ class PolyBot:
             )
 
             mode = "PAPER" if self.dry_run else "LIVE"
-            print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
+            print(f"  鉁?{mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
             print(f"     Watching live Polymarket bid for profit exit")
 
@@ -3131,7 +3296,7 @@ class PolyBot:
         else:
             if result.error == "UNVERIFIED_BUY":
                 # Order likely filled but Polygon hasn't settled.
-                # Save details — window boundary sync will detect the fill.
+                # Save details 鈥?window boundary sync will detect the fill.
                 self._pending_buy_side = sig.side
                 self._pending_buy_price = result.price
                 self._pending_buy_amount = result.amount_usd
@@ -3147,25 +3312,25 @@ class PolyBot:
                 self._pending_buy_window = self._current_window
                 print(f"  Buy sent but unverified - will poll order API and balance")
             else:
-                print(f"  ❌ Buy failed: {result.error}")
+                print(f"  鉂?Buy failed: {result.error}")
                 # Circuit breaker: track consecutive API failures
                 err = str(result.error).lower()
                 if "request exception" in err or "service not ready" in err or "status_code=none" in err:
                     self._consecutive_buy_failures += 1
                     if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
                         self._clob_halted = True
-                        msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
-                               f"consecutive API failures — stopping trades until restart")
+                        msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
+                               f"consecutive API failures 鈥?stopping trades until restart")
                         print(f"\n  {msg}")
                         self.telegram.status_update({"alert": msg})
 
-    # ── Resolve (partial fill aware) ────────────────────────────────
+    # 鈹€鈹€ Resolve (partial fill aware) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _resolve_previous_trade(self):
         if self._exited:
             profit = self._exit_revenue - self._trade_cost
             self._record_trend_result(profit)
-            result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
+            result_emoji = "鉁?WIN" if profit > 0 else "鉂?LOSS"
             residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
             print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
@@ -3190,7 +3355,7 @@ class PolyBot:
         original_cost = self._trade_cost
         remaining_shares = self._trade_shares
 
-        # ── Dry run: Binance price fallback ──────────────────────────
+        # 鈹€鈹€ Dry run: Binance price fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         if self.dry_run:
             won = self._dry_run_resolution_won(self._trade_side, self._current_window)
             if won is None:
@@ -3211,11 +3376,11 @@ class PolyBot:
             )
             return
 
-        # ── Live: attempt claim sell first — result is the truth ─────
+        # 鈹€鈹€ Live: attempt claim sell first 鈥?result is the truth 鈹€鈹€鈹€鈹€鈹€
         # Binance price and oracle can disagree when BTC is near the opening
         # price at resolution. The claim sell result is ground truth:
-        #   - Sell succeeds at ~$0.99 → shares had value → won
-        #   - "no match" or near-zero fill → shares worthless → lost
+        #   - Sell succeeds at ~$0.99 鈫?shares had value 鈫?won
+        #   - "no match" or near-zero fill 鈫?shares worthless 鈫?lost
         won = None
         claim_revenue = 0.0
         claim_result = "not_attempted"
@@ -3227,13 +3392,13 @@ class PolyBot:
                       and self.executor._initialized)
 
         # Short-circuit: if last observed sell price is below $0.50, market has
-        # already priced these shares as worthless — skip the claim API call.
+        # already priced these shares as worthless 鈥?skip the claim API call.
         if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
             net_loss = original_cost - self._exit_revenue
             profit = -net_loss
             self._record_trend_result(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [market_price] | "
+            print(f"  鉂?LOSS{partial_note} -${net_loss:.2f} [market_price] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.strategy_result_alert(
@@ -3256,7 +3421,7 @@ class PolyBot:
 
         pre_sell_balance = 0.0
         if live_token and claim_notional >= 5.0:
-            print(f"  💰 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
+            print(f"  馃挵 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
             pre_sell_balance = self.executor.get_balance()
             claim = self.executor.sell(
                 token_id=self._trade_token_id,
@@ -3264,34 +3429,34 @@ class PolyBot:
                 price=0.99,
             )
             if claim.success and claim.amount_usd > remaining_shares * 0.50:
-                # API says success — verify with balance check to catch phantom fills
+                # API says success 鈥?verify with balance check to catch phantom fills
                 time.sleep(2)
                 post_sell_balance = self.executor.get_balance()
                 balance_increase = max(0.0, post_sell_balance - pre_sell_balance) if (
                     pre_sell_balance > 0 and post_sell_balance > 0
                 ) else claim.amount_usd
                 if balance_increase > remaining_shares * 0.99 * 0.50:
-                    # Balance confirmed — real fill
+                    # Balance confirmed 鈥?real fill
                     won = True
                     claim_revenue = claim.amount_usd
                     claim_result = "filled"
                     self.stats.bankroll += claim_revenue
                 else:
-                    # API said success but no USDC arrived yet — defer to next window
-                    print(f"  ⏳ Possible phantom sell "
+                    # API said success but no USDC arrived yet 鈥?defer to next window
+                    print(f"  鈴?Possible phantom sell "
                           f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
-                          f" — deferring to next window balance sync")
+                          f" 鈥?deferring to next window balance sync")
             elif "no match" in claim.error.lower() or (
                 claim.success and claim.amount_usd < remaining_shares * 0.10
             ):
-                # No buyers for these shares → shares worthless → definitive loss
+                # No buyers for these shares 鈫?shares worthless 鈫?definitive loss
                 won = False
                 claim_result = "no_match"
             elif "not enough balance" in claim.error.lower():
                 # Tracked share count is slightly above on-chain balance (rounding).
                 # Retry with one fewer share to clear the discrepancy.
                 retry_shares = int(remaining_shares) - 1
-                print(f"  🔄 Rounding fix: retrying claim with {retry_shares} shares...")
+                print(f"  馃攧 Rounding fix: retrying claim with {retry_shares} shares...")
                 if retry_shares > 0 and float(retry_shares) * 0.99 >= 5.0:
                     retry = self.executor.sell(
                         token_id=self._trade_token_id,
@@ -3307,32 +3472,32 @@ class PolyBot:
                             claim_revenue = retry.amount_usd
                             claim_result = "filled"
                             self.stats.bankroll += claim_revenue
-                        # else: retry succeeded but balance unconfirmed — fall to defer
-                # else: retry failed or too small — fall to defer (won still None)
-            # else: any other error — fall to defer (won still None)
+                        # else: retry succeeded but balance unconfirmed 鈥?fall to defer
+                # else: retry failed or too small 鈥?fall to defer (won still None)
+            # else: any other error 鈥?fall to defer (won still None)
         else:
             if live_token and claim_notional < 5.0:
-                print(f"  💰 {remaining_shares:.0f} shares below $5 min — deferring to auto-resolution")
+                print(f"  馃挵 {remaining_shares:.0f} shares below $5 min 鈥?deferring to auto-resolution")
 
-        # ── Deferred fallback ────────────────────────────────────────
+        # 鈹€鈹€ Deferred fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         # The old balance check fired before auto-resolution settled on-chain.
         # Any unresolved case is now deferred to the next window boundary
         # (~5 min), where Polygon settlement is guaranteed to have landed.
         if won is None:
             if not live_token:
-                # No valid token/executor — Binance price as last resort
+                # No valid token/executor 鈥?Binance price as last resort
                 btc_price, _ = self.price_feed.get_price()
                 if self._opening_price > 0 and btc_price > 0:
                     won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
                     resolution_method = "binance_fallback"
-                    print(f"  ⚠️  No live token — using Binance fallback")
+                    print(f"  鈿狅笍  No live token 鈥?using Binance fallback")
                 else:
-                    print(f"  ⚠️  Cannot determine resolution outcome — skipping")
+                    print(f"  鈿狅笍  Cannot determine resolution outcome 鈥?skipping")
                     return
             else:
                 if pre_sell_balance <= 0:
                     pre_sell_balance = self.executor.get_balance()
-                print(f"  ⏳ Resolution deferred to next window balance sync")
+                print(f"  鈴?Resolution deferred to next window balance sync")
                 self._pending_phantom = {
                     "pre_sell_balance": pre_sell_balance,
                     "expected_revenue": remaining_shares * 0.99,
@@ -3380,7 +3545,7 @@ class PolyBot:
                 if claim_revenue > 0
                 else f" (unclaimed payout ${resolution_payout:.2f})"
             )
-            print(f"  ✅ WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
+            print(f"  鉁?WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.strategy_result_alert(
@@ -3394,7 +3559,7 @@ class PolyBot:
             profit = -net_loss
             self._record_trend_result(profit)
             partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  ❌ LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
+            print(f"  鉂?LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
                   f"P&L: ${self.stats.total_pnl:+.2f} | "
                   f"Bank: ${self.stats.bankroll:.2f}")
             self.telegram.strategy_result_alert(
@@ -3415,7 +3580,7 @@ class PolyBot:
             claim_result=claim_result,
         )
 
-    # ── Hourly + shutdown ───────────────────────────────────────────
+    # 鈹€鈹€ Hourly + shutdown 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def _check_hourly_summary(self):
         current_hour = int(time.time() // 3600)
@@ -3434,8 +3599,8 @@ class PolyBot:
 
             real_pnl = self.stats.bankroll - self._session_start_balance
 
-            print(f"\n{'═' * 55}")
-            print(f"  📊 HOURLY SUMMARY")
+            print("\n" + "=" * 55)
+            print("  HOURLY SUMMARY")
             print(f"  This hour: {h['trades']} trades | "
                   f"{h['wins']}W/{h['losses']}L | "
                   f"P&L: ${h['pnl']:+.2f}")
@@ -3445,16 +3610,16 @@ class PolyBot:
                   f"{h['windows_skipped']} skipped")
             print(f"  Overall: {o['total_trades']} trades | "
                   f"P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
-            print(f"  💰 Real P&L (balance): ${real_pnl:+.2f} "
-                  f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
+            print(f"  Real P&L (balance): ${real_pnl:+.2f} "
+                  f"(${self._session_start_balance:.2f} -> ${self.stats.bankroll:.2f})")
             if self._unclaimed_winnings > 0:
-                print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
-            print(f"{'═' * 55}\n")
+                print(f"  Unclaimed: ${self._unclaimed_winnings:.2f}")
+            print("=" * 55 + "\n")
             self.telegram.hourly_summary(h, o)
             self.stats.hourly.reset()
 
     def _handle_shutdown(self, signum, frame):
-        print(f"\n\n🛑 Shutting down...")
+        print(f"\n\n馃洃 Shutting down...")
         self._running = False
         self.price_feed.stop()
         self.poly_feed.stop()
@@ -3470,16 +3635,16 @@ class PolyBot:
 
         real_pnl = self.stats.bankroll - self._session_start_balance
         o = self.stats.to_dict()
-        print(f"\n{'═' * 55}")
+        print("\n" + "=" * 55)
         print(f"  FINAL: {o['total_trades']} trades | "
               f"{o['wins']}W/{o['losses']}L | "
               f"WR: {o['win_rate']:.1f}%")
         print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
-        print(f"  💰 Real P&L: ${real_pnl:+.2f} "
-              f"(${self._session_start_balance:.2f} → ${self.stats.bankroll:.2f})")
+        print(f"  Real P&L: ${real_pnl:+.2f} "
+              f"(${self._session_start_balance:.2f} -> ${self.stats.bankroll:.2f})")
         if self._unclaimed_winnings > 0:
-            print(f"  💰 Unclaimed: ${self._unclaimed_winnings:.2f}")
-        print(f"{'═' * 55}")
+            print(f"  Unclaimed: ${self._unclaimed_winnings:.2f}")
+        print("=" * 55)
 
         self.telegram.status_update(o)
 
@@ -3504,3 +3669,5 @@ class PolyBot:
 if __name__ == "__main__":
     bot = PolyBot()
     bot.start()
+
+

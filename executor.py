@@ -613,11 +613,13 @@ class Executor:
                 if fill:
                     matched = self._extract_fill(fill, price)
                     if matched:
+                        shares_left = max(0, sell_shares - matched[2])
                         return OrderResult(
-                            success=True, order_id=order_id, status=FILLED,
+                            success=True, order_id=order_id,
+                            status=FILLED if shares_left < 1 else PARTIAL,
                             side="SELL", price=matched[0],
                             amount_usd=matched[1], shares=matched[2],
-                            shares_remaining=max(0, sell_shares - matched[2]),
+                            shares_remaining=shares_left,
                             token_id=token_id[:16] + "...", dry_run=False,
                         )
                 self.cancel_order(order_id)
