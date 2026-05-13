@@ -41,6 +41,7 @@ from market import get_current_market, get_market_winner, current_window_ts, PER
 from price_feed import BinancePriceFeed
 from polymarket_ws import PolymarketMarketFeed
 from strategy import (
+    evaluate,
     evaluate_trend_entry,
     estimate_true_probability,
     get_trend_entry_skip_reason,
@@ -163,18 +164,21 @@ class PolyBot:
             "cheap": float(os.getenv("CHEAP_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
             "panic": float(os.getenv("PANIC_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
             "relative": float(os.getenv("RELATIVE_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
+            "original": float(os.getenv("ORIGINAL_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
         }
         self._strategy_peak_loss_drops = {
             "trend": float(os.getenv("TREND_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
             "cheap": float(os.getenv("CHEAP_PEAK_LOSS_DROP", os.getenv("CHEAP_SCALP_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0")))),
             "panic": float(os.getenv("PANIC_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
             "relative": float(os.getenv("RELATIVE_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
+            "original": float(os.getenv("ORIGINAL_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
         }
         self._strategy_cooling_down_periods = {
             "trend": float(os.getenv("TREND_COOLING_DOWN_PERIOD", "5400")),
             "cheap": float(os.getenv("CHEAP_COOLING_DOWN_PERIOD", os.getenv("CHEAP_SCALP_COOLING_DOWN_PERIOD", "5400"))),
             "panic": float(os.getenv("PANIC_COOLING_DOWN_PERIOD", "5400")),
             "relative": float(os.getenv("RELATIVE_COOLING_DOWN_PERIOD", "5400")),
+            "original": float(os.getenv("ORIGINAL_COOLING_DOWN_PERIOD", "5400")),
         }
         self._rolling_vol_windows = int(os.getenv("ROLLING_VOL_WINDOWS", "12"))
         self._vol_floor = float(os.getenv("VOL_FLOOR", "0.06"))
@@ -199,6 +203,7 @@ class PolyBot:
         self.stats.hourly.hour_start = time.time()
 
         self._poly_ws_enabled = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
+        self._trend_enabled = os.getenv("TREND_STRATEGY_ENABLED", "true").lower() == "true"
         self._take_profit_price = float(os.getenv("TAKE_PROFIT_PRICE", "0.70"))
         self._min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.10"))
         self._min_profit_usd = float(os.getenv("MIN_PROFIT_USD", "1.00"))
@@ -239,6 +244,7 @@ class PolyBot:
         self._relative_min_profit_pct = float(os.getenv("RELATIVE_MIN_PROFIT_PCT", "0.10"))
         self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
         self._relative_profit_retreat_pct = float(os.getenv("RELATIVE_PROFIT_RETREAT_PCT", os.getenv("RELATIVE_OVERREACTION_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
+        self._original_enabled = os.getenv("ORIGINAL_STRATEGY_ENABLED", "false").lower() == "true"
         self._poly_ws_warmup_seconds = float(os.getenv("POLYMARKET_WS_WARMUP_SECONDS", "2.0"))
         self._entry_price_trend_window_seconds = float(os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50")) / 1000.0
         self._entry_price_trend_samples = int(os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50"))
@@ -317,13 +323,13 @@ class PolyBot:
         self._cheap_pending_last_notice: float = 0.0
 
         # Strategy-level risk and P&L
-        self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
-        self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False}
+        self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
+        self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False, "original": False}
         self._total_pnl_peak: float = 0.0
         self._balance_peak: float = initial_bankroll
         self._bot_cooldown_until: float = 0.0
-        self._strategy_pnl_peaks = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
-        self._strategy_cooldown_until = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0}
+        self._strategy_pnl_peaks = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
+        self._strategy_cooldown_until = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
 
         # Fourth strategy: Binance/Polymarket relative overreaction
         self._realtime_history = []
@@ -378,6 +384,30 @@ class PolyBot:
         self._panic_pending_started_at: float = 0.0
         self._panic_pending_window: int = 0
         self._panic_pending_last_notice: float = 0.0
+
+        # Original repo strategy: Brownian probability + fixed edge, hold to resolution.
+        self._original_traded: bool = False
+        self._original_trade_attempted: bool = False
+        self._original_exited: bool = False
+        self._original_side: str = ""
+        self._original_token_id: str = ""
+        self._original_price: float = 0.0
+        self._original_cost: float = 0.0
+        self._original_shares: float = 0.0
+        self._original_exit_revenue: float = 0.0
+        self._original_last_check: float = 0.0
+        self._original_pending_side: str = ""
+        self._original_pending_token_id: str = ""
+        self._original_pending_order_id: str = ""
+        self._original_pending_price: float = 0.0
+        self._original_pending_amount: float = 0.0
+        self._original_pending_shares: float = 0.0
+        self._original_pending_balance_before: float = 0.0
+        self._original_pending_token_balance_before: float = 0.0
+        self._original_pending_last_check: float = 0.0
+        self._original_pending_started_at: float = 0.0
+        self._original_pending_window: int = 0
+        self._original_pending_last_notice: float = 0.0
 
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
         # Resolved at next window boundary once Polygon settlement has had time to land.
@@ -448,6 +478,7 @@ class PolyBot:
         print(f"  PolyBot v13 鈥?Recalibrated (vol=0.12)")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '馃敶 LIVE TRADING'}")
         print(f"  Bets: ${self.strategy_config.min_bet:.0f}鈥?{self.strategy_config.max_bet:.0f}")
+        print(f"  Trend strategy: {'on' if self._trend_enabled else 'off'}")
         print(f"  Entry mode: Binance trend scalp")
         print(f"  Entry direction: {'inverse trend' if self.strategy_config.invert_trend_entry else 'trend follow'}")
         print(f"  Trend trigger: {self.strategy_config.trend_entry_threshold_pct:.3f}% | "
@@ -494,6 +525,11 @@ class PolyBot:
         )
         print(f"  Relative overreaction: {'on' if self._relative_enabled else 'off'} | "
               f"entry first {self._relative_entry_window_seconds}s | save {self._realtime_to_save}s")
+        print(
+            f"  Original model: {'on' if self._original_enabled else 'off'} | "
+            f"prob >= {self.strategy_config.min_prob:.0%}, edge >= {self.strategy_config.min_edge:.0%}, "
+            "hold to resolution"
+        )
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
 
@@ -566,6 +602,7 @@ class PolyBot:
         self._check_pending_cheap_buy(now)
         self._check_pending_panic_buy(now)
         self._check_pending_relative_buy(now)
+        self._check_pending_original_buy(now)
 
         if window_ts != self._current_window:
             self._on_new_window(window_ts, closing_btc_price=btc_price)
@@ -599,6 +636,9 @@ class PolyBot:
             self._manage_panic_rebound(seconds_remaining, now)
             if not self._panic_traded and not self._panic_trade_attempted:
                 self._try_panic_rebound_entry(btc_price, seconds_remaining)
+            self._manage_original_model(now)
+            if self._original_enabled and not self._original_traded and not self._original_trade_attempted:
+                self._try_original_model_entry(btc_price, seconds_remaining)
 
         # HOLDING: active position management
         if self._traded and not self._exited and not self._exit_gave_up:
@@ -645,7 +685,7 @@ class PolyBot:
             "skip_reason": skip_reason,
         }
 
-        if signal_result:
+        if signal_result and self._trend_enabled:
             self._execute_trade(signal_result, seconds_remaining)
 
         if now - self._last_status_print >= 30:
@@ -825,6 +865,9 @@ class PolyBot:
 
     def _record_relative_result(self, profit: float):
         self._record_strategy_result("relative", "Relative overreaction", profit)
+
+    def _record_original_result(self, profit: float):
+        self._record_strategy_result("original", "Original model", profit)
 
     def _record_strategy_result(self, key: str, label: str, profit: float):
         self.stats.total_trades += 1
@@ -1473,6 +1516,12 @@ class PolyBot:
                     self._check_pending_panic_buy(time.time())
             if self._panic_traded and not self._panic_exited:
                 self._resolve_panic_rebound(closing_btc_price)
+            if self._original_pending_side and not self._original_traded:
+                if not self.dry_run and self.executor._initialized:
+                    self._original_pending_last_check = 0.0
+                    self._check_pending_original_buy(time.time())
+            if self._original_traded and not self._original_exited:
+                self._resolve_original_model(closing_btc_price)
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -1574,6 +1623,17 @@ class PolyBot:
         self._panic_peak_profit = 0.0
         self._panic_price_history = {"UP": [], "DOWN": []}
         self._clear_pending_panic_buy()
+        self._original_traded = False
+        self._original_trade_attempted = False
+        self._original_exited = False
+        self._original_side = ""
+        self._original_token_id = ""
+        self._original_price = 0.0
+        self._original_cost = 0.0
+        self._original_shares = 0.0
+        self._original_exit_revenue = 0.0
+        self._original_last_check = 0.0
+        self._clear_pending_original_buy()
         self._cached_up = 0.50
         self._cached_down = 0.50
         self._price_last_fetched = 0.0
@@ -1734,6 +1794,192 @@ class PolyBot:
                     source="balance",
                     balance_already_synced=True,
                 )
+
+    def _clear_pending_original_buy(self):
+        self._original_pending_side = ""
+        self._original_pending_token_id = ""
+        self._original_pending_order_id = ""
+        self._original_pending_price = 0.0
+        self._original_pending_amount = 0.0
+        self._original_pending_shares = 0.0
+        self._original_pending_balance_before = 0.0
+        self._original_pending_token_balance_before = 0.0
+        self._original_pending_last_check = 0.0
+        self._original_pending_started_at = 0.0
+        self._original_pending_window = 0
+        self._original_pending_last_notice = 0.0
+
+    def _activate_original_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
+        self._original_traded = True
+        self._original_side = side
+        self._original_token_id = token_id
+        self._original_price = price
+        self._original_cost = amount
+        self._original_shares = shares
+        self._original_exit_revenue = 0.0
+        self.stats.bankroll -= amount
+        self.stats.hourly.record_trade(0.0, 0.0)
+        self._clear_pending_original_buy()
+        print(
+            f"  Original model bought: {shares:.0f} {side} "
+            f"@ ${price:.3f} = ${amount:.2f} (hold to resolution)"
+        )
+        self.telegram.strategy_trade_alert(
+            strategy="Original model",
+            side=side,
+            price=price,
+            amount=amount,
+            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
+            dry_run=self.dry_run,
+            strategy_pnl=self._strategy_pnl.get("original", 0.0),
+            total_pnl=self.stats.total_pnl,
+        )
+
+    def _check_pending_original_buy(self, now: float):
+        if not self._original_pending_side or self._original_traded or self.dry_run:
+            return
+        if self._original_pending_started_at <= 0:
+            self._original_pending_started_at = now
+        if self._pending_buy_expired(
+            self._original_pending_started_at, self._original_pending_window, now, "Original model"
+        ):
+            self._clear_pending_original_buy()
+            return
+        if now - self._original_pending_last_check < 2.0:
+            return
+        self._original_pending_last_check = now
+
+        if self._original_pending_order_id and self.executor._initialized:
+            matched = self.executor.check_buy_fill(
+                self._original_pending_order_id,
+                self._original_pending_price,
+            )
+            if matched:
+                self._activate_original_buy(
+                    self._original_pending_side,
+                    self._original_pending_token_id,
+                    matched[0],
+                    matched[1],
+                    matched[2],
+                )
+                return
+
+        if self.executor._initialized and self._original_pending_balance_before > 0:
+            real_bal = self.executor.get_balance()
+            spent = self._original_pending_balance_before - real_bal if real_bal > 0 else 0.0
+            if spent > 1.0:
+                current_tokens = self.executor.get_token_balance(self._original_pending_token_id)
+                shares = max(0.0, current_tokens - self._original_pending_token_balance_before)
+                if shares < 1:
+                    self._pending_buy_notice(
+                        "_original_pending_last_notice",
+                        now,
+                        "  Original model pending balance moved but no token balance/order fill yet - waiting",
+                    )
+                    return
+                self.stats.bankroll = real_bal + spent
+                self._last_real_balance = real_bal
+                self._activate_original_buy(
+                    self._original_pending_side,
+                    self._original_pending_token_id,
+                    self._original_pending_price,
+                    spent,
+                    shares,
+                )
+
+    def _place_original_buy(self, sig, token_id: str, price: float):
+        result = self.executor.buy(token_id=token_id, amount_usd=round(sig.kelly_size, 2), price=price)
+        if not result.success:
+            if result.error == "UNVERIFIED_BUY":
+                self._original_pending_side = sig.side
+                self._original_pending_token_id = token_id
+                self._original_pending_order_id = result.order_id
+                self._original_pending_price = result.price
+                self._original_pending_amount = result.amount_usd
+                self._original_pending_shares = result.shares
+                self._original_pending_balance_before = self.stats.bankroll
+                self._original_pending_token_balance_before = self.executor.get_token_balance(token_id)
+                self._original_pending_last_check = 0.0
+                self._original_pending_started_at = time.time()
+                self._original_pending_window = self._current_window
+                print("  Original model buy unverified - will poll order API and balance")
+                return
+            print(f"  Original model buy failed: {result.error}")
+            return
+        self._activate_original_buy(sig.side, token_id, result.price, result.amount_usd, result.shares)
+
+    def _try_original_model_entry(self, btc_price: float, seconds_remaining: float):
+        if not self._original_enabled:
+            return
+        if not self._check_risk_limits("original", "original model"):
+            self._original_trade_attempted = True
+            return
+        market = self._ensure_market_subscription()
+        if not market:
+            return
+
+        realized_vol = self._compute_realized_vol()
+        sig = evaluate(
+            btc_price=btc_price,
+            opening_price=self._opening_price,
+            up_market_price=self._cached_up,
+            down_market_price=self._cached_down,
+            seconds_remaining=seconds_remaining,
+            bankroll=self.stats.bankroll,
+            config=self.strategy_config,
+            realized_vol=realized_vol,
+        )
+        if not sig:
+            if seconds_remaining < self.strategy_config.entry_window_end:
+                self._original_trade_attempted = True
+            return
+
+        token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
+        trade_amount = round(sig.kelly_size, 2)
+        buy_price = self._cached_up if sig.side == "UP" else self._cached_down
+        if not self.dry_run and self.executor._initialized:
+            executable = self.executor.get_market_price(token_id, "BUY", trade_amount)
+            if executable > 0:
+                buy_price = round(executable, 2)
+                actual_edge = sig.true_prob - buy_price
+                if actual_edge < self.strategy_config.min_edge:
+                    print(
+                        f"  Original model skip: executable ${buy_price:.3f} "
+                        f"edge {actual_edge:.3f} < {self.strategy_config.min_edge:.3f}"
+                    )
+                    self._original_trade_attempted = True
+                    return
+
+        print(
+            f"\n  Original model signal: {sig.side} | prob={sig.true_prob:.2f} "
+            f"edge={sig.edge:.3f} | BTC={sig.btc_delta_pct:+.3f}% | "
+            f"amount ${trade_amount:.2f}"
+        )
+        self._original_trade_attempted = True
+        self._place_original_buy(sig, token_id, buy_price)
+
+    def _manage_original_model(self, now: float):
+        if not self._original_traded or self._original_exited:
+            return
+        self._reconcile_active_position_balance(
+            "Original model",
+            "_original_token_id",
+            "_original_shares",
+            "_original_cost",
+            "_original_price",
+        )
+        if now - self._original_last_check < 30.0:
+            return
+        self._original_last_check = now
+        live = self._live_token_price(self._original_token_id)
+        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
+        if sell_price > 0:
+            pnl = self._original_exit_revenue + self._original_shares * sell_price - self._original_cost
+            print(
+                f"  Original model holding {self._original_side}: "
+                f"{self._original_shares:.0f} shares | bid ${sell_price:.3f} | "
+                f"unrealized ${pnl:+.2f} [hold-to-resolution]"
+            )
 
     def _ensure_market_subscription(self):
         if self._current_market:
@@ -3070,6 +3316,56 @@ class PolyBot:
             self._record_panic_result(-loss)
             print(f"  Panic rebound resolved LOSS -${loss:.2f}")
         self._panic_exited = True
+
+    def _resolve_original_model(self, closing_btc_price: float):
+        if not self._original_traded or self._original_exited:
+            return
+        if self.dry_run:
+            won = self._dry_run_resolution_won(self._original_side, self._current_window)
+            if won is None:
+                print("  Original model dry-run resolution pending Polymarket final result")
+                self._queue_dry_resolution(
+                    "original", "Original model", self._original_side,
+                    self._original_shares, self._original_cost,
+                    self._original_exit_revenue, self._current_window,
+                )
+                self._original_exited = True
+                return
+        else:
+            winner = self._polymarket_winner_for_window(self._current_window)
+            if winner:
+                won = winner == self._original_side
+            elif self._opening_price > 0 and closing_btc_price > 0:
+                won = (closing_btc_price >= self._opening_price) == (self._original_side == "UP")
+            else:
+                print("  Original model resolution unknown - waiting for next window")
+                return
+
+        if won:
+            if self.dry_run:
+                revenue = self._original_shares
+            else:
+                revenue = self._original_shares
+                if self._original_shares * 0.99 >= 5.0:
+                    claim = self.executor.sell(self._original_token_id, self._original_shares, price=0.99)
+                    if claim.success:
+                        revenue = claim.amount_usd
+                    else:
+                        print(
+                            f"  Original model claim not verified: {claim.error} "
+                            "- booking resolution payout for strategy P&L"
+                        )
+                else:
+                    print("  Original model winning shares below $5 claim minimum - booking resolution payout")
+            profit = self._original_exit_revenue + revenue - self._original_cost
+            self.stats.bankroll += revenue
+            self._record_original_result(profit)
+            print(f"  Original model resolved WIN +${profit:.2f}")
+        else:
+            loss = self._original_cost - self._original_exit_revenue
+            self._record_original_result(-loss)
+            print(f"  Original model resolved LOSS -${loss:.2f}")
+        self._original_exited = True
 
     # 鈹€鈹€ Market prices (cached, complement engine) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
