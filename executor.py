@@ -39,6 +39,8 @@ MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
 DEFAULT_MAX_BUY_PRICE = 0.90
 POLY_MIN_NOTIONAL = 5.0
+BUY_VERIFY_ATTEMPTS = 8
+BUY_VERIFY_DELAY_SECONDS = 3.0
 
 DEFAULT_TICK_SIZE = "0.01"
 DEFAULT_NEG_RISK = False
@@ -269,18 +271,20 @@ class Executor:
             print(f"[executor] Init failed: {e}")
             return False
 
-    def get_balance(self) -> float:
+    def get_balance(self, refresh: bool = False) -> float:
         if not self._initialized:
             return 0.0
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            if refresh:
+                self.client.update_balance_allowance(params)
             bal = self.client.get_balance_allowance(params)
             return float(bal.get("balance", 0)) / 1e6
         except Exception as e:
             print(f"[executor] Balance check failed: {e}")
             return 0.0
 
-    def _get_token_balance_optional(self, token_id: str) -> Optional[float]:
+    def _get_token_balance_optional(self, token_id: str, refresh: bool = False) -> Optional[float]:
         """Return the wallet's conditional-token balance, or None if unavailable."""
         if not self._initialized or not token_id:
             return None
@@ -298,6 +302,8 @@ class Executor:
                     asset_type=conditional_type,
                     asset_id=str(token_id),
                 )
+            if refresh:
+                self.client.update_balance_allowance(params)
             bal = self.client.get_balance_allowance(params)
             raw = bal.get("balance", 0) if isinstance(bal, dict) else 0
             return float(raw) / 1e6
@@ -305,9 +311,9 @@ class Executor:
             print(f"[executor] Token balance check failed: {e}")
             return None
 
-    def get_token_balance(self, token_id: str) -> float:
+    def get_token_balance(self, token_id: str, refresh: bool = True) -> float:
         """Return the wallet's conditional-token balance for one outcome token."""
-        balance = self._get_token_balance_optional(token_id)
+        balance = self._get_token_balance_optional(token_id, refresh=refresh)
         if balance is None:
             return 0.0
         return balance
@@ -416,10 +422,10 @@ class Executor:
             )
         except Exception as e:
             time.sleep(3)
-            balance_after = self.get_balance()
+            balance_after = self.get_balance(refresh=True)
             spent = balance_before - balance_after if balance_before > 0 else 0
             if spent > 1.0:
-                token_balance_after = self._get_token_balance_optional(token_id)
+                token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
                 token_delta = (
                     max(0.0, token_balance_after - token_balance_before)
                     if token_balance_before is not None and token_balance_after is not None
@@ -453,10 +459,14 @@ class Executor:
         self, order_id: str, price: float, shares: float,
         token_id: str, balance_before: float, token_balance_before: Optional[float],
     ) -> OrderResult:
-        for attempt in range(3):
-            balance_after = self.get_balance()
+        best_result: Optional[OrderResult] = None
+        last_seen: Optional[tuple[float, float]] = None
+        stable_seen_count = 0
+
+        for attempt in range(BUY_VERIFY_ATTEMPTS):
+            balance_after = self.get_balance(refresh=True)
             spent = balance_before - balance_after if balance_before > 0 else 0
-            token_balance_after = self._get_token_balance_optional(token_id)
+            token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
             token_delta = (
                 max(0.0, token_balance_after - token_balance_before)
                 if token_balance_before is not None and token_balance_after is not None
@@ -468,13 +478,33 @@ class Executor:
                 suffix = f" (attempt {attempt + 1})" if attempt > 0 else ""
                 print(f"  [order] Balance verified{suffix}: spent ${spent:.2f} "
                       f"(~{actual_shares:.0f}/{shares:.0f} shares @ ${price:.3f})")
-                if status == PARTIAL:
-                    print(f"  [order] Partial buy detected: tracking actual {actual_shares:.0f} shares")
-                return OrderResult(
+
+                best_result = OrderResult(
                     success=True, order_id=order_id, status=status,
                     side="BUY", price=price,
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
+                )
+                if status == FILLED:
+                    return best_result
+
+                seen = (round(spent, 6), round(actual_shares, 6))
+                if seen == last_seen:
+                    stable_seen_count += 1
+                else:
+                    stable_seen_count = 1
+                    last_seen = seen
+
+                if stable_seen_count >= 2 and attempt >= 2:
+                    print(
+                        f"  [order] Partial buy settled after {attempt + 1} checks: "
+                        f"tracking actual {actual_shares:.0f} shares"
+                    )
+                    return best_result
+
+                print(
+                    "  [order] Partial buy still settling - refreshing Polymarket "
+                    "token balance again"
                 )
 
             fill = self._check_order(order_id)
@@ -490,17 +520,33 @@ class Executor:
                     suffix = f" (attempt {attempt + 1})" if attempt > 0 else ""
                     print(f"  [order] Order API verified{suffix}: "
                           f"{matched[2]:.0f} shares @ ${matched[0]:.3f}")
-                    return OrderResult(
-                        success=True, order_id=order_id, status=FILLED,
+                    if matched[2] >= shares - 0.001:
+                        return OrderResult(
+                            success=True, order_id=order_id, status=FILLED,
+                            side="BUY", price=matched[0],
+                            amount_usd=matched[1], shares=matched[2],
+                            token_id=token_id[:16] + "...", dry_run=False,
+                        )
+                    best_result = OrderResult(
+                        success=True, order_id=order_id, status=PARTIAL,
                         side="BUY", price=matched[0],
                         amount_usd=matched[1], shares=matched[2],
                         token_id=token_id[:16] + "...", dry_run=False,
                     )
 
-            if attempt < 2:
-                time.sleep(3)
+            if attempt < BUY_VERIFY_ATTEMPTS - 1:
+                time.sleep(BUY_VERIFY_DELAY_SECONDS)
 
-        print("  [order] Buy unverified after 14s - NOT cancelling")
+        if best_result:
+            if best_result.status == PARTIAL:
+                print(
+                    f"  [order] Partial buy detected after final verification: "
+                    f"tracking actual {best_result.shares:.0f} shares"
+                )
+            return best_result
+
+        total_wait = 5 + (BUY_VERIFY_ATTEMPTS - 1) * BUY_VERIFY_DELAY_SECONDS
+        print(f"  [order] Buy unverified after {total_wait:.0f}s - NOT cancelling")
         return OrderResult(
             success=False, order_id=order_id, status=FAILED,
             error="UNVERIFIED_BUY",
@@ -531,7 +577,7 @@ class Executor:
         if not self._initialized:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        token_balance = self._get_token_balance_optional(token_id)
+        token_balance = self._get_token_balance_optional(token_id, refresh=True)
         if token_balance is not None and token_balance > 0:
             available_shares = int(token_balance)
             if available_shares < sell_shares:

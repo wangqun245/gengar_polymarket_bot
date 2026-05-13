@@ -1127,6 +1127,7 @@ class PolyBot:
             return
 
         self._last_position_check = now
+        self._reconcile_active_position_balance()
 
         current_sell_price = self._get_live_sell_price(self._trade_token_id, our_prob)
 
@@ -1223,6 +1224,42 @@ class PolyBot:
             f"Sell: ${current_sell_price:.3f} | "
             f"Target: ${target_price:.2f} | "
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
+        )
+
+    def _reconcile_active_position_balance(
+        self,
+        label: str = "Trend follow",
+        token_attr: str = "_trade_token_id",
+        shares_attr: str = "_trade_shares",
+        cost_attr: str = "_trade_cost",
+        price_attr: str = "_trade_price",
+    ):
+        token_id = getattr(self, token_attr, "")
+        current_shares = getattr(self, shares_attr, 0.0)
+        entry_price = getattr(self, price_attr, 0.0)
+        if self.dry_run or not self.executor._initialized or not token_id:
+            return
+        actual_shares = self.executor.get_token_balance(token_id, refresh=True)
+        if actual_shares <= current_shares + 0.5:
+            return
+
+        old_shares = current_shares
+        added_shares = actual_shares - old_shares
+        estimated_added_cost = added_shares * entry_price
+        real_bal = self.executor.get_balance(refresh=True)
+        balance_drift = self.stats.bankroll - real_bal if real_bal > 0 else 0.0
+        added_cost = balance_drift if balance_drift > 0.50 else estimated_added_cost
+
+        setattr(self, shares_attr, actual_shares)
+        setattr(self, cost_attr, getattr(self, cost_attr, 0.0) + added_cost)
+        if real_bal > 0:
+            self.stats.bankroll = real_bal
+            self._last_real_balance = real_bal
+
+        print(
+            f"  [position] {label} reconciled real Polymarket token balance: "
+            f"{old_shares:.0f} -> {actual_shares:.0f} shares "
+            f"(cost +${added_cost:.2f})"
         )
 
     # 鈹€鈹€ Execute exit (balance-verified, partial fill aware) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -2179,6 +2216,13 @@ class PolyBot:
         if now - self._cheap_last_check < POSITION_CHECK_INTERVAL:
             return
         self._cheap_last_check = now
+        self._reconcile_active_position_balance(
+            "Cheap scalp",
+            "_cheap_token_id",
+            "_cheap_shares",
+            "_cheap_cost",
+            "_cheap_price",
+        )
 
         live = self._live_token_price(self._cheap_token_id)
         sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
@@ -2527,6 +2571,13 @@ class PolyBot:
         if now - self._relative_last_check < POSITION_CHECK_INTERVAL:
             return
         self._relative_last_check = now
+        self._reconcile_active_position_balance(
+            "Relative overreaction",
+            "_relative_token_id",
+            "_relative_shares",
+            "_relative_cost",
+            "_relative_price",
+        )
         live = self._live_token_price(self._relative_token_id)
         sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
         if sell_price <= 0 and not self.dry_run and self.executor._initialized:
@@ -2857,6 +2908,13 @@ class PolyBot:
         if now - self._panic_last_check < POSITION_CHECK_INTERVAL:
             return
         self._panic_last_check = now
+        self._reconcile_active_position_balance(
+            "Panic rebound",
+            "_panic_token_id",
+            "_panic_shares",
+            "_panic_cost",
+            "_panic_price",
+        )
         live = self._live_token_price(self._panic_token_id)
         sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
         if sell_price <= 0 and not self.dry_run and self.executor._initialized:
