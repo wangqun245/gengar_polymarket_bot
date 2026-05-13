@@ -246,6 +246,8 @@ class PolyBot:
         self._exit_profit_avg_window_seconds = float(os.getenv("EXIT_PROFIT_AVG_WINDOW_MS", os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50"))) / 1000.0
         self._exit_profit_avg_samples = int(os.getenv("EXIT_PROFIT_AVG_SAMPLES", os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50")))
         self._exit_profit_avg_min_samples = int(os.getenv("EXIT_PROFIT_AVG_MIN_SAMPLES", os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3")))
+        self._position_reconcile_interval = float(os.getenv("POSITION_RECONCILE_INTERVAL_SECONDS", "2.0"))
+        self._position_reconcile_last: dict = {}
 
         self._running = False
         self._current_window: int = 0
@@ -1239,6 +1241,13 @@ class PolyBot:
         entry_price = getattr(self, price_attr, 0.0)
         if self.dry_run or not self.executor._initialized or not token_id:
             return
+        now = time.time()
+        reconcile_key = f"{label}:{token_id}"
+        last_check = self._position_reconcile_last.get(reconcile_key, 0.0)
+        if now - last_check < self._position_reconcile_interval:
+            return
+        self._position_reconcile_last[reconcile_key] = now
+
         actual_shares = self.executor.get_token_balance(token_id, refresh=True)
         if actual_shares <= current_shares + 0.5:
             return

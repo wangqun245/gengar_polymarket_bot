@@ -42,6 +42,8 @@ POLY_MIN_NOTIONAL = 5.0
 BUY_VERIFY_ATTEMPTS = 8
 BUY_VERIFY_DELAY_SECONDS = 3.0
 BUY_RETRY_BUFFER_USD = 0.05
+BALANCE_REFRESH_MIN_INTERVAL = 2.0
+BALANCE_REFRESH_BACKOFF_SECONDS = 90.0
 
 DEFAULT_TICK_SIZE = "0.01"
 DEFAULT_NEG_RISK = False
@@ -248,6 +250,8 @@ class Executor:
         self.signature_type = _signature_type(signature_type)
         self.client: Optional[ClobClient] = None
         self._initialized = False
+        self._balance_refresh_last: dict[str, float] = {}
+        self._balance_refresh_blocked_until: float = 0.0
 
         if self.signature_type == SignatureTypeV2.POLY_1271:
             print(
@@ -288,13 +292,35 @@ class Executor:
             print(f"[executor] Init failed: {e}")
             return False
 
+    def _refresh_balance_allowance(self, params: BalanceAllowanceParams, cache_key: str) -> bool:
+        now = time.time()
+        if now < self._balance_refresh_blocked_until:
+            return False
+        if now - self._balance_refresh_last.get(cache_key, 0.0) < BALANCE_REFRESH_MIN_INTERVAL:
+            return False
+        try:
+            self.client.update_balance_allowance(params)
+            self._balance_refresh_last[cache_key] = now
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "1015" in err or "access denied" in err:
+                self._balance_refresh_blocked_until = now + BALANCE_REFRESH_BACKOFF_SECONDS
+                print(
+                    f"[executor] Balance refresh rate-limited; backing off "
+                    f"{BALANCE_REFRESH_BACKOFF_SECONDS:.0f}s"
+                )
+            else:
+                print(f"[executor] Balance refresh warning: {_friendly_error(e)}")
+            return False
+
     def get_balance(self, refresh: bool = False) -> float:
         if not self._initialized:
             return 0.0
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             if refresh:
-                self.client.update_balance_allowance(params)
+                self._refresh_balance_allowance(params, "collateral")
             bal = self.client.get_balance_allowance(params)
             return float(bal.get("balance", 0)) / 1e6
         except Exception as e:
@@ -320,7 +346,7 @@ class Executor:
                     asset_id=str(token_id),
                 )
             if refresh:
-                self.client.update_balance_allowance(params)
+                self._refresh_balance_allowance(params, f"conditional:{token_id}")
             bal = self.client.get_balance_allowance(params)
             raw = bal.get("balance", 0) if isinstance(bal, dict) else 0
             return float(raw) / 1e6
