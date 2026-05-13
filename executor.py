@@ -41,6 +41,7 @@ DEFAULT_MAX_BUY_PRICE = 0.90
 POLY_MIN_NOTIONAL = 5.0
 BUY_VERIFY_ATTEMPTS = 8
 BUY_VERIFY_DELAY_SECONDS = 3.0
+BUY_RETRY_BUFFER_USD = 0.05
 
 DEFAULT_TICK_SIZE = "0.01"
 DEFAULT_NEG_RISK = False
@@ -193,13 +194,29 @@ def _friendly_error(exc: Exception) -> str:
 
 
 def _balance_from_not_enough_error(message: str) -> float:
-    match = re.search(r"balance:\s*(\d+)\s*,\s*order amount:\s*(\d+)", message)
+    match = re.search(r"balance:\s*(\d+)", message)
     if not match:
         return 0.0
     try:
         return float(match.group(1)) / 1e6
     except Exception:
         return 0.0
+
+
+def _not_enough_balance_parts(message: str) -> Optional[dict]:
+    if "not enough balance" not in message.lower():
+        return None
+    patterns = {
+        "balance": r"balance:\s*(\d+)",
+        "active_orders": r"sum of active orders:\s*(\d+)",
+        "matched_orders": r"sum of matched orders:\s*(\d+)",
+        "order_amount": r"order amount(?: \(inc\. fees\))?:\s*(\d+)",
+    }
+    parts = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, message, re.IGNORECASE)
+        parts[key] = float(match.group(1)) / 1e6 if match else 0.0
+    return parts
 
 
 def _signature_type(value: int) -> SignatureTypeV2:
@@ -335,6 +352,93 @@ class Executor:
                 print(f"[executor] Price check failed: {e}")
             return 0.0
 
+    def _shares_within_budget(self, price: float, budget_usd: float) -> tuple[float, float]:
+        if price <= 0 or budget_usd <= 0:
+            return 0.0, 0.0
+        price_cents = round(price * 100)
+        budget_cents = int(max(0.0, budget_usd) * 100)
+        if price_cents <= 0:
+            return 0.0, 0.0
+        shares = budget_cents // price_cents
+        if shares < 1:
+            return 0.0, 0.0
+        spend = shares * price_cents / 100.0
+        return float(shares), spend
+
+    def _retry_buy_after_balance_error(
+        self,
+        error_message: str,
+        token_id: str,
+        market_price: float,
+        original_shares: float,
+        original_clean_amount: float,
+        balance_before: float,
+        token_balance_before: Optional[float],
+    ) -> Optional[OrderResult]:
+        parts = _not_enough_balance_parts(error_message)
+        if not parts:
+            return None
+
+        free_balance = max(
+            0.0,
+            parts["balance"] - parts["active_orders"] - parts["matched_orders"],
+        )
+        fee_multiplier = 1.0
+        if parts["order_amount"] > 0 and original_clean_amount > 0:
+            fee_multiplier = max(1.0, parts["order_amount"] / original_clean_amount)
+
+        retry_budget = max(0.0, free_balance / fee_multiplier - BUY_RETRY_BUFFER_USD)
+        retry_shares, retry_amount = self._shares_within_budget(market_price, retry_budget)
+        retry_shares = min(retry_shares, max(0.0, original_shares - 1.0))
+        retry_amount = retry_shares * round(market_price * 100) / 100.0
+
+        if retry_amount < POLY_MIN_NOTIONAL or retry_shares < 1:
+            print(
+                f"  [order] Balance available after active orders is only "
+                f"${free_balance:.2f}; below ${POLY_MIN_NOTIONAL:.0f} buy minimum"
+            )
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=(
+                    f"Insufficient available balance after active orders: "
+                    f"${free_balance:.2f}"
+                ),
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        print(
+            f"  [order] Balance reserved in active orders: ${parts['active_orders']:.2f}; "
+            f"retrying smaller buy {int(retry_shares)} shares for ${retry_amount:.2f}"
+        )
+        try:
+            result = self.client.create_and_post_order(
+                order_args=OrderArgs(
+                    token_id=token_id,
+                    price=market_price,
+                    size=float(int(retry_shares)),
+                    side="BUY",
+                ),
+                options=_order_options(),
+                order_type=OrderType.GTC,
+            )
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"No orderID on retry: {result}", side="BUY",
+                    price=market_price, token_id=token_id[:16] + "...",
+                )
+            time.sleep(5)
+            return self._verify_buy_via_balance(
+                order_id, market_price, float(retry_shares), token_id,
+                balance_before, token_balance_before,
+            )
+        except Exception as retry_error:
+            return OrderResult(
+                success=False, status=FAILED, error=_friendly_error(retry_error),
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
     def buy(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
         """Buy via v2 resting limit order with integer shares."""
         amount_usd = round(float(amount_usd), 2)
@@ -450,6 +554,12 @@ class Executor:
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
+            retry_result = self._retry_buy_after_balance_error(
+                str(e), token_id, market_price, shares, clean_amount,
+                balance_before, token_balance_before,
+            )
+            if retry_result is not None:
+                return retry_result
             return OrderResult(
                 success=False, status=FAILED, error=_friendly_error(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
