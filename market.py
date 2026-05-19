@@ -1,6 +1,6 @@
-"""Market discovery for Polymarket 5-minute BTC Up/Down markets.
+"""Market discovery for Polymarket 5-minute crypto Up/Down markets.
 
-The market slug is deterministic: btc-updown-5m-{window_ts}
+The market slug is deterministic: {asset}-updown-5m-{window_ts}
 where window_ts = now - (now % 300), i.e. the start of the current 5-min window.
 """
 
@@ -45,10 +45,11 @@ def next_window_ts(period_minutes: int = 5) -> int:
     return current_window_ts(period_minutes) + period
 
 
-def market_slug(period_minutes: int = 5, window_ts: int = None) -> str:
+def market_slug(period_minutes: int = 5, window_ts: int = None, asset: str = "btc") -> str:
     """Generate the deterministic market slug."""
     ts = window_ts or current_window_ts(period_minutes)
-    return f"btc-updown-{period_minutes}m-{ts}"
+    asset = str(asset or "btc").lower()
+    return f"{asset}-updown-{period_minutes}m-{ts}"
 
 
 def fetch_market_by_slug(slug: str) -> Optional[dict]:
@@ -133,9 +134,9 @@ def extract_winning_outcome(event_data: dict) -> Optional[str]:
     return None
 
 
-def get_market_winner(period_minutes: int = 5, window_ts: int = None) -> Optional[str]:
-    """Fetch the Polymarket final winner for a BTC Up/Down window."""
-    event = fetch_market_by_slug(market_slug(period_minutes, window_ts))
+def get_market_winner(period_minutes: int = 5, window_ts: int = None, asset: str = "btc") -> Optional[str]:
+    """Fetch the Polymarket final winner for a crypto Up/Down window."""
+    event = fetch_market_by_slug(market_slug(period_minutes, window_ts, asset=asset))
     if not event:
         return None
     return extract_winning_outcome(event)
@@ -146,7 +147,7 @@ def extract_token_ids(event_data: dict) -> tuple[str, str]:
     
     Returns (token_id_up, token_id_down).
     
-    Polymarket BTC 5-min markets have a single market with:
+    Polymarket 5-min markets have a single market with:
       outcomes: ["Up", "Down"]
       clobTokenIds: ["<up_token>", "<down_token>"]  (JSON string)
     """
@@ -188,10 +189,10 @@ def extract_token_ids(event_data: dict) -> tuple[str, str]:
     return token_up, token_down
 
 
-def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
-    """Get the current active 5-min BTC market with all required info."""
+def get_current_market(period_minutes: int = 5, asset: str = "btc") -> Optional[MarketWindow]:
+    """Get the current active 5-min crypto market with all required info."""
     wts = current_window_ts(period_minutes)
-    slug = market_slug(period_minutes, wts)
+    slug = market_slug(period_minutes, wts, asset=asset)
     period = PERIOD_SECONDS[period_minutes]
     
     event = fetch_market_by_slug(slug)

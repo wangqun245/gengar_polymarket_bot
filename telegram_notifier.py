@@ -44,20 +44,26 @@ class TelegramNotifier:
         return "\n".join(lines)
 
     def _send_sync(self, message: str, silent: bool):
-        try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = json.dumps({
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_notification": silent,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=payload, headers={"Content-Type": "application/json"}
-            )
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"[telegram] Failed to send: {e}")
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_notification": silent,
+        }).encode("utf-8")
+        for attempt in range(1, 4):
+            try:
+                req = urllib.request.Request(
+                    url, data=payload, headers={"Content-Type": "application/json"}
+                )
+                urllib.request.urlopen(req, timeout=10)
+                return
+            except Exception as e:
+                if attempt >= 3:
+                    print(f"[telegram] Failed to send after 3 attempts: {e}")
+                    return
+                print(f"[telegram] Send attempt {attempt}/3 failed: {e}; retrying...")
+                time.sleep(2 * attempt)
 
     def trade_alert(self, side: str, price: float, amount: float, market_slug: str, dry_run: bool, edge: float = 0, kelly_size: float = 0):
         mode = "PAPER" if dry_run else "LIVE"
@@ -125,6 +131,15 @@ class TelegramNotifier:
 
         lines.append(f"  Windows seen: {h['windows_seen']}")
         lines.append(f"  Windows skipped: {h['windows_skipped']} (no signal)")
+
+        compare_rows = h.get("kronos_model_compare") or []
+        if compare_rows:
+            lines.extend([
+                "",
+                "*Kronos model compare:*",
+            ])
+            for row in compare_rows[-12:]:
+                lines.extend(row.splitlines())
 
         lines.extend([
             "",

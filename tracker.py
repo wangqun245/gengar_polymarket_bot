@@ -104,6 +104,16 @@ SESSION_FIELDS = [
     "avg_entry_price", "avg_edge", "avg_delta",
 ]
 
+SHADOW_PREDICTION_FIELDS = [
+    "timestamp", "asset", "window_ts", "window_time",
+    "asset_price", "opening_price", "asset_delta_pct",
+    "up_price", "down_price", "seconds_remaining",
+    "side", "confidence", "true_prob", "market_price", "edge", "kelly_size",
+    "action", "skip_reason",
+    "winner", "won", "profit_if_traded",
+    "market_slug",
+]
+
 
 class Tracker:
     def __init__(self, log_dir: str = "logs", log_executions: bool = False):
@@ -115,10 +125,12 @@ class Tracker:
         self._trade_path = os.path.join(log_dir, "trades.csv")
         self._exec_path = os.path.join(log_dir, "executions.csv")
         self._session_path = os.path.join(log_dir, "sessions.csv")
+        self._shadow_prediction_path = os.path.join(log_dir, "shadow_predictions.csv")
 
         self._ensure_headers(self._signal_path, SIGNAL_FIELDS)
         self._ensure_headers(self._trade_path, TRADE_FIELDS)
         self._ensure_headers(self._session_path, SESSION_FIELDS)
+        self._ensure_headers(self._shadow_prediction_path, SHADOW_PREDICTION_FIELDS)
         if self.log_executions:
             self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
 
@@ -205,6 +217,61 @@ class Tracker:
             "slippage": round(slippage, 4),
         }
         self._append_row(self._signal_path, row, SIGNAL_FIELDS)
+
+    def log_shadow_prediction(
+        self,
+        asset: str,
+        window_ts: int,
+        asset_price: float,
+        opening_price: float,
+        up_price: float,
+        down_price: float,
+        seconds_remaining: float,
+        side: str = "",
+        confidence: float = 0.0,
+        true_prob: float = 0.0,
+        market_price: float = 0.0,
+        edge: float = 0.0,
+        kelly_size: float = 0.0,
+        action: str = "no_signal",
+        skip_reason: str = "",
+        winner: str = "",
+        market_slug: str = "",
+    ):
+        asset_delta_pct = ((asset_price - opening_price) / opening_price * 100) if opening_price > 0 else 0.0
+        won = ""
+        profit_if_traded = 0.0
+        if side and winner:
+            won_bool = side.upper() == winner.upper()
+            won = "true" if won_bool else "false"
+            if market_price > 0 and kelly_size > 0:
+                profit_if_traded = kelly_size * ((1.0 / market_price) - 1.0) if won_bool else -kelly_size
+
+        row = {
+            "timestamp": time.time(),
+            "asset": str(asset or "").upper(),
+            "window_ts": window_ts,
+            "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
+            "asset_price": round(asset_price, 4),
+            "opening_price": round(opening_price, 4),
+            "asset_delta_pct": round(asset_delta_pct, 4),
+            "up_price": round(up_price, 3),
+            "down_price": round(down_price, 3),
+            "seconds_remaining": round(seconds_remaining, 1),
+            "side": side,
+            "confidence": round(confidence, 4),
+            "true_prob": round(true_prob, 4),
+            "market_price": round(market_price, 4),
+            "edge": round(edge, 4),
+            "kelly_size": round(kelly_size, 2),
+            "action": action,
+            "skip_reason": skip_reason,
+            "winner": winner,
+            "won": won,
+            "profit_if_traded": round(profit_if_traded, 2),
+            "market_slug": market_slug,
+        }
+        self._append_row(self._shadow_prediction_path, row, SHADOW_PREDICTION_FIELDS)
 
     # ── Trade lifecycle ─────────────────────────────────────────────
 

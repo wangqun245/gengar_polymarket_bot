@@ -5,7 +5,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 
 
 POLYMARKET_MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -20,6 +20,7 @@ class TokenPrice:
     bid_size: float = 0.0
     ask_size: float = 0.0
     timestamp: float = 0.0
+    received_ts: float = 0.0
     label: str = ""
 
     @property
@@ -32,8 +33,9 @@ class TokenPrice:
 class PolymarketMarketFeed:
     """Maintains live best bid/ask for subscribed Polymarket token IDs."""
 
-    def __init__(self, url: str = POLYMARKET_MARKET_WS):
+    def __init__(self, url: str = POLYMARKET_MARKET_WS, on_raw_message: Callable = None):
         self.url = url
+        self._on_raw_message = on_raw_message
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -43,6 +45,9 @@ class PolymarketMarketFeed:
         self._subscription_version = 0
         self._connected = False
         self._last_message = 0.0
+
+    def set_raw_callback(self, callback: Callable = None):
+        self._on_raw_message = callback
 
     def start(self):
         if self._running:
@@ -126,8 +131,9 @@ class PolymarketMarketFeed:
                                 if version != self._subscription_version:
                                     break
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                            self._last_message = time.time()
-                            self._handle_raw_message(raw)
+                            received_ts = time.time()
+                            self._last_message = received_ts
+                            self._handle_raw_message(raw, received_ts=received_ts)
                     finally:
                         ping_task.cancel()
                         self._connected = False
@@ -153,7 +159,15 @@ class PolymarketMarketFeed:
             except Exception:
                 return
 
-    def _handle_raw_message(self, raw: str):
+    def _handle_raw_message(self, raw: str, received_ts: float = None):
+        received_ts = received_ts or time.time()
+        if self._on_raw_message:
+            try:
+                self._on_raw_message(raw, received_ts=received_ts)
+            except TypeError:
+                self._on_raw_message(raw)
+            except Exception as e:
+                print(f"[poly-ws] Raw callback failed: {e}")
         try:
             payload = json.loads(raw)
         except Exception:
@@ -165,16 +179,16 @@ class PolymarketMarketFeed:
                 continue
             event_type = msg.get("event_type")
             if event_type == "book":
-                self._handle_book(msg)
+                self._handle_book(msg, received_ts=received_ts)
             elif event_type == "price_change":
                 for change in msg.get("price_changes", []):
-                    self._handle_price_change(change, msg.get("timestamp"))
+                    self._handle_price_change(change, msg.get("timestamp"), received_ts=received_ts)
             elif event_type == "best_bid_ask":
-                self._handle_best_bid_ask(msg)
+                self._handle_best_bid_ask(msg, received_ts=received_ts)
             elif event_type == "last_trade_price":
-                self._handle_last_trade(msg)
+                self._handle_last_trade(msg, received_ts=received_ts)
 
-    def _handle_book(self, msg: dict):
+    def _handle_book(self, msg: dict, received_ts: float = None):
         asset_id = str(msg.get("asset_id", ""))
         if not asset_id:
             return
@@ -188,9 +202,10 @@ class PolymarketMarketFeed:
             best_ask=best_ask,
             bid_size=bid_size,
             ask_size=ask_size,
+            received_ts=received_ts,
         )
 
-    def _handle_price_change(self, msg: dict, timestamp=None):
+    def _handle_price_change(self, msg: dict, timestamp=None, received_ts: float = None):
         asset_id = str(msg.get("asset_id", ""))
         if not asset_id:
             return
@@ -199,9 +214,10 @@ class PolymarketMarketFeed:
             best_bid=self._as_float(msg.get("best_bid")),
             best_ask=self._as_float(msg.get("best_ask")),
             timestamp=timestamp,
+            received_ts=received_ts,
         )
 
-    def _handle_best_bid_ask(self, msg: dict):
+    def _handle_best_bid_ask(self, msg: dict, received_ts: float = None):
         asset_id = str(msg.get("asset_id", ""))
         if not asset_id:
             return
@@ -210,9 +226,10 @@ class PolymarketMarketFeed:
             best_bid=self._as_float(msg.get("best_bid")),
             best_ask=self._as_float(msg.get("best_ask")),
             timestamp=msg.get("timestamp"),
+            received_ts=received_ts,
         )
 
-    def _handle_last_trade(self, msg: dict):
+    def _handle_last_trade(self, msg: dict, received_ts: float = None):
         asset_id = str(msg.get("asset_id", ""))
         if not asset_id:
             return
@@ -220,6 +237,7 @@ class PolymarketMarketFeed:
             asset_id,
             last_trade=self._as_float(msg.get("price")),
             timestamp=msg.get("timestamp"),
+            received_ts=received_ts,
         )
 
     def _update_price(
@@ -231,6 +249,7 @@ class PolymarketMarketFeed:
         bid_size: float = None,
         ask_size: float = None,
         timestamp=None,
+        received_ts: float = None,
     ):
         with self._lock:
             if asset_id not in self._asset_ids:
@@ -250,6 +269,7 @@ class PolymarketMarketFeed:
             if ask_size is not None and ask_size >= 0:
                 price.ask_size = ask_size
             price.timestamp = self._normalize_ts(timestamp) or time.time()
+            price.received_ts = received_ts or time.time()
 
     def _best_level(self, levels: list, highest: bool) -> tuple[float, float]:
         best_price = 0.0

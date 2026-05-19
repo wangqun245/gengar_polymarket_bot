@@ -1,6 +1,6 @@
-"""Real-time BTC price feed from Binance WebSocket.
+"""Real-time crypto price feed from Binance WebSocket.
 
-Subscribes to BTCUSDT trade stream for tick-by-tick price updates.
+Subscribes to a Binance trade stream for tick-by-tick price updates.
 Falls back to REST API polling if WebSocket fails.
 """
 
@@ -12,13 +12,13 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws"
+BINANCE_REST_BASE = "https://api.binance.com/api/v3/ticker/price"
 
 
 @dataclass
 class PriceState:
-    """Thread-safe container for current BTC price."""
+    """Thread-safe container for current Binance price."""
     price: float = 0.0
     timestamp: float = 0.0
     source: str = "none"
@@ -43,7 +43,11 @@ class PriceState:
 
 
 class BinancePriceFeed:
-    def __init__(self):
+    def __init__(self, symbol: str = "BTCUSDT", label: str = None):
+        self.symbol = str(symbol or "BTCUSDT").upper()
+        self.label = label or self.symbol.replace("USDT", "")
+        self.ws_url = f"{BINANCE_WS_BASE}/{self.symbol.lower()}@trade"
+        self.rest_url = f"{BINANCE_REST_BASE}?symbol={self.symbol}"
         self.state = PriceState()
         self._ws_thread: Optional[threading.Thread] = None
         self._running = False
@@ -61,7 +65,7 @@ class BinancePriceFeed:
         # Also start REST poller as backup
         threading.Thread(target=self._rest_poll_loop, daemon=True).start()
 
-        print("[price] BTC price feed starting...")
+        print(f"[price] {self.label} price feed starting...")
 
     def stop(self):
         self._running = False
@@ -75,19 +79,23 @@ class BinancePriceFeed:
             async def connect():
                 while self._running:
                     try:
-                        async with websockets.connect(BINANCE_WS_URL) as ws:
-                            print("[price] WebSocket connected to Binance")
+                        async with websockets.connect(self.ws_url) as ws:
+                            print(f"[price] {self.label} WebSocket connected to Binance")
                             while self._running:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=30)
                                 data = json.loads(msg)
                                 price = float(data.get("p", 0))
                                 if price > 0:
                                     self.state.update(price, source="ws")
-                                    if self._on_price:
-                                        self._on_price(price)
+                                    self._emit_price(
+                                        price,
+                                        source="ws",
+                                        event_ts=self._event_timestamp(data),
+                                        raw=data,
+                                    )
                     except Exception as e:
                         if self._running:
-                            print(f"[price] WebSocket error: {e}, reconnecting in 3s...")
+                            print(f"[price] {self.label} WebSocket error: {e}, reconnecting in 3s...")
                             await asyncio.sleep(3)
 
             asyncio.run(connect())
@@ -102,7 +110,7 @@ class BinancePriceFeed:
                 # Only poll if WebSocket data is stale
                 if not self.state.is_fresh:
                     req = urllib.request.Request(
-                        BINANCE_REST_URL,
+                        self.rest_url,
                         headers={"User-Agent": "PolyBot/1.0"},
                     )
                     resp = urllib.request.urlopen(req, timeout=5)
@@ -110,14 +118,39 @@ class BinancePriceFeed:
                     price = float(data.get("price", 0))
                     if price > 0:
                         self.state.update(price, source="rest")
-                        if self._on_price:
-                            self._on_price(price)
+                        self._emit_price(price, source="rest", event_ts=time.time(), raw=data)
             except Exception:
                 pass
             time.sleep(2)
 
+    def _emit_price(self, price: float, source: str, event_ts: float = None, raw: dict = None):
+        if not self._on_price:
+            return
+        received_ts = time.time()
+        try:
+            self._on_price(
+                price,
+                source=source,
+                event_ts=event_ts or received_ts,
+                received_ts=received_ts,
+                raw=raw or {},
+            )
+        except TypeError:
+            self._on_price(price)
+
+    def _event_timestamp(self, data: dict) -> float:
+        # Binance trade stream exposes event time E and trade time T in ms.
+        for key in ("E", "T"):
+            value = data.get(key)
+            if value:
+                try:
+                    return float(value) / 1000.0
+                except Exception:
+                    pass
+        return time.time()
+
     def get_price(self) -> tuple[float, bool]:
-        """Get current BTC price and whether it's fresh.
+        """Get current price and whether it's fresh.
         
         Returns (price, is_fresh).
         """

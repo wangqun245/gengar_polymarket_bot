@@ -1,4085 +1,1381 @@
-﻿#!/usr/bin/env python3
-"""
-PolyBot v13 鈥?Recalibrated + Safety Systems
+"""PolyBot single-strategy runner.
 
-Strategy:
-  - Brownian motion model with vol=0.12 (recalibrated from 0.08)
-  - Entry gate: model confidence >= 80%, market price <= true_prob * 0.85
-  - Position sizing: quarter-Kelly, $5鈥?25 per trade
-  - Exit: hold all positions to resolution 鈥?no stops, no take-profit
-
-Safety systems:
-  1. CLOB health check: get_ok() before every trade; 3 consecutive
-     failures halt trading and send Telegram alert. Auto-recovers
-     when API comes back at next window boundary.
-  2. Daily loss limit: if balance retreats from its daily peak by DAILY_LOSS_LIMIT_RETREAT, halt trading.
-  3. Balance-verified buys: snapshot USDC before/after; ghost fills
-     caught even when API throws. Never cancels on timeout 鈥?returns
-     UNVERIFIED_BUY for pending detection at next window boundary.
-  4. Pending buy safety net: if buy unverified, check balance at next
-     window boundary; retroactively track as filled if balance dropped.
-  5. Window-boundary balance sync: real USDC balance overwrites internal
-     tracking every 5 minutes. Corrects any accumulated drift.
-  6. Minimum notional guard: skip sells below $5 notional; hold to
-     resolution instead of hitting Polymarket's minimum-size rejection.
+Only one strategy is active:
+  1. Build a rolling Binance BTCUSDT baseline from 50ms trade buckets.
+  2. Buy Polymarket BTC UP when Binance price and filled quantity spike upward.
+  3. Sell the UP position when Binance price reverses downward on elevated
+     quantity and the live Polymarket sell price satisfies the minimum profit.
+  4. If Binance does not reverse, trail the best unrealized profit and sell
+     when Polymarket profit retreats by the configured percentage.
 """
 
-import os
-import sys
-import time
-import signal
-import math
-import statistics
+from __future__ import annotations
+
 import builtins
+import math
+import os
+import signal
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+import numpy as np
 from dotenv import load_dotenv
 
-import logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-from market import get_current_market, get_market_winner, current_window_ts, PERIOD_SECONDS
-from price_feed import BinancePriceFeed
+from executor import Executor
+from market import MarketWindow, get_current_market, get_market_winner
 from polymarket_ws import PolymarketMarketFeed
-from strategy import (
-    evaluate,
-    evaluate_trend_entry,
-    estimate_true_probability,
-    get_trend_entry_skip_reason,
-    StrategyConfig,
-    TradingStats,
-)
-from executor import Executor, FILLED, PARTIAL, FAILED, max_buy_price
+from price_feed import BinancePriceFeed
+from strategy import LatencySpikeStrategy, LatencyStrategyConfig
 from telegram_notifier import TelegramNotifier
-from tracker import Tracker
 
 
-FORCED_EXIT_START = 5
-FORCED_EXIT_END = 1
-POSITION_CHECK_INTERVAL = 0.25
-MAX_EXIT_RETRIES = 3
-EXIT_RETRY_COOLDOWN = 10
-PENDING_BUY_STATUS_LOG_INTERVAL = 30.0
+_ORIGINAL_PRINT = builtins.print
 
 
-_RAW_PRINT = builtins.print
+def _timestamped_print(*args, **kwargs):
+    now = datetime.now()
+    prefix = now.strftime("[%Y-%m-%d %H:%M:%S.%f")[:-3] + "]"
+    if args:
+        first = str(args[0])
+        if first.startswith("\n"):
+            args = ("\n" + prefix + " " + first[1:], *args[1:])
+        else:
+            args = (prefix, *args)
+    else:
+        args = (prefix,)
+    _ORIGINAL_PRINT(*args, **kwargs)
+    try:
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        log_dir = Path(os.getenv("LOG_DIR", "logs"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"bot_{now.strftime('%Y%m%d')}.log"
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(sep.join(str(arg) for arg in args) + end)
+    except Exception:
+        pass
 
 
-def _sanitize_console_text(value) -> str:
-    """Keep systemd/journalctl logs readable even if old source text is mojibake."""
-    text = str(value)
-    replacements = {
-        "鈹€": "-",
-        "═": "=",
-        "鈥?": "-",
-        "鈫?": "->",
-        "鈴?": "[TIME]",
-        "鉁?": "[OK]",
-        "鉂?": "[ERROR]",
-        "鈿狅笍": "[WARN]",
-        "馃敶": "LIVE",
-        "馃殌": "[RUN]",
-        "馃晲": "[WINDOW]",
-        "馃搶": "[INFO]",
-        "馃搳": "[SUMMARY]",
-        "馃挵": "[MONEY]",
-        "馃搱": "[UP]",
-        "馃搲": "[DOWN]",
-        "馃洃": "[STOP]",
-        "馃攧": "[SYNC]",
-        "馃攲": "[HALT]",
-        "馃幆": "[TRADE]",
-        "馃懟": "[LATE_FILL]",
-        "閴?": "[ORDER]",
-        "↑": "UP",
-        "↓": "DOWN",
-        "→": "FLAT",
-        "—": "-",
-        "–": "-",
-    }
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-    return "".join(ch if ord(ch) < 128 else "" for ch in text)
+builtins.print = _timestamped_print
 
 
-def _safe_print(*args, **kwargs):
-    args = tuple(_sanitize_console_text(arg) for arg in args)
-    _RAW_PRINT(*args, **kwargs)
+@dataclass
+class Position:
+    side: str
+    token_id: str
+    window_ts: int
+    market_slug: str
+    entry_price: float
+    shares: float
+    cost: float
+    entry_btc_price: float
+    opening_price: float
+    entry_ts: float
+    exit_revenue: float = 0.0
+    peak_unrealized_profit: float = 0.0
+    peak_sell_price: float = 0.0
+    last_sell_price: float = 0.0
+    closed: bool = False
 
 
-builtins.print = _safe_print
+@dataclass
+class PendingSignal:
+    kind: str
+    created_ts: float
+    deadline_ts: float
+    ref_poly_price: float
+    ref_poly_received_ts: float
+    signal: object
+    trend_start_ts: float = 0.0
+    latency_target_ms: float = 0.0
+    trend_window_ms: float = 0.0
+    safety_margin_ms: float = 0.0
+    waits: int = 0
+    observation_logged: bool = False
 
 
-class TeeStream:
-    """Write console output to both the original stream and a log file."""
+@dataclass
+class PriceSample:
+    ts: float
+    price: float
+    segment: int = 0
 
-    def __init__(self, console, log_file):
-        self.console = console
-        self.log_file = log_file
 
-    def write(self, data):
-        self.console.write(data)
-        self.log_file.write(data)
-        self.flush()
+@dataclass
+class WindowLatencyMatch:
+    window_start: int
+    btc_start_ts: float
+    latency_ms: float
+    sse: float
+    samples: int
+    second_sse: float = 0.0
+    top_lags: str = ""
+    scale: float = 0.0
+    btc_range: float = 0.0
+    poly_range: float = 0.0
 
-    def flush(self):
-        self.console.flush()
-        self.log_file.flush()
 
-    def isatty(self):
-        return hasattr(self.console, "isatty") and self.console.isatty()
+@dataclass
+class FeedGapStats:
+    count: int = 0
+    avg_gap_ms: float = 0.0
+    max_gap_ms: float = 0.0
+    last_gap_ms: float = 0.0
+    last_ts: float = 0.0
+
+    def update(self, ts: float) -> None:
+        if ts <= 0:
+            return
+        if self.last_ts > 0 and ts > self.last_ts:
+            gap_ms = (ts - self.last_ts) * 1000.0
+            self.last_gap_ms = gap_ms
+            self.max_gap_ms = max(self.max_gap_ms, gap_ms)
+            if self.count <= 0:
+                self.avg_gap_ms = gap_ms
+            else:
+                self.avg_gap_ms = ((self.avg_gap_ms * self.count) + gap_ms) / (self.count + 1)
+            self.count += 1
+        elif self.last_ts <= 0:
+            self.count = max(self.count, 0)
+        self.last_ts = max(self.last_ts, ts)
 
 
 class PolyBot:
     def __init__(self):
         load_dotenv()
 
-        self._runtime_log_file = None
-        self._setup_runtime_log()
-
+        self.config = LatencyStrategyConfig.from_env()
+        self.strategy = LatencySpikeStrategy(self.config)
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-        self.period = int(os.getenv("MARKET_PERIOD", "5"))
-
-        self.strategy_config = StrategyConfig(
-            min_edge=float(os.getenv("MIN_EDGE", "0.05")),
-            min_prob=float(os.getenv("MIN_PROB", "0.80")),
-            min_btc_delta=float(os.getenv("MIN_BTC_DELTA", "0.06")),
-            entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "240")),
-            entry_window_end=int(os.getenv("ENTRY_WINDOW_END", "10")),
-            kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
-            min_bet=float(os.getenv("MIN_BET", "5.0")),
-            max_bet=float(os.getenv("MAX_BET", "25.0")),
-            trend_entry_window_seconds=int(os.getenv("TREND_ENTRY_WINDOW_SECONDS", "60")),
-            trend_entry_threshold_pct=float(os.getenv("TREND_ENTRY_THRESHOLD_PCT", "0.03")),
-            trend_entry_skip_threshold_pct=float(os.getenv("TREND_ENTRY_SKIP_THRESHOLD_PCT", "0.20")),
-            trend_trade_amount=float(os.getenv("TREND_TRADE_AMOUNT", os.getenv("MAX_BET", "25.0"))),
-            invert_trend_entry=os.getenv("INVERT_TREND_ENTRY", "false").lower() == "true",
+        self.period_minutes = int(os.getenv("MARKET_PERIOD", "5"))
+        self.entry_window_seconds = float(os.getenv("ENTRY_WINDOW_SECONDS", "240"))
+        self.dry_run_balance = float(os.getenv("DRY_RUN_BALANCE", "100"))
+        self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30"))
+        self.strategy_peak_loss_drop = float(os.getenv("STRATEGY_PEAK_LOSS_DROP", "0"))
+        self.strategy_cooling_down_period = float(os.getenv("STRATEGY_COOLING_DOWN_PERIOD", "5400"))
+        self.status_interval = float(os.getenv("STATUS_INTERVAL_SECONDS", "10"))
+        self.latency_default_ms = float(os.getenv("CHANNEL_LATENCY_DEFAULT_MS", "300"))
+        self.latency_max_wait_ms = float(os.getenv("CHANNEL_LATENCY_MAX_WAIT_MS", "1500"))
+        self.latency_poly_sync_min_move = float(os.getenv("CHANNEL_LATENCY_POLY_SYNC_MIN_MOVE", "0.005"))
+        self.latency_poly_trend_delay_seconds = float(os.getenv("CHANNEL_LATENCY_POLY_TREND_DELAY_MS", "0")) / 1000.0
+        self.latency_poly_trend_ticks = max(2, int(float(os.getenv("CHANNEL_LATENCY_POLY_TREND_TICKS", "3"))))
+        self.latency_poly_trend_window_ms = float(
+            os.getenv("CHANNEL_LATENCY_POLY_TREND_WINDOW_MS", str(self.latency_poly_trend_ticks * 50))
         )
+        self.latency_safety_margin_ms = float(os.getenv("CHANNEL_LATENCY_SAFETY_MARGIN_MS", "200"))
+        self.latency_samples_limit = int(float(os.getenv("CHANNEL_LATENCY_SAMPLE_LIMIT", "100")))
+        self.waveform_sample_ms = float(os.getenv("CHANNEL_WAVEFORM_SAMPLE_MS", "50"))
+        self.waveform_match_seconds = float(os.getenv("CHANNEL_WAVEFORM_MATCH_SECONDS", "120"))
+        self.waveform_start_offset_seconds = float(os.getenv("CHANNEL_WAVEFORM_START_OFFSET_SECONDS", "10"))
+        self.waveform_max_lag_seconds = float(os.getenv("CHANNEL_WAVEFORM_MAX_LAG_SECONDS", "5"))
+        self.waveform_lag_step_ms = float(os.getenv("CHANNEL_WAVEFORM_LAG_STEP_MS", "100"))
+        self.waveform_min_points = int(float(os.getenv("CHANNEL_WAVEFORM_MIN_POINTS", "1500")))
+        self.waveform_max_sample_deviation_ms = float(os.getenv("CHANNEL_WAVEFORM_MAX_SAMPLE_DEVIATION_MS", "250"))
+        self.waveform_min_accept_ms = float(os.getenv("CHANNEL_WAVEFORM_MIN_ACCEPT_MS", "250"))
+        self.waveform_max_accept_ms = float(os.getenv("CHANNEL_WAVEFORM_MAX_ACCEPT_MS", "1500"))
+        self.waveform_min_baseline_samples = int(float(os.getenv("CHANNEL_WAVEFORM_MIN_BASELINE_SAMPLES", "3")))
+        self.waveform_max_sample_gap_seconds = float(os.getenv("CHANNEL_WAVEFORM_MAX_SAMPLE_GAP_SECONDS", "30"))
+        self.waveform_min_sse_improvement = float(os.getenv("CHANNEL_WAVEFORM_MIN_SSE_IMPROVEMENT", "1.0"))
+        self.waveform_min_sse_improvement_pct = float(os.getenv("CHANNEL_WAVEFORM_MIN_SSE_IMPROVEMENT_PCT", "0.001"))
+        self.waveform_min_poly_range = float(os.getenv("CHANNEL_WAVEFORM_MIN_POLY_RANGE", "0.50"))
+        self.waveform_max_scale = float(os.getenv("CHANNEL_WAVEFORM_MAX_SCALE", "350"))
+        self._waveform_fail_reason = ""
 
-        initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
-        self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT_RETREAT", os.getenv("DAILY_LOSS_LIMIT", "30.0")))
-        self._peak_loss_drop = float(os.getenv("PEAK_LOSS_DROP", "0.0"))
-        self._cooling_down_period = float(os.getenv("COOLING_DOWN_PERIOD", "10800"))
-        self._strategy_daily_loss_limits = {
-            "trend": float(os.getenv("TREND_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
-            "cheap": float(os.getenv("CHEAP_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
-            "panic": float(os.getenv("PANIC_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
-            "relative": float(os.getenv("RELATIVE_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
-            "original": float(os.getenv("ORIGINAL_DAILY_LOSS_LIMIT", os.getenv("DAILY_LOSS_LIMIT", "30.0"))),
-        }
-        self._strategy_peak_loss_drops = {
-            "trend": float(os.getenv("TREND_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
-            "cheap": float(os.getenv("CHEAP_PEAK_LOSS_DROP", os.getenv("CHEAP_SCALP_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0")))),
-            "panic": float(os.getenv("PANIC_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
-            "relative": float(os.getenv("RELATIVE_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
-            "original": float(os.getenv("ORIGINAL_PEAK_LOSS_DROP", os.getenv("PEAK_LOSS_DROP", "0.0"))),
-        }
-        self._strategy_cooling_down_periods = {
-            "trend": float(os.getenv("TREND_COOLING_DOWN_PERIOD", "5400")),
-            "cheap": float(os.getenv("CHEAP_COOLING_DOWN_PERIOD", os.getenv("CHEAP_SCALP_COOLING_DOWN_PERIOD", "5400"))),
-            "panic": float(os.getenv("PANIC_COOLING_DOWN_PERIOD", "5400")),
-            "relative": float(os.getenv("RELATIVE_COOLING_DOWN_PERIOD", "5400")),
-            "original": float(os.getenv("ORIGINAL_COOLING_DOWN_PERIOD", "5400")),
-        }
-        self._rolling_vol_windows = int(os.getenv("ROLLING_VOL_WINDOWS", "12"))
-        self._vol_floor = float(os.getenv("VOL_FLOOR", "0.06"))
-        self._vol_cap = float(os.getenv("VOL_CAP", "0.30"))
-        self._vol_fallback = 0.12  # used until enough windows accumulate
-
-        self.price_feed = BinancePriceFeed()
-        self.poly_feed = PolymarketMarketFeed()
         self.executor = Executor(
             private_key=os.getenv("PRIVATE_KEY", ""),
             safe_address=os.getenv("SAFE_ADDRESS", ""),
             dry_run=self.dry_run,
-            signature_type=int(os.getenv("SIGNATURE_TYPE", "3")),
-            funder_address=os.getenv("FUNDER_ADDRESS", "") or os.getenv("SAFE_ADDRESS", ""),
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
+            funder_address=os.getenv("FUNDER_ADDRESS", os.getenv("SAFE_ADDRESS", "")),
         )
         self.telegram = TelegramNotifier()
-        self.tracker = Tracker(
-            log_dir=os.getenv("LOG_DIR", "logs"),
-            log_executions=os.getenv("LOG_EXECUTIONS", "false").lower() == "true",
-        )
-        self.stats = TradingStats(bankroll=initial_bankroll)
-        self.stats.hourly.hour_start = time.time()
+        self.price_feed = BinancePriceFeed("BTCUSDT", "BTC")
+        self.poly_feed = PolymarketMarketFeed()
 
-        self._poly_ws_enabled = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
-        self._trend_enabled = os.getenv("TREND_STRATEGY_ENABLED", "true").lower() == "true"
-        self._take_profit_price = float(os.getenv("TAKE_PROFIT_PRICE", "0.70"))
-        self._min_profit_pct = float(os.getenv("MIN_PROFIT_PCT", "0.10"))
-        self._min_profit_usd = float(os.getenv("MIN_PROFIT_USD", "1.00"))
-        self._trend_profit_retreat_pct = float(os.getenv("TREND_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20")))
-        self._confirm_ws_sell_price = os.getenv("CONFIRM_WS_SELL_PRICE", "true").lower() == "true"
-        self._cheap_scalp_enabled = os.getenv("CHEAP_SCALP_ENABLED", "true").lower() == "true"
-        self._cheap_entry_price = float(os.getenv("CHEAP_ENTRY_PRICE", "0.20"))
-        self._cheap_entry_window_seconds = int(os.getenv("CHEAP_ENTRY_WINDOW_SECONDS", "150"))
-        self._cheap_trade_amount = float(os.getenv("CHEAP_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
-        self._cheap_take_profit_price = float(os.getenv("CHEAP_BUY_TAKE_PROFIT_PRICE", "0.30"))
-        self._cheap_min_profit_pct = float(os.getenv("CHEAP_BUY_MIN_PROFIT_PCT", "0.10"))
-        self._cheap_min_profit_usd = float(os.getenv("CHEAP_BUY_MIN_PROFIT_USD", "1.00"))
-        self._cheap_profit_retreat_pct = float(os.getenv("CHEAP_PROFIT_RETREAT_PCT", os.getenv("CHEAP_SCALP_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
-        self._panic_enabled = os.getenv("PANIC_BUY_ENABLED", "true").lower() == "true"
-        self._panic_lookback_seconds = int(os.getenv("PANIC_LOOKBACK_SECONDS", "20"))
-        self._panic_drop_pct = float(os.getenv("PANIC_DROP_PCT", "0.25"))
-        self._panic_min_high_price = float(os.getenv("PANIC_MIN_HIGH_PRICE", "0.50"))
-        self._panic_max_buy_price = float(os.getenv("PANIC_MAX_BUY_PRICE", "0.45"))
-        self._panic_max_btc_against_pct = float(os.getenv("PANIC_MAX_BTC_AGAINST_PCT", "0.08"))
-        self._panic_entry_window_seconds = int(os.getenv("PANIC_ENTRY_WINDOW_SECONDS", "240"))
-        self._panic_trade_amount = float(os.getenv("PANIC_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
-        self._panic_take_profit_price = float(os.getenv("PANIC_TAKE_PROFIT_PRICE", "0.55"))
-        self._panic_min_profit_pct = float(os.getenv("PANIC_MIN_PROFIT_PCT", "0.12"))
-        self._panic_min_profit_usd = float(os.getenv("PANIC_MIN_PROFIT_USD", "1.00"))
-        self._panic_profit_retreat_pct = float(os.getenv("PANIC_PROFIT_RETREAT_PCT", os.getenv("PANIC_REBOUND_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
-        self._realtime_to_save = int(os.getenv("REALTIME_TO_SAVE", "120"))
-        self._relative_enabled = os.getenv("RELATIVE_REACTION_ENABLED", "true").lower() == "true"
-        self._relative_entry_window_seconds = int(os.getenv("RELATIVE_ENTRY_WINDOW_SECONDS", "120"))
-        self._relative_lookback_seconds = int(os.getenv("RELATIVE_LOOKBACK_SECONDS", str(self._realtime_to_save)))
-        self._relative_min_btc_move_pct = float(os.getenv("RELATIVE_MIN_BTC_MOVE_PCT", "0.02"))
-        self._relative_overreaction_price = float(
-            os.getenv("RELATIVE_OVERREACTION_PRICE", os.getenv("RELATIVE_OVERREACTION_CENTS", "0.10"))
-        )
-        self._relative_trade_amount = float(os.getenv("RELATIVE_TRADE_AMOUNT", os.getenv("TREND_TRADE_AMOUNT", "25.0")))
-        self._relative_min_buy_price = float(os.getenv("RELATIVE_MIN_BUY_PRICE", "0.05"))
-        self._relative_max_buy_price = float(os.getenv("RELATIVE_MAX_BUY_PRICE", "0.65"))
-        self._relative_take_profit_price = float(os.getenv("RELATIVE_TAKE_PROFIT_PRICE", "0.55"))
-        self._relative_min_profit_pct = float(os.getenv("RELATIVE_MIN_PROFIT_PCT", "0.10"))
-        self._relative_min_profit_usd = float(os.getenv("RELATIVE_MIN_PROFIT_USD", "1.00"))
-        self._relative_profit_retreat_pct = float(os.getenv("RELATIVE_PROFIT_RETREAT_PCT", os.getenv("RELATIVE_OVERREACTION_PROFIT_RETREAT_PCT", os.getenv("STRATEGY_PROFIT_RETREAT_PCT", "0.20"))))
-        self._original_enabled = os.getenv("ORIGINAL_STRATEGY_ENABLED", "false").lower() == "true"
-        self._poly_ws_warmup_seconds = float(os.getenv("POLYMARKET_WS_WARMUP_SECONDS", "2.0"))
-        self._entry_price_trend_window_seconds = float(os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50")) / 1000.0
-        self._entry_price_trend_samples = int(os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50"))
-        self._entry_price_trend_min_samples = int(os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3"))
-        self._exit_profit_avg_window_seconds = float(os.getenv("EXIT_PROFIT_AVG_WINDOW_MS", os.getenv("ENTRY_PRICE_TREND_WINDOW_MS", "50"))) / 1000.0
-        self._exit_profit_avg_samples = int(os.getenv("EXIT_PROFIT_AVG_SAMPLES", os.getenv("ENTRY_PRICE_TREND_SAMPLES", "50")))
-        self._exit_profit_avg_min_samples = int(os.getenv("EXIT_PROFIT_AVG_MIN_SAMPLES", os.getenv("ENTRY_PRICE_TREND_MIN_SAMPLES", "3")))
-        self._position_reconcile_interval = float(os.getenv("POSITION_RECONCILE_INTERVAL_SECONDS", "2.0"))
-        self._position_reconcile_last: dict = {}
-
+        self.market: Optional[MarketWindow] = None
+        self.opening_price = 0.0
+        self.current_btc_price = 0.0
+        self.position: Optional[Position] = None
+        self.session_start_balance = 0.0
+        self.realized_pnl = 0.0
+        self._strategy_pnl_peak = 0.0
+        self._strategy_cooldown_until = 0.0
         self._running = False
-        self._current_window: int = 0
-        self._current_market = None
-        self._market_subscription_time: float = 0.0
-        self._opening_price: float = 0.0
-        self._last_hour_check: int = 0
-        self._winner_cache: dict = {}
-        self._winner_source_cache: dict = {}
-        self._polymarket_window_prices: dict = {}
-        self._dry_pending_resolutions: list = []
-        self._resolving_window_ts: int = 0
-        self._resolving_window_winner: str = ""
-        self._delayed_entries: dict = {}
-        self._entry_price_history: dict = {}
-        self._exit_profit_history: dict = {}
+        self._last_status_ts = 0.0
+        self._last_market_probe_ts = 0.0
+        self._consecutive_clob_failures = 0
+        self._clob_halted = False
+        self._pending_entry: Optional[PendingSignal] = None
+        self._pending_exit: Optional[PendingSignal] = None
+        self._latency_samples_ms: list[float] = []
+        self._latency_avg_ms = self.latency_default_ms
+        self._last_latency_log_ts = 0.0
+        self._btc_price_samples: list[PriceSample] = []
+        self._poly_price_samples: list[PriceSample] = []
+        self._feed_gap_stats = {
+            "btc": FeedGapStats(),
+            "poly": FeedGapStats(),
+        }
+        self._window_latency_matches: list[WindowLatencyMatch] = []
+        self._calibrated_window_starts: set[int] = set()
+        self._latency_calibrated = False
+        self._last_poly_extrema_received_ts = 0.0
+        self._last_calibration_debug_ts = 0.0
+        self._calibration_debug_reason = "waiting for completed 5m waveform windows"
 
-        # Trade state
-        self._traded: bool = False
-        self._trade_attempted: bool = False
-        self._trade_side: str = ""
-        self._trade_price: float = 0.0
-        self._trade_cost: float = 0.0
-        self._trade_shares: float = 0.0
-        self._trade_token_id: str = ""
-
-        # Exit state
-        self._exited: bool = False
-        self._exit_revenue: float = 0.0
-        self._exit_shares_sold: float = 0.0
-        self._residual_shares: float = 0.0  # Shares left after partial fill
-        self._last_position_check: float = 0.0
-        self._last_status_print: float = 0.0
-        self._last_tick_context: dict = {}   # last entry-window state, for window-end signal logging
-        self._session_start_time: float = time.time()
-        self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
-        self._exit_retries: int = 0
-        self._exit_gave_up: bool = False
-        self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
-        self._trend_trailing_armed: bool = False
-        self._trend_peak_profit: float = 0.0
-
-        # Secondary strategy: cheap Polymarket price scalp
-        self._cheap_traded: bool = False
-        self._cheap_trade_attempted: bool = False
-        self._cheap_exited: bool = False
-        self._cheap_side: str = ""
-        self._cheap_token_id: str = ""
-        self._cheap_price: float = 0.0
-        self._cheap_cost: float = 0.0
-        self._cheap_shares: float = 0.0
-        self._cheap_exit_revenue: float = 0.0
-        self._cheap_last_check: float = 0.0
-        self._cheap_trailing_armed: bool = False
-        self._cheap_peak_profit: float = 0.0
-        self._cheap_pending_side: str = ""
-        self._cheap_pending_token_id: str = ""
-        self._cheap_pending_order_id: str = ""
-        self._cheap_pending_price: float = 0.0
-        self._cheap_pending_amount: float = 0.0
-        self._cheap_pending_shares: float = 0.0
-        self._cheap_pending_balance_before: float = 0.0
-        self._cheap_pending_token_balance_before: float = 0.0
-        self._cheap_pending_last_check: float = 0.0
-        self._cheap_pending_started_at: float = 0.0
-        self._cheap_pending_window: int = 0
-        self._cheap_pending_last_notice: float = 0.0
-
-        # Strategy-level risk and P&L
-        self._strategy_pnl = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
-        self._strategy_loss_halted = {"trend": False, "cheap": False, "panic": False, "relative": False, "original": False}
-        self._total_pnl_peak: float = 0.0
-        self._balance_peak: float = initial_bankroll
-        self._bot_cooldown_until: float = 0.0
-        self._strategy_pnl_peaks = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
-        self._strategy_cooldown_until = {"trend": 0.0, "cheap": 0.0, "panic": 0.0, "relative": 0.0, "original": 0.0}
-
-        # Fourth strategy: Binance/Polymarket relative overreaction
-        self._realtime_history = []
-        self._relative_traded: bool = False
-        self._relative_trade_attempted: bool = False
-        self._relative_exited: bool = False
-        self._relative_side: str = ""
-        self._relative_token_id: str = ""
-        self._relative_price: float = 0.0
-        self._relative_cost: float = 0.0
-        self._relative_shares: float = 0.0
-        self._relative_exit_revenue: float = 0.0
-        self._relative_last_check: float = 0.0
-        self._relative_trailing_armed: bool = False
-        self._relative_peak_profit: float = 0.0
-        self._relative_pending_side: str = ""
-        self._relative_pending_token_id: str = ""
-        self._relative_pending_order_id: str = ""
-        self._relative_pending_price: float = 0.0
-        self._relative_pending_amount: float = 0.0
-        self._relative_pending_shares: float = 0.0
-        self._relative_pending_balance_before: float = 0.0
-        self._relative_pending_token_balance_before: float = 0.0
-        self._relative_pending_last_check: float = 0.0
-        self._relative_pending_started_at: float = 0.0
-        self._relative_pending_window: int = 0
-        self._relative_pending_last_notice: float = 0.0
-
-        # Third strategy: panic sell rebound
-        self._panic_traded: bool = False
-        self._panic_trade_attempted: bool = False
-        self._panic_exited: bool = False
-        self._panic_side: str = ""
-        self._panic_token_id: str = ""
-        self._panic_price: float = 0.0
-        self._panic_cost: float = 0.0
-        self._panic_shares: float = 0.0
-        self._panic_exit_revenue: float = 0.0
-        self._panic_last_check: float = 0.0
-        self._panic_trailing_armed: bool = False
-        self._panic_peak_profit: float = 0.0
-        self._panic_price_history = {"UP": [], "DOWN": []}
-        self._panic_pending_side: str = ""
-        self._panic_pending_token_id: str = ""
-        self._panic_pending_order_id: str = ""
-        self._panic_pending_price: float = 0.0
-        self._panic_pending_amount: float = 0.0
-        self._panic_pending_shares: float = 0.0
-        self._panic_pending_balance_before: float = 0.0
-        self._panic_pending_token_balance_before: float = 0.0
-        self._panic_pending_last_check: float = 0.0
-        self._panic_pending_started_at: float = 0.0
-        self._panic_pending_window: int = 0
-        self._panic_pending_last_notice: float = 0.0
-
-        # Original repo strategy: Brownian probability + fixed edge, hold to resolution.
-        self._original_traded: bool = False
-        self._original_trade_attempted: bool = False
-        self._original_exited: bool = False
-        self._original_side: str = ""
-        self._original_token_id: str = ""
-        self._original_price: float = 0.0
-        self._original_cost: float = 0.0
-        self._original_shares: float = 0.0
-        self._original_exit_revenue: float = 0.0
-        self._original_last_check: float = 0.0
-        self._original_pending_side: str = ""
-        self._original_pending_token_id: str = ""
-        self._original_pending_order_id: str = ""
-        self._original_pending_price: float = 0.0
-        self._original_pending_amount: float = 0.0
-        self._original_pending_shares: float = 0.0
-        self._original_pending_balance_before: float = 0.0
-        self._original_pending_token_balance_before: float = 0.0
-        self._original_pending_last_check: float = 0.0
-        self._original_pending_started_at: float = 0.0
-        self._original_pending_window: int = 0
-        self._original_pending_last_notice: float = 0.0
-
-        # Pending phantom verification (claim sell reported success but balance didn't move yet)
-        # Resolved at next window boundary once Polygon settlement has had time to land.
-        self._pending_phantom: dict = {}
-
-        # Pending buy (unverified 鈥?Polygon settlement too slow)
-        self._pending_buy_side: str = ""
-        self._pending_buy_price: float = 0.0
-        self._pending_buy_amount: float = 0.0
-        self._pending_buy_shares: float = 0.0
-        self._pending_buy_token_id: str = ""
-        self._pending_buy_edge: float = 0.0
-        self._pending_buy_delta: float = 0.0
-        self._pending_buy_order_id: str = ""
-        self._pending_buy_last_check: float = 0.0
-        self._balance_before_buy: float = 0.0
-        self._pending_buy_token_balance_before: float = 0.0
-        self._pending_buy_started_at: float = 0.0
-        self._pending_buy_window: int = 0
-        self._pending_buy_last_notice: float = 0.0
-
-        # Unclaimed
-        self._unclaimed_winnings: float = 0.0
-
-        # Real balance tracking (source of truth)
-        self._session_start_balance: float = 0.0
-        self._last_real_balance: float = 0.0
-
-        # Price cache
-        self._cached_up: float = 0.50
-        self._cached_down: float = 0.50
-        self._price_last_fetched: float = 0.0
-        self._PRICE_REFRESH: float = 5.0
-
-        # Circuit breaker 鈥?detects CLOB API degradation
-        self._consecutive_buy_failures: int = 0
-        self._clob_halted: bool = False
-        self._HALT_AFTER_FAILURES: int = 3
-        self._daily_loss_halted: bool = False
-
-    def _setup_runtime_log(self):
-        if os.getenv("BOT_RUNTIME_LOG_ENABLED", "true").lower() != "true":
-            return
-        if isinstance(sys.stdout, TeeStream):
-            return
-
-        log_dir = os.getenv("LOG_DIR", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        configured_path = os.getenv("BOT_RUNTIME_LOG_FILE", "").strip()
-        if configured_path:
-            log_path = configured_path
-            parent = os.path.dirname(log_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-        else:
-            log_path = os.path.join(log_dir, f"bot_{time.strftime('%Y%m%d')}.log")
-
-        self._runtime_log_file = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
-        sys.stdout = TeeStream(sys.stdout, self._runtime_log_file)
-        sys.stderr = TeeStream(sys.stderr, self._runtime_log_file)
-        print(f"  Runtime log file: {log_path}")
-
-    def start(self):
-        if not self.dry_run:
-            print("  Direct CLOB connection enabled (Tor disabled)")
-
-        print("=" * 55)
-        print(f"  PolyBot v13 鈥?Recalibrated (vol=0.12)")
-        print(f"  Mode: {'DRY RUN' if self.dry_run else '馃敶 LIVE TRADING'}")
-        print(f"  Bets: ${self.strategy_config.min_bet:.0f}鈥?{self.strategy_config.max_bet:.0f}")
-        print(f"  Trend strategy: {'on' if self._trend_enabled else 'off'}")
-        print(f"  Entry mode: Binance trend scalp")
-        print(f"  Entry direction: {'inverse trend' if self.strategy_config.invert_trend_entry else 'trend follow'}")
-        print(f"  Trend trigger: {self.strategy_config.trend_entry_threshold_pct:.3f}% | "
-              f"Skip chase: >{self.strategy_config.trend_entry_skip_threshold_pct:.3f}%")
-        print(f"  Entry window: first {self.strategy_config.trend_entry_window_seconds}s | "
-              f"Trade amount: ${self.strategy_config.trend_trade_amount:.2f}")
-        print(f"  Max buy price: ${max_buy_price():.2f}")
-        print(f"  Polymarket WS: {'on' if self._poly_ws_enabled else 'off'} | "
-              f"Take profit: ${self._take_profit_price:.2f} or {self._min_profit_pct:.0%}+")
-        print(f"  Cheap scalp: {'on' if self._cheap_scalp_enabled else 'off'} | "
-              f"entry <= ${self._cheap_entry_price:.2f} for first {self._cheap_entry_window_seconds}s")
-        print(f"  Cheap scalp exit: ${self._cheap_take_profit_price:.2f} or "
-              f"{self._cheap_min_profit_pct:.0%}+ / ${self._cheap_min_profit_usd:.2f}+")
-        print(f"  Panic rebound: {'on' if self._panic_enabled else 'off'} | "
-              f"drop {self._panic_drop_pct:.0%} from >= ${self._panic_min_high_price:.2f} / "
-              f"buy <= ${self._panic_max_buy_price:.2f}")
-        print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
-        print(f"  Exits: arm on profit target, sell on profit retreat; otherwise hold to resolution")
+    def start(self) -> None:
+        print("=" * 72)
+        print("PolyBot - Binance latency spike strategy only")
+        print("=" * 72)
+        print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}")
+        print(f"Bucket: {self.config.bucket_ms}ms")
+        print(f"Baseline: {self.config.baseline_hours:.1f}h")
         print(
-            "  Profit trailing retreats: "
-            f"trend {self._trend_profit_retreat_pct:.0%} | "
-            f"cheap {self._cheap_profit_retreat_pct:.0%} | "
-            f"panic {self._panic_profit_retreat_pct:.0%} | "
-            f"relative {self._relative_profit_retreat_pct:.0%}"
-        )
-        print(f"  Daily balance retreat hard stop: ${self._daily_loss_limit:.0f}")
-        print(
-            f"  Peak drawdown cooldown: bot ${self._peak_loss_drop:.0f} drop / "
-            f"{self._format_duration(self._cooling_down_period)}"
+            f"Entry: push window >= {self.config.entry_push_std_mult:.2f}x "
+            f"over {self.config.push_signal_ms}ms vs {self.config.push_std_minutes:.1f}m, "
+            f"{self.strategy.entry_volume_summary()}"
         )
         print(
-            "  Strategy loss limits: "
-            f"trend ${self._strategy_daily_loss_limits['trend']:.0f} | "
-            f"cheap ${self._strategy_daily_loss_limits['cheap']:.0f} | "
-            f"panic ${self._strategy_daily_loss_limits['panic']:.0f} | "
-            f"relative ${self._strategy_daily_loss_limits['relative']:.0f}"
+            f"Exit: push window <= -{self.config.exit_push_std_mult:.2f}x "
+            f"over {self.config.push_signal_ms}ms vs {self.config.push_std_minutes:.1f}m, "
+            f"qty z>={self.config.exit_volume_z:.2f}"
+        )
+        print(f"Buy cap: ${self.config.max_buy_price:.2f}")
+        print(f"Min profit: {self.config.min_profit_pct:.1%}")
+        print(f"Profit retreat: {self.config.profit_retreat_pct:.1%}")
+        print(
+            f"Peak drawdown freeze: ${self.strategy_peak_loss_drop:.2f} / "
+            f"{self.strategy_cooling_down_period:.0f}s"
         )
         print(
-            "  Strategy peak drawdown cooldowns: "
-            f"trend ${self._strategy_peak_loss_drops['trend']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['trend'])} | "
-            f"cheap ${self._strategy_peak_loss_drops['cheap']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['cheap'])} | "
-            f"panic ${self._strategy_peak_loss_drops['panic']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['panic'])} | "
-            f"relative ${self._strategy_peak_loss_drops['relative']:.0f}/{self._format_duration(self._strategy_cooling_down_periods['relative'])}"
+            f"Channel latency: default {self.latency_default_ms:.0f}ms, "
+            f"max wait {self.latency_max_wait_ms:.0f}ms"
         )
-        print(f"  Relative overreaction: {'on' if self._relative_enabled else 'off'} | "
-              f"entry first {self._relative_entry_window_seconds}s | save {self._realtime_to_save}s")
         print(
-            f"  Original model: {'on' if self._original_enabled else 'off'} | "
-            f"prob >= {self.strategy_config.min_prob:.0%}, edge >= {self.strategy_config.min_edge:.0%}, "
-            "hold to resolution"
+            f"Poly trend sync: delay {self.latency_poly_trend_delay_seconds * 1000:.0f}ms, "
+            f"{self.latency_poly_trend_ticks} ticks, "
+            f"window {self.latency_poly_trend_window_ms:.0f}ms, "
+            f"safety {self.latency_safety_margin_ms:.0f}ms"
         )
-        print(f"  Bankroll: ${self.stats.bankroll:.2f}")
-        print("=" * 55)
+        print(
+            f"Waveform latency: sample {self.waveform_sample_ms:.0f}ms, "
+            f"start +{self.waveform_start_offset_seconds:.0f}s, "
+            f"match {self.waveform_match_seconds:.0f}s, "
+            f"lag 0-{self.waveform_max_lag_seconds:.0f}s, "
+            f"accept {self.waveform_min_accept_ms:.0f}-{self.waveform_max_accept_ms:.0f}ms, "
+            f"baseline samples {self.waveform_min_baseline_samples}, "
+            f"max gap {self.waveform_max_sample_gap_seconds:.0f}s, "
+            f"max sample dev {self.waveform_max_sample_deviation_ms:.0f}ms, "
+            f"min SSE edge {self.waveform_min_sse_improvement:.2f}/"
+            f"{self.waveform_min_sse_improvement_pct:.3%}, "
+            f"min poly range ${self.waveform_min_poly_range:.3f}, "
+            f"max scale {self.waveform_max_scale:.0f}x"
+        )
+        print(f"Trade amount: ${self.config.trade_amount:.2f}")
+        print(f"Entry window: first {self.entry_window_seconds:.0f}s of each market")
 
-        if not self.dry_run:
-            if not self.executor.initialize():
-                print("\n鉂?Failed to initialize. Check credentials.")
-                return
-            balance = self.executor.get_balance()
-            print(f"  USDC balance: ${balance:.2f}")
-            self.stats.bankroll = balance
-            self._session_start_balance = balance
-            self._last_real_balance = balance
-            self._balance_peak = balance
-            self.tracker.set_session_balance(balance)
-        else:
-            print("  [dry run 鈥?no wallet connection]")
-            self._session_start_balance = self.stats.bankroll
-            self._last_real_balance = self.stats.bankroll
-            self._balance_peak = self.stats.bankroll
-            self.tracker.set_session_balance(self.stats.bankroll)
+        executor_ready = self.executor.initialize()
+        if not executor_ready and not self.dry_run:
+            raise RuntimeError("Executor initialization failed")
+        if not executor_ready:
+            print("[executor] DRY RUN continuing without CLOB auth initialization")
 
-        self.price_feed.start()
-        if self._poly_ws_enabled:
-            self.poly_feed.start()
-        print("\n鈴?Waiting for BTC price...")
-        price = self.price_feed.wait_for_price(timeout=30)
-        if not price:
-            print("鉂?No price feed. Check internet.")
-            return
-        print(f"鉁?BTC: ${price:,.2f} ({self.price_feed.state.source})")
+        self.session_start_balance = self.dry_run_balance if self.dry_run else self.executor.get_balance(refresh=True)
+        print(f"Starting balance: ${self.session_start_balance:.2f}")
 
-        self.telegram.startup_alert({
-            "dry_run": self.dry_run,
-            "kelly_fraction": self.strategy_config.kelly_fraction,
-            "min_edge": self.strategy_config.min_edge,
-            "min_bet": self.strategy_config.min_bet,
-            "max_bet": self.strategy_config.max_bet,
-            "entry_start": self.strategy_config.entry_window_start,
-            "entry_end": self.strategy_config.entry_window_end,
-        })
-
-        self._running = True
-        self._last_hour_check = int(time.time() // 3600)
+        self.price_feed.start(on_price=self._on_binance_trade)
+        self.poly_feed.start()
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-        print("\n馃殌 Running. Ctrl+C to stop.\n")
-        self._main_loop()
+        self.telegram.send(
+            "*PolyBot Started*\n"
+            "Strategy: Binance 50ms latency spike\n"
+            f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}\n"
+            f"Buy cap: ${self.config.max_buy_price:.2f}\n"
+            f"Min profit: {self.config.min_profit_pct:.1%}\n"
+            f"Profit retreat: {self.config.profit_retreat_pct:.1%}\n"
+            f"Peak drawdown freeze: ${self.strategy_peak_loss_drop:.2f}"
+        )
 
-    def _main_loop(self):
+        self._running = True
         while self._running:
-            try:
-                self._tick()
-                self._check_hourly_summary()
-            except Exception as e:
-                print(f"[error] {e}")
-                self.telegram.error_alert(str(e))
-            time.sleep(0.1)
+            self._tick()
+            time.sleep(0.05)
 
-    def _tick(self):
-        now = time.time()
-        period_secs = PERIOD_SECONDS[self.period]
-        window_ts = int(now) - (int(now) % period_secs)
-
-        btc_price, is_fresh = self.price_feed.get_price()
-        if not is_fresh or btc_price <= 0:
-            return
-
-        self._check_pending_buy_fill(now)
-        self._check_pending_cheap_buy(now)
-        self._check_pending_panic_buy(now)
-        self._check_pending_relative_buy(now)
-        self._check_pending_original_buy(now)
-
-        if window_ts != self._current_window:
-            self._on_new_window(window_ts, closing_btc_price=btc_price)
-
-        seconds_remaining = (window_ts + period_secs) - now
-
-        if self._opening_price <= 0:
-            self._opening_price = btc_price
-            print(f"  馃搶 Open: ${btc_price:,.2f}")
-
-        self._ensure_market_subscription()
-        ws_warmed = (
-            not self._poly_ws_enabled
-            or (
-                self._market_subscription_time > 0
-                and now - self._market_subscription_time >= self._poly_ws_warmup_seconds
-            )
-        )
-        self._refresh_cached_ws_prices()
-        if ws_warmed:
-            self._update_realtime_history(now, btc_price)
-            self._update_panic_price_history(now)
-
-            self._manage_relative_reaction(seconds_remaining, now)
-            self._manage_delayed_entries(seconds_remaining, now)
-            if not self._relative_traded and not self._relative_trade_attempted:
-                self._try_relative_reaction_entry(seconds_remaining)
-            self._manage_cheap_scalp(seconds_remaining, now)
-            if not self._cheap_traded and not self._cheap_trade_attempted:
-                self._try_cheap_scalp_entry(seconds_remaining)
-            self._manage_panic_rebound(seconds_remaining, now)
-            if not self._panic_traded and not self._panic_trade_attempted:
-                self._try_panic_rebound_entry(btc_price, seconds_remaining)
-            self._manage_original_model(now)
-            if self._original_enabled and not self._original_traded and not self._original_trade_attempted:
-                self._try_original_model_entry(btc_price, seconds_remaining)
-
-        # HOLDING: active position management
-        if self._traded and not self._exited and not self._exit_gave_up:
-            self._manage_position(btc_price, seconds_remaining, now)
-            return
-
-        # Already done
-        if self._traded or self._trade_attempted:
-            return
-
-        # IDLE: watch Binance during the first minute and enter on trend.
-        signal_result = evaluate_trend_entry(
-            btc_price=btc_price,
-            opening_price=self._opening_price,
-            seconds_remaining=seconds_remaining,
-            bankroll=self.stats.bankroll,
-            config=self.strategy_config,
-        )
-        skip_reason = get_trend_entry_skip_reason(
-            btc_price=btc_price,
-            opening_price=self._opening_price,
-            seconds_remaining=seconds_remaining,
-            config=self.strategy_config,
-        )
-
-        if skip_reason == "trend_move_too_large":
-            self._trade_attempted = True
-            move = abs(((btc_price - self._opening_price) / self._opening_price) * 100)
-            print(
-                f"  Skip: BTC move {move:.3f}% > "
-                f"{self.strategy_config.trend_entry_skip_threshold_pct:.3f}% chase limit"
-            )
-        elif skip_reason == "entry_window_closed":
-            self._trade_attempted = True
-
-        # Store context for window-end no-trade signal logging
-        self._last_tick_context = {
-            "btc_price": btc_price,
-            "up_price": self._cached_up,
-            "down_price": self._cached_down,
-            "seconds_remaining": seconds_remaining,
-            "window_ts": self._current_window,
-            "signal": signal_result,
-            "skip_reason": skip_reason,
-        }
-
-        if signal_result and self._trend_enabled:
-            self._execute_trade(signal_result, seconds_remaining)
-
-        if now - self._last_status_print >= 30:
-            self._last_status_print = now
-            delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
-            d = "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT"
-            if self._traded:
-                state = "HOLDING"
-            elif skip_reason == "trend_below_threshold":
-                state = (
-                    f"TREND_WAIT "
-                    f"({abs(delta):.3f}%<{self.strategy_config.trend_entry_threshold_pct:.3f}%)"
-                )
-            elif skip_reason == "entry_window_closed":
-                state = "ENTRY_CLOSED"
-            elif skip_reason == "trend_move_too_large":
-                state = "SKIP_CHASE"
-            else:
-                state = "IDLE"
-            n = len(self._recent_window_deltas)
-            vol_label = f"{self._compute_realized_vol():.3f}({'r' if n >= 6 else f'fb,n={n}'})"
-            print(
-                f"  鈴? T-{seconds_remaining:5.1f}s | "
-                f"BTC ${btc_price:,.2f} {d}{abs(delta):.3f}% | "
-                f"UP ${self._cached_up:.3f} DN ${self._cached_down:.3f} | "
-                f"vol={vol_label} | P&L ${self.stats.total_pnl:+.2f} [{state}]"
-            )
-
-    # 鈹€鈹€ Active position management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    # 鈹€鈹€ Position monitoring (hold to resolution) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    def _check_daily_loss_limit(self, label: str = "trade") -> bool:
-        if self._daily_loss_halted:
-            print(f"  DAILY LOSS LIMIT - skipping {label} "
-                  f"(balance ${self.stats.bankroll:.2f}, peak ${self._balance_peak:.2f})")
-            return False
-
-        self._balance_peak = max(self._balance_peak, self.stats.bankroll)
-        retreat = self._balance_peak - self.stats.bankroll
-        if retreat >= self._daily_loss_limit:
-            self._daily_loss_halted = True
-            msg = (
-                f"DAILY BALANCE RETREAT LIMIT HIT: current balance ${self.stats.bankroll:.2f} "
-                f"retreated ${retreat:.2f} from peak ${self._balance_peak:.2f} "
-                f"(limit ${self._daily_loss_limit:.0f}) - stopping all trades for manual review"
-            )
-            print(f"\n  {msg}")
-            self.telegram.status_update({"alert": msg})
-            return False
-        return True
-
-    def _check_strategy_daily_loss_limit(self, key: str, label: str) -> bool:
-        limit = self._strategy_daily_loss_limits.get(key, 0.0)
-        if limit <= 0:
-            return True
-        strategy_pnl = self._strategy_pnl.get(key, 0.0)
-        if self._strategy_loss_halted.get(key, False):
-            print(
-                f"  {label.upper()} LOSS LIMIT - skipping "
-                f"(strategy P&L ${strategy_pnl:+.2f}, limit -${limit:.0f})"
-            )
-            return False
-        if strategy_pnl <= -limit:
-            self._strategy_loss_halted[key] = True
-            msg = (
-                f"{label} DAILY LOSS LIMIT HIT: ${strategy_pnl:+.2f} "
-                f"(limit -${limit:.0f}) - stopping only this strategy"
-            )
-            print(f"\n  {msg}")
-            self.telegram.status_update({"alert": msg})
-            return False
-        return True
-
-    def _format_duration(self, seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        hours, rem = divmod(seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        if hours:
-            return f"{hours}h {minutes}m"
-        if minutes:
-            return f"{minutes}m {secs}s"
-        return f"{secs}s"
-
-    def _check_bot_cooldown(self, label: str = "trade") -> bool:
-        if self._bot_cooldown_until <= 0:
-            return True
-        remaining = self._bot_cooldown_until - time.time()
-        if remaining > 0:
-            print(
-                f"  BOT COOLING DOWN - skipping {label} "
-                f"(remaining {self._format_duration(remaining)}, total P&L ${self.stats.total_pnl:+.2f})"
-            )
-            return False
-        self._bot_cooldown_until = 0.0
-        print("  Bot cooldown expired - trading can resume if other risk checks pass")
-        return True
-
-    def _check_strategy_cooldown(self, key: str, label: str) -> bool:
-        cooldown_until = self._strategy_cooldown_until.get(key, 0.0)
-        if cooldown_until <= 0:
-            return True
-        remaining = cooldown_until - time.time()
-        if remaining > 0:
-            print(
-                f"  {label.upper()} COOLING DOWN - skipping "
-                f"(remaining {self._format_duration(remaining)}, strategy P&L ${self._strategy_pnl.get(key, 0.0):+.2f})"
-            )
-            return False
-        self._strategy_cooldown_until[key] = 0.0
-        print(f"  {label} cooldown expired - strategy can resume if other risk checks pass")
-        return True
-
-    def _check_total_peak_drawdown(self):
-        self._total_pnl_peak = max(self._total_pnl_peak, self.stats.total_pnl)
-        if self._peak_loss_drop <= 0:
-            return
-        if self._bot_cooldown_until > time.time():
-            return
-        drawdown = self._total_pnl_peak - self.stats.total_pnl
-        if drawdown < self._peak_loss_drop:
-            return
-
-        self._bot_cooldown_until = time.time() + self._cooling_down_period
-        msg = (
-            f"BOT PEAK DRAWDOWN COOLDOWN: total P&L ${self.stats.total_pnl:+.2f} "
-            f"dropped ${drawdown:.2f} from peak ${self._total_pnl_peak:+.2f}. "
-            f"Pausing all strategies for {self._format_duration(self._cooling_down_period)}."
-        )
-        print(f"\n  {msg}")
-        self.telegram.status_update({"alert": msg})
-        self._total_pnl_peak = self.stats.total_pnl
-
-    def _check_strategy_peak_drawdown(self, key: str, label: str):
-        strategy_pnl = self._strategy_pnl.get(key, 0.0)
-        self._strategy_pnl_peaks[key] = max(self._strategy_pnl_peaks.get(key, 0.0), strategy_pnl)
-        drop_limit = self._strategy_peak_loss_drops.get(key, 0.0)
-        if drop_limit <= 0:
-            return
-        if self._strategy_cooldown_until.get(key, 0.0) > time.time():
-            return
-        drawdown = self._strategy_pnl_peaks[key] - strategy_pnl
-        if drawdown < drop_limit:
-            return
-
-        period = self._strategy_cooling_down_periods.get(key, 5400.0)
-        self._strategy_cooldown_until[key] = time.time() + period
-        msg = (
-            f"{label} PEAK DRAWDOWN COOLDOWN: strategy P&L ${strategy_pnl:+.2f} "
-            f"dropped ${drawdown:.2f} from peak ${self._strategy_pnl_peaks[key]:+.2f}. "
-            f"Pausing this strategy for {self._format_duration(period)}."
-        )
-        print(f"\n  {msg}")
-        self.telegram.status_update({"alert": msg})
-        self._strategy_pnl_peaks[key] = strategy_pnl
-
-    def _check_risk_limits(self, key: str, label: str) -> bool:
-        return (
-            self._check_daily_loss_limit(label)
-            and self._check_bot_cooldown(label)
-            and self._check_strategy_daily_loss_limit(key, label)
-            and self._check_strategy_cooldown(key, label)
-        )
-
-    def _update_strategy_pnl(self, key: str, label: str, profit: float):
-        self._strategy_pnl[key] = self._strategy_pnl.get(key, 0.0) + profit
-        self._check_strategy_daily_loss_limit(key, label)
-        self._check_strategy_peak_drawdown(key, label)
-        self._check_total_peak_drawdown()
-        self._check_daily_loss_limit(label)
-
-    def _record_cheap_result(self, profit: float):
-        self._record_strategy_result("cheap", "Cheap scalp", profit)
-
-    def _record_panic_result(self, profit: float):
-        self._record_strategy_result("panic", "Panic rebound", profit)
-
-    def _record_relative_result(self, profit: float):
-        self._record_strategy_result("relative", "Relative overreaction", profit)
-
-    def _record_original_result(self, profit: float):
-        self._record_strategy_result("original", "Original model", profit)
-
-    def _record_strategy_result(self, key: str, label: str, profit: float):
-        self.stats.total_trades += 1
-        if profit > 0:
-            self.stats.wins += 1
-            self.stats.total_pnl += profit
-            self.stats.hourly.record_result(profit, won=True)
-        else:
-            loss = abs(profit)
-            self.stats.losses += 1
-            self.stats.total_pnl -= loss
-            self.stats.hourly.record_result(-loss, won=False)
-        self._update_strategy_pnl(key, label, profit)
-        self.telegram.strategy_result_alert(
-            strategy=label,
-            profit=profit,
-            strategy_pnl=self._strategy_pnl.get(key, 0.0),
-            total_pnl=self.stats.total_pnl,
-        )
-
-    def _record_result_stats_only(self, profit: float):
-        self.stats.total_trades += 1
-        if profit > 0:
-            self.stats.wins += 1
-            self.stats.total_pnl += profit
-            self.stats.hourly.record_result(profit, won=True)
-        else:
-            loss = abs(profit)
-            self.stats.losses += 1
-            self.stats.total_pnl -= loss
-            self.stats.hourly.record_result(-loss, won=False)
-
-    def _record_trend_result(self, profit: float):
-        self._record_result_stats_only(profit)
-        self._update_strategy_pnl("trend", "Trend follow", profit)
-
-    def _poly_row_price(self, row: dict, side: str) -> float:
-        bid = row.get(f"{side}_bid", 0.0) or 0.0
-        ask = row.get(f"{side}_ask", 0.0) or 0.0
-        if bid > 0 and ask > 0 and bid < ask:
-            return round((bid + ask) / 2, 4)
-        return ask or bid
-
-    def _remember_polymarket_window_price(self, window_ts: int, row: dict, is_end: bool = False):
-        if window_ts <= 0 or not row:
-            return
-        up_price = self._poly_row_price(row, "UP")
-        down_price = self._poly_row_price(row, "DOWN")
-        if up_price <= 0 and down_price <= 0:
-            return
-        prices = self._polymarket_window_prices.setdefault(window_ts, {})
-        if "start_up" not in prices:
-            prices["start_ts"] = row.get("ts", time.time())
-            prices["start_up"] = up_price
-            prices["start_down"] = down_price
-            t = time.strftime("%H:%M", time.localtime(window_ts))
-            print(f"  Polymarket event start price {t}: UP ${up_price:.3f}, DOWN ${down_price:.3f}")
-        prices["end_ts"] = row.get("ts", time.time())
-        prices["end_up"] = up_price
-        prices["end_down"] = down_price
-        if is_end:
-            t = time.strftime("%H:%M", time.localtime(window_ts))
-            print(f"  Polymarket event end price {t}: UP ${up_price:.3f}, DOWN ${down_price:.3f}")
-
-    def _record_current_polymarket_window_end(self, window_ts: int):
-        if window_ts <= 0:
-            return
-        row = self._realtime_history[-1] if self._realtime_history else None
-        if row:
-            self._remember_polymarket_window_price(window_ts, row, is_end=True)
-
-    def _polymarket_price_fallback_winner(self, window_ts: int) -> str:
-        prices = self._polymarket_window_prices.get(window_ts, {})
-        start_up = prices.get("start_up", 0.0)
-        end_up = prices.get("end_up", 0.0)
-        if start_up <= 0 or end_up <= 0:
-            return ""
-        return "UP" if end_up >= start_up else "DOWN"
-
-    def _winner_resolution_method(self, window_ts: int) -> str:
-        source = self._winner_source_cache.get(window_ts, "")
-        return "polymarket_price_fallback" if source == "price_fallback" else "polymarket_gamma"
-
-    def _trailing_profit_exit_ready(
-        self, label: str, pnl: float, threshold_reached: bool,
-        retreat_pct: float, armed_attr: str, peak_attr: str, history_key: str = "",
-    ) -> bool:
-        avg_pnl = self._average_exit_profit(history_key or label, pnl)
-        if avg_pnl <= 0:
-            return False
-
-        armed = getattr(self, armed_attr)
-        peak = getattr(self, peak_attr)
-
-        if not armed:
-            if not threshold_reached:
-                return False
-            setattr(self, armed_attr, True)
-            setattr(self, peak_attr, avg_pnl)
-            print(
-                f"  {label} trailing profit armed: avg peak profit ${avg_pnl:+.2f}, "
-                f"retreat trigger {retreat_pct:.0%}"
-            )
-            return retreat_pct <= 0
-
-        if avg_pnl > peak:
-            setattr(self, peak_attr, avg_pnl)
-            return False
-
-        if peak <= 0:
-            return False
-        retreat = (peak - avg_pnl) / peak
-        if retreat >= retreat_pct:
-            print(
-                f"  {label} trailing avg profit retreat: peak ${peak:+.2f} -> "
-                f"avg ${avg_pnl:+.2f} / spot ${pnl:+.2f} ({retreat:.0%})"
-            )
-            return True
-        return False
-
-    def _exit_price_is_profitable(
-        self, label: str, shares: float, cost: float, sell_price: float,
-        min_profit_usd: float, notice_key: str, token_id: str = "",
-        allow_below_min_profit: bool = False, realized_revenue: float = 0.0,
-    ) -> bool:
-        sellable_shares = shares
-        if token_id and not self.dry_run and self.executor._initialized:
-            token_balance = self.executor.get_token_balance(token_id)
-            if token_balance > 0:
-                sellable_shares = min(shares, float(int(token_balance)))
-        pnl = realized_revenue + sellable_shares * sell_price - cost
-        required_profit = max(float(min_profit_usd), 0.0)
-        if allow_below_min_profit:
-            required_profit = 0.0
-        if pnl >= required_profit - 0.01 and sell_price > 0:
-            return True
-        now = time.time()
-        last_notice = self._exit_guard_last_notice.get(notice_key, 0.0)
-        if now - last_notice >= 5.0:
-            print(
-                f"  {label} exit blocked: executable sell ${sell_price:.3f} "
-                f"on {sellable_shares:.0f} shares would profit ${pnl:+.2f}, "
-                f"required ${required_profit:.2f}"
-            )
-            self._exit_guard_last_notice[notice_key] = now
-        return False
-
-    def _profit_floor_exit_ready(
-        self, label: str, shares: float, cost: float, sell_price: float,
-        target_price: float, min_profit_usd: float, armed_attr: str,
-        notice_key: str, token_id: str = "", realized_revenue: float = 0.0,
-    ) -> bool:
-        if not getattr(self, armed_attr):
-            return False
-        sellable_shares = shares
-        if token_id and not self.dry_run and self.executor._initialized:
-            token_balance = self.executor.get_token_balance(token_id)
-            if token_balance > 0:
-                sellable_shares = min(shares, float(int(token_balance)))
-        pnl = realized_revenue + sellable_shares * sell_price - cost
-        below_floor = sell_price < target_price or pnl < max(float(min_profit_usd), 0.0)
-        if not below_floor or pnl < -0.01:
-            return False
-        now = time.time()
-        last_notice = self._exit_guard_last_notice.get(f"{notice_key}_floor", 0.0)
-        if now - last_notice >= 5.0:
-            print(
-                f"  {label} profit floor exit: latest sell ${sell_price:.3f} "
-                f"on {sellable_shares:.0f} shares profit ${pnl:+.2f} "
-                f"is below minimum target - selling now"
-            )
-            self._exit_guard_last_notice[f"{notice_key}_floor"] = now
-        return True
-
-    def _average_exit_profit(self, key: str, pnl: float) -> float:
-        now = time.time()
-        history = self._exit_profit_history.setdefault(key, [])
-        history.append((now, pnl))
-        max_samples = max(self._exit_profit_avg_samples, self._exit_profit_avg_min_samples)
-        if len(history) > max_samples:
-            del history[:-max_samples]
-
-        cutoff = now - max(self._exit_profit_avg_window_seconds, 0.001)
-        recent = [value for ts, value in history if ts >= cutoff]
-        if len(recent) < self._exit_profit_avg_min_samples:
-            recent = [value for _, value in history[-max_samples:]]
-        if not recent:
-            return pnl
-        return sum(recent) / len(recent)
-
-    def _polymarket_winner_for_window(self, window_ts: int = None) -> str:
-        window_ts = window_ts or self._current_window
-        if window_ts <= 0:
-            return ""
-        if window_ts in self._winner_cache:
-            return self._winner_cache[window_ts]
-        winner = ""
-        for attempt in range(3):
-            winner = get_market_winner(self.period, window_ts) or ""
-            if winner:
-                break
-            if attempt < 2:
-                time.sleep(2)
-
-        window_label = time.strftime("%H:%M", time.localtime(window_ts))
-        if winner:
-            print(f"  Polymarket final result: {winner} for {window_label} ({window_ts})")
-            self._winner_cache[window_ts] = winner
-            self._winner_source_cache[window_ts] = "gamma"
-        else:
-            print(f"  Polymarket final result not available after 3 tries for {window_label} ({window_ts})")
-            winner = self._polymarket_price_fallback_winner(window_ts)
-            if winner:
-                prices = self._polymarket_window_prices.get(window_ts, {})
-                print(
-                    f"  Polymarket price fallback result: {winner} for {window_label} "
-                    f"(UP ${prices.get('start_up', 0.0):.3f} -> ${prices.get('end_up', 0.0):.3f})"
-                )
-                self._winner_cache[window_ts] = winner
-                self._winner_source_cache[window_ts] = "price_fallback"
-            else:
-                print(f"  Polymarket price fallback not available for {window_label} ({window_ts})")
-        return winner
-
-    def _dry_run_resolution_won(self, side: str, window_ts: int = None) -> Optional[bool]:
-        window_ts = window_ts or self._current_window
-        if window_ts == self._resolving_window_ts:
-            winner = self._resolving_window_winner
-        else:
-            winner = self._polymarket_winner_for_window(window_ts)
-        if not winner:
-            return None
-        return winner == side
-
-    def _queue_dry_resolution(
-        self, key: str, label: str, side: str, shares: float,
-        cost: float, exit_revenue: float, window_ts: int,
-    ):
-        if any(item["key"] == key and item["window_ts"] == window_ts for item in self._dry_pending_resolutions):
-            return
-        self._dry_pending_resolutions.append({
-            "key": key,
-            "label": label,
-            "side": side,
-            "shares": shares,
-            "cost": cost,
-            "exit_revenue": exit_revenue,
-            "window_ts": window_ts,
-        })
-
-    def _process_dry_pending_resolutions(self):
-        if not self.dry_run or not self._dry_pending_resolutions:
-            return
-        remaining = []
-        for item in self._dry_pending_resolutions:
-            winner = self._polymarket_winner_for_window(item["window_ts"])
-            if not winner:
-                remaining.append(item)
-                continue
-            won = winner == item["side"]
-            if won:
-                revenue = item["shares"]
-                profit = revenue - item["cost"]
-                self.stats.bankroll += revenue
-            else:
-                profit = -(item["cost"] - item["exit_revenue"])
-            self._record_strategy_result(item["key"], item["label"], profit)
-            result = "WIN" if won else "LOSS"
-            method = self._winner_resolution_method(item["window_ts"])
-            print(
-                f"  {item['label']} dry-run pending resolved {result} "
-                f"{profit:+.2f} via {method}"
-            )
-        self._dry_pending_resolutions = remaining
-
-    def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
-        """Monitor only 鈥?all trades hold to resolution. No stops.
-        Tracker logs hold-period stats for future optimization.
-        """
-        if self._opening_price <= 0:
-            return
-
-        btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
-        direction_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
-        if btc_delta_pct == 0:
-            our_prob = 0.50
-        else:
-            price_direction = "UP" if btc_delta_pct > 0 else "DOWN"
-            our_prob = direction_prob if self._trade_side == price_direction else 1.0 - direction_prob
-
-        # Throttled check
-        if now - self._last_position_check < POSITION_CHECK_INTERVAL:
-            if now - self._last_status_print >= 30:
-                self._last_status_print = now
-                d = "UP" if btc_delta_pct > 0 else "DOWN" if btc_delta_pct < 0 else "FLAT"
-                print(
-                    f"  鈴? T-{seconds_remaining:5.1f}s | "
-                    f"BTC {d}{abs(btc_delta_pct):.3f}% | "
-                    f"Prob: {our_prob:.2f} | "
-                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING鈫扲ES]"
-                )
-            return
-
-        self._last_position_check = now
-        self._reconcile_active_position_balance()
-
-        current_sell_price = self._get_live_sell_price(self._trade_token_id, our_prob)
-
-        if current_sell_price <= 0:
-            return
-
-        self._last_sell_price_seen = current_sell_price
-
-        # Track hold-period extremes
-        self.tracker.update_hold_stats(our_prob, current_sell_price)
-
-        current_value = self._trade_shares * current_sell_price
-        unrealized_pnl = self._exit_revenue + current_value - self._trade_cost
-        return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
-
-        target_price = self._profit_target_price()
-        can_sell_notional = self._trade_shares * current_sell_price >= 5.0
-
-        if self._exit_revenue > 0 and can_sell_notional:
-            sell_price = current_sell_price
-            if not self.dry_run and self._confirm_ws_sell_price:
-                probe = max(round(self._trade_shares * current_sell_price, 2), 1.0)
-                confirmed = self.executor.get_market_price(self._trade_token_id, "SELL", probe)
-                if confirmed > 0:
-                    sell_price = confirmed
-            partial_recovery_pnl = self._exit_revenue + self._trade_shares * sell_price - self._trade_cost
-            if partial_recovery_pnl >= -0.01:
-                self._exit_position(
-                    sell_price, seconds_remaining, "partial_recovery",
-                    allow_below_min_profit=True,
-                )
-                return
-
-        threshold_reached = (
-            current_sell_price >= target_price
-            and unrealized_pnl >= self._min_profit_usd
-        )
-
-        if (threshold_reached or self._trend_trailing_armed) and can_sell_notional:
-            sell_price = current_sell_price
-            if not self.dry_run and self._confirm_ws_sell_price:
-                probe = max(round(self._trade_shares * current_sell_price, 2), 1.0)
-                confirmed = self.executor.get_market_price(self._trade_token_id, "SELL", probe)
-                if confirmed > 0:
-                    sell_price = confirmed
-                    current_value = self._trade_shares * sell_price
-                    unrealized_pnl = self._exit_revenue + current_value - self._trade_cost
-            threshold_reached = (
-                sell_price >= target_price
-                and unrealized_pnl >= self._min_profit_usd
-            )
-            if self._profit_floor_exit_ready(
-                "Trend follow", self._trade_shares, self._trade_cost,
-                sell_price, target_price, self._min_profit_usd,
-                "_trend_trailing_armed", "trend", self._trade_token_id,
-                realized_revenue=self._exit_revenue,
-            ):
-                if not self._exit_price_is_profitable(
-                    "Trend follow", self._trade_shares, self._trade_cost,
-                    sell_price, self._min_profit_usd, "trend", self._trade_token_id,
-                    allow_below_min_profit=True, realized_revenue=self._exit_revenue,
-                ):
-                    return
-                self._exit_position(
-                    sell_price, seconds_remaining, "profit_floor",
-                    allow_below_min_profit=True,
-                )
-                return
-            if self._trailing_profit_exit_ready(
-                "Trend follow", unrealized_pnl, threshold_reached,
-                self._trend_profit_retreat_pct,
-                "_trend_trailing_armed", "_trend_peak_profit", "trend",
-            ):
-                if not self._exit_price_is_profitable(
-                    "Trend follow", self._trade_shares, self._trade_cost,
-                    sell_price, self._min_profit_usd, "trend", self._trade_token_id,
-                    realized_revenue=self._exit_revenue,
-                ):
-                    return
-                self._exit_position(sell_price, seconds_remaining, "trailing_profit")
-                return
-
-        if now - self._last_status_print < 5:
-            return
-        self._last_status_print = now
-
-        # Status line
-        d = "UP" if btc_delta_pct > 0 else "DOWN" if btc_delta_pct < 0 else "FLAT"
-        pnl_emoji = "馃搱" if unrealized_pnl > 0 else "馃搲"
-        print(
-            f"  {pnl_emoji} T-{seconds_remaining:5.1f}s | "
-            f"BTC {d}{abs(btc_delta_pct):.3f}% | "
-            f"Prob: {our_prob:.2f} | "
-            f"Sell: ${current_sell_price:.3f} | "
-            f"Target: ${target_price:.2f} | "
-            f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
-        )
-
-    def _reconcile_active_position_balance(
+    def _on_binance_trade(
         self,
-        label: str = "Trend follow",
-        token_attr: str = "_trade_token_id",
-        shares_attr: str = "_trade_shares",
-        cost_attr: str = "_trade_cost",
-        price_attr: str = "_trade_price",
-    ):
-        token_id = getattr(self, token_attr, "")
-        current_shares = getattr(self, shares_attr, 0.0)
-        entry_price = getattr(self, price_attr, 0.0)
-        if self.dry_run or not self.executor._initialized or not token_id:
-            return
-        now = time.time()
-        reconcile_key = f"{label}:{token_id}"
-        last_check = self._position_reconcile_last.get(reconcile_key, 0.0)
-        if now - last_check < self._position_reconcile_interval:
-            return
-        self._position_reconcile_last[reconcile_key] = now
+        price: float,
+        source: str = "ws",
+        event_ts: float = None,
+        received_ts: float = None,
+        raw: dict = None,
+        **_,
+    ) -> None:
+        self.current_btc_price = float(price or 0.0)
+        raw = raw or {}
+        qty = self._as_float(raw.get("q"))
+        self.strategy.ingest_trade(self.current_btc_price, qty=qty, event_ts=event_ts)
+        self._update_price_sample("btc", self.current_btc_price, received_ts or time.time())
 
-        actual_shares = self.executor.get_token_balance(token_id, refresh=True)
-        if actual_shares <= current_shares + 0.5:
+    def _tick(self) -> None:
+        if self.current_btc_price <= 0:
             return
 
-        old_shares = current_shares
-        added_shares = actual_shares - old_shares
-        estimated_added_cost = added_shares * entry_price
-        real_bal = self.executor.get_balance(refresh=True)
-        balance_drift = self.stats.bankroll - real_bal if real_bal > 0 else 0.0
-        added_cost = balance_drift if balance_drift > 0.50 else estimated_added_cost
-
-        setattr(self, shares_attr, actual_shares)
-        setattr(self, cost_attr, getattr(self, cost_attr, 0.0) + added_cost)
-        if real_bal > 0:
-            self.stats.bankroll = real_bal
-            self._last_real_balance = real_bal
-
-        print(
-            f"  [position] {label} reconciled real Polymarket token balance: "
-            f"{old_shares:.0f} -> {actual_shares:.0f} shares "
-            f"(cost +${added_cost:.2f})"
-        )
-
-    # 鈹€鈹€ Execute exit (balance-verified, partial fill aware) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    def _exit_position(
-        self, sell_price: float, seconds_remaining: float, reason: str,
-        allow_below_min_profit: bool = False,
-    ):
-        if not self._exit_price_is_profitable(
-            "Trend follow", self._trade_shares, self._trade_cost,
-            sell_price, self._min_profit_usd, "trend", self._trade_token_id,
-            allow_below_min_profit=allow_below_min_profit,
-            realized_revenue=self._exit_revenue,
-        ):
+        self._ensure_market()
+        if not self.market:
             return
-        if self.dry_run:
-            revenue = self._trade_shares * sell_price
-            self._exited = True
-            self._exit_revenue = revenue
-            self.stats.bankroll += revenue
-            profit = revenue - self._trade_cost
-            print(f"  馃挵 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
-                  f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
-            return
+        self._update_extrema_latency()
 
-        result = self.executor.sell(
-            token_id=self._trade_token_id,
-            shares=self._trade_shares,
-            price=sell_price,
-        )
-
-        if result.success:
-            self._exit_revenue += result.amount_usd
-            self._exit_shares_sold += result.shares
-            self._residual_shares = result.shares_remaining
-            self.stats.bankroll += result.amount_usd
-
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                # Partial fill: got some USDC back, still have shares
-                print(f"  馃挵 EXIT ({reason}, partial): ~{result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"~{result.shares_remaining:.0f} shares remaining -> keep monitoring")
-                # Update shares but keep original cost for clean P&L math
-                self._trade_shares = result.shares_remaining
-                self._exited = False
+        self._check_daily_loss_limit()
+        if self.position and not self.position.closed:
+            if self.market.window_start != self.position.window_ts:
+                self._resolve_position(self.current_btc_price)
             else:
-                # Full fill (or residual < 1 share)
-                self._exited = True
-                profit = self._exit_revenue - self._trade_cost
-                print(f"  馃挵 EXIT ({reason}): {result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"Profit: ${profit:+.2f}")
-        elif "hold to resolution" in result.error:
-            # Below $5 minimum 鈥?can't sell, hold to resolution
-            notional = self._trade_shares * sell_price
-            print(f"  馃搶 Can't sell: ${notional:.2f} below $5 minimum 鈥?holding to resolution")
-            self._exit_gave_up = True  # Skip further exit attempts
+                self._try_exit()
+        elif not self._clob_halted and not self._strategy_is_cooling_down():
+            self._try_entry()
         else:
-            self._exit_retries += 1
-            if self._exit_retries >= MAX_EXIT_RETRIES:
-                print(f"  鉂?Exit failed {MAX_EXIT_RETRIES} times ({reason}) 鈥?"
-                      f"holding to resolution")
-                self._exit_gave_up = True
-            else:
-                print(f"  鈿狅笍  Exit failed ({reason}, attempt "
-                      f"{self._exit_retries}/{MAX_EXIT_RETRIES}): {result.error}")
-                self._last_position_check = time.time() + EXIT_RETRY_COOLDOWN - POSITION_CHECK_INTERVAL
+            self._pending_entry = None
 
-    # 鈹€鈹€ Window management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        self._print_status()
 
-    def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
-        self._process_dry_pending_resolutions()
-        if self._current_window > 0:
-            self._record_current_polymarket_window_end(self._current_window)
-            self._resolving_window_ts = self._current_window
-            self._resolving_window_winner = (
-                self._polymarket_winner_for_window(self._current_window)
-                if self.dry_run else ""
-            )
-            # Resolve any pending phantom sell from the previous window.
-            # Must run before trade state is reset below.
-            # Balance is fetched once here and reused by the sync below.
-            if self._pending_phantom:
-                pp = self._pending_phantom
-                if not self.dry_run and self.executor._initialized:
-                    real_bal = self.executor.get_balance()
-                    if real_bal > 0:
-                        balance_increase = max(0.0, real_bal - pp["pre_sell_balance"])
-                        if balance_increase > pp["expected_revenue"] * 0.50:
-                            # Settlement landed 鈥?it was a real win
-                            profit = balance_increase - pp["cost"]
-                            self._record_trend_result(profit)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  鉁?Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.strategy_result_alert(
-                                strategy="Trend follow",
-                                profit=profit,
-                                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                                total_pnl=self.stats.total_pnl,
-                            )
-                            btc_price, _ = self.price_feed.get_price()
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
-                                won=True,
-                                profit=profit,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_resolved",
-                                claim_result="phantom_resolved",
-                            )
-                        else:
-                            # Balance still hasn't moved 鈥?genuine loss
-                            net_loss = pp["cost"] - pp["exit_revenue"]
-                            profit = -net_loss
-                            self._record_trend_result(profit)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  鉂?Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.strategy_result_alert(
-                                strategy="Trend follow",
-                                profit=profit,
-                                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                                total_pnl=self.stats.total_pnl,
-                            )
-                            btc_price, _ = self.price_feed.get_price()
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
-                                won=False,
-                                profit=-net_loss,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_confirmed",
-                                claim_result="phantom_confirmed",
-                            )
-                        self._pending_phantom = {}
-                else:
-                    # Dry run or executor not ready 鈥?treat as loss
-                    net_loss = pp["cost"] - pp["exit_revenue"]
-                    self._record_trend_result(-net_loss)
-                    self._pending_phantom = {}
-
-            # Record closing delta for rolling vol calculation
-            if self._opening_price > 0 and closing_btc_price > 0:
-                closing_delta = abs((closing_btc_price - self._opening_price) / self._opening_price * 100)
-                self._recent_window_deltas.append(closing_delta)
-                if len(self._recent_window_deltas) > self._rolling_vol_windows:
-                    self._recent_window_deltas.pop(0)
-            # Detect pending buy that settled after our verification timeout
-            if self._pending_buy_side and not self._traded:
-                if not self.dry_run and self.executor._initialized:
-                    self._pending_buy_last_check = 0.0
-                    self._check_pending_buy_fill(time.time())
-                if False and self._pending_buy_side and not self._traded and not self.dry_run and self.executor._initialized:
-                    now = time.time()
-                    if self._pending_buy_expired(self._pending_buy_started_at, self._pending_buy_window, now, "Trend follow"):
-                        self._clear_pending_buy()
-                    if not self._pending_buy_side:
-                        pass
-                    else:
-                        real_bal = self.executor.get_balance()
-                        if real_bal > 0 and self._balance_before_buy > 0:
-                            spent = self._balance_before_buy - real_bal
-                            if spent > 1.0:
-                            # The buy DID go through 鈥?retroactively track it
-                                current_tokens = self.executor.get_token_balance(self._pending_buy_token_id)
-                                est_shares = max(0.0, current_tokens - self._pending_buy_token_balance_before)
-                                if est_shares < 1:
-                                    print(
-                                        f"\n  Pending trend buy balance dropped ${spent:.2f}, "
-                                        "but no token balance/order fill is verified yet"
-                                    )
-                                    return
-                            print(f"\n  馃懟 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
-                            print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
-                                  f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
-
-                            self._traded = True
-                            self._trade_side = self._pending_buy_side
-                            self._trade_price = self._pending_buy_price
-                            self._trade_cost = spent
-                            self._trade_shares = est_shares
-                            self._trade_token_id = self._pending_buy_token_id
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            self.stats.hourly.record_trade(
-                                self._pending_buy_edge, self._pending_buy_delta)
-
-            if self._cheap_traded and not self._cheap_exited:
-                self._resolve_cheap_scalp(closing_btc_price)
-            if self._relative_pending_side and not self._relative_traded:
-                if not self.dry_run and self.executor._initialized:
-                    self._relative_pending_last_check = 0.0
-                    self._check_pending_relative_buy(time.time())
-            if self._relative_traded and not self._relative_exited:
-                self._resolve_relative_reaction(closing_btc_price)
-            if self._panic_pending_side and not self._panic_traded:
-                if not self.dry_run and self.executor._initialized:
-                    self._panic_pending_last_check = 0.0
-                    self._check_pending_panic_buy(time.time())
-            if self._panic_traded and not self._panic_exited:
-                self._resolve_panic_rebound(closing_btc_price)
-            if self._original_pending_side and not self._original_traded:
-                if not self.dry_run and self.executor._initialized:
-                    self._original_pending_last_check = 0.0
-                    self._check_pending_original_buy(time.time())
-            if self._original_traded and not self._original_exited:
-                self._resolve_original_model(closing_btc_price)
-
-            self.stats.hourly.record_window(self._traded)
-            if self._traded:
-                self._resolve_previous_trade()
-            elif self._last_tick_context:
-                # Log the no-trade signal for this window using last tick state
-                ctx = self._last_tick_context
-                skip_reason = ctx.get("skip_reason") or get_trend_entry_skip_reason(
-                    btc_price=ctx["btc_price"],
-                    opening_price=self._opening_price,
-                    seconds_remaining=ctx["seconds_remaining"],
-                    config=self.strategy_config,
-                )
-                sig = ctx.get("signal")
-                self.tracker.log_signal(
-                    window_ts=ctx["window_ts"],
-                    btc_price=ctx["btc_price"],
-                    opening_price=self._opening_price,
-                    up_price=ctx["up_price"],
-                    down_price=ctx["down_price"],
-                    seconds_remaining=ctx["seconds_remaining"],
-                    side=sig.side if sig else "",
-                    true_prob=sig.true_prob if sig else 0.0,
-                    market_price=sig.market_price if sig else 0.0,
-                    edge=sig.edge if sig else 0.0,
-                    kelly_size=sig.kelly_size if sig else 0.0,
-                    action="no_signal",
-                    skip_reason=skip_reason,
-                )
-
-            # Sync real balance at window boundary (catches any drift)
-            if not self.dry_run and self.executor._initialized:
-                real_bal = self.executor.get_balance()
-                if real_bal > 0:
-                    drift = abs(real_bal - self.stats.bankroll)
-                    if drift > 0.50:
-                        print(f"  馃攧 Balance sync: ${self.stats.bankroll:.2f} 鈫?"
-                              f"${real_bal:.2f} (drift ${drift:.2f})")
-                    self.stats.bankroll = real_bal
-                    self._last_real_balance = real_bal
-
-            self._resolving_window_ts = 0
-            self._resolving_window_winner = ""
-
-        self._current_window = window_ts
-        self._current_market = None
-        self._market_subscription_time = 0.0
-        self._opening_price = 0.0
-        self._traded = False
-        self._trade_attempted = False
-        self._exited = False
-        self._exit_revenue = 0.0
-        self._exit_shares_sold = 0.0
-        self._residual_shares = 0.0
-        self._last_position_check = 0.0
-        self._exit_retries = 0
-        self._exit_gave_up = False
-        self._last_sell_price_seen = 0.0
-        self._trend_trailing_armed = False
-        self._trend_peak_profit = 0.0
-        self._cheap_traded = False
-        self._cheap_trade_attempted = False
-        self._cheap_exited = False
-        self._cheap_side = ""
-        self._cheap_token_id = ""
-        self._cheap_price = 0.0
-        self._cheap_cost = 0.0
-        self._cheap_shares = 0.0
-        self._cheap_exit_revenue = 0.0
-        self._cheap_last_check = 0.0
-        self._cheap_trailing_armed = False
-        self._cheap_peak_profit = 0.0
-        self._clear_pending_cheap_buy()
-        self._relative_traded = False
-        self._relative_trade_attempted = False
-        self._relative_exited = False
-        self._relative_side = ""
-        self._relative_token_id = ""
-        self._relative_price = 0.0
-        self._relative_cost = 0.0
-        self._relative_shares = 0.0
-        self._relative_exit_revenue = 0.0
-        self._relative_last_check = 0.0
-        self._relative_trailing_armed = False
-        self._relative_peak_profit = 0.0
-        self._realtime_history = []
-        self._clear_pending_relative_buy()
-        self._panic_traded = False
-        self._panic_trade_attempted = False
-        self._panic_exited = False
-        self._panic_side = ""
-        self._panic_token_id = ""
-        self._panic_price = 0.0
-        self._panic_cost = 0.0
-        self._panic_shares = 0.0
-        self._panic_exit_revenue = 0.0
-        self._panic_last_check = 0.0
-        self._panic_trailing_armed = False
-        self._panic_peak_profit = 0.0
-        self._panic_price_history = {"UP": [], "DOWN": []}
-        self._clear_pending_panic_buy()
-        self._original_traded = False
-        self._original_trade_attempted = False
-        self._original_exited = False
-        self._original_side = ""
-        self._original_token_id = ""
-        self._original_price = 0.0
-        self._original_cost = 0.0
-        self._original_shares = 0.0
-        self._original_exit_revenue = 0.0
-        self._original_last_check = 0.0
-        self._clear_pending_original_buy()
-        self._cached_up = 0.50
-        self._cached_down = 0.50
-        self._price_last_fetched = 0.0
-        self._delayed_entries = {}
-        self._entry_price_history = {}
-        self._exit_profit_history = {}
-        self._exit_guard_last_notice = {}
-        self._pending_buy_side = ""
-        self._pending_buy_price = 0.0
-        self._pending_buy_amount = 0.0
-        self._pending_buy_shares = 0.0
-        self._pending_buy_token_id = ""
-        self._pending_buy_edge = 0.0
-        self._pending_buy_delta = 0.0
-        self._pending_buy_order_id = ""
-        self._pending_buy_last_check = 0.0
-        self._balance_before_buy = 0.0
-        self._pending_buy_token_balance_before = 0.0
-        self._pending_buy_started_at = 0.0
-
-        t = time.strftime("%H:%M:%S", time.localtime(window_ts))
-        print(f"\n{'鈹€' * 55}")
-        print(f"馃晲 {t} | Trades: {self.stats.total_trades} | "
-              f"W/L: {self.stats.wins}/{self.stats.losses} | "
-              f"P&L: ${self.stats.total_pnl:+.2f}")
-        print(f"{'鈹€' * 55}")
-
-        # Circuit breaker auto-recovery: ping CLOB each new window
-        if self._clob_halted and not self.dry_run and self.executor._initialized:
-            try:
-                self.executor.client.get_ok()
-                self._clob_halted = False
-                self._consecutive_buy_failures = 0
-                print(f"  鉁?CLOB recovered (health check OK) 鈥?resuming trades")
-            except Exception:
-                print(f"  馃攲 CLOB health check still failing 鈥?staying halted")
-
-    # 鈹€鈹€ Polymarket live prices 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    def _clear_pending_buy(self):
-        self._pending_buy_side = ""
-        self._pending_buy_price = 0.0
-        self._pending_buy_amount = 0.0
-        self._pending_buy_shares = 0.0
-        self._pending_buy_token_id = ""
-        self._pending_buy_edge = 0.0
-        self._pending_buy_delta = 0.0
-        self._pending_buy_order_id = ""
-        self._pending_buy_last_check = 0.0
-        self._balance_before_buy = 0.0
-        self._pending_buy_token_balance_before = 0.0
-        self._pending_buy_started_at = 0.0
-        self._pending_buy_window = 0
-        self._pending_buy_last_notice = 0.0
-
-    def _pending_buy_expired(
-        self, started_at: float, pending_window: int, now: float, label: str
-    ) -> bool:
-        if pending_window > 0 and now >= pending_window + PERIOD_SECONDS[self.period]:
-            print(f"  {label} pending buy reached event end - clearing pending state")
-            return True
-        if pending_window > 0 and pending_window != self._current_window:
-            print(f"  {label} pending buy moved to a new event - clearing pending state")
-            return True
-        return False
-
-    def _pending_buy_notice(self, attr_name: str, now: float, message: str):
-        last_notice = getattr(self, attr_name, 0.0)
-        if last_notice > 0 and now - last_notice < PENDING_BUY_STATUS_LOG_INTERVAL:
+    def _ensure_market(self) -> None:
+        now = time.time()
+        if self.market and self.market.window_start <= now < self.market.window_end:
             return
-        print(message)
-        setattr(self, attr_name, now)
-
-    def _activate_pending_buy(
-        self, price: float, amount: float, shares: float,
-        source: str, balance_already_synced: bool = False,
-    ):
-        if not self._pending_buy_side or self._traded:
+        if now - self._last_market_probe_ts < 1.0:
             return
-        self._traded = True
-        self._trade_side = self._pending_buy_side
-        self._trade_price = price
-        self._trade_cost = amount
-        self._trade_shares = shares
-        self._trade_token_id = self._pending_buy_token_id
-        self._trend_trailing_armed = False
-        self._trend_peak_profit = 0.0
-        self._exit_profit_history.pop("trend", None)
-        if not balance_already_synced:
-            self.stats.bankroll -= amount
-        self.stats.hourly.record_trade(self._pending_buy_edge, self._pending_buy_delta)
+
+        self._last_market_probe_ts = now
+        previous = self.market
+        market = get_current_market(self.period_minutes, asset="btc")
+        if not market:
+            if previous and now >= previous.window_end and previous.window_start not in self._calibrated_window_starts:
+                self._calibrate_completed_window(previous)
+                print("[market] current market unavailable after boundary; calibrated previous window only")
+            return
+
+        if previous and previous.window_start != market.window_start:
+            self._calibrate_completed_window(previous)
+
+        self.market = market
+        self.opening_price = self.current_btc_price
+        self._pending_entry = None
+        self._pending_exit = None
+        self.poly_feed.subscribe(
+            [market.token_id_up, market.token_id_down],
+            {market.token_id_up: "UP", market.token_id_down: "DOWN"},
+        )
         print(
-            f"  鉁?Pending buy verified [{source}]: ~{shares:.0f} shares "
-            f"{self._trade_side} @ ${price:.3f} = ${amount:.2f}"
+            f"\n[new window] {market.slug} | open BTC ${self.opening_price:,.2f} | "
+            f"UP {market.token_id_up[:10]}..."
         )
-        self.tracker.log_trade_entry(
-            window_ts=self._current_window,
-            side=self._trade_side,
-            entry_price=price,
-            entry_shares=shares,
-            entry_cost=amount,
-            edge=self._pending_buy_edge,
-            prob=1.0,
-            btc_delta=self._pending_buy_delta,
-            seconds_remaining=0.0,
-            entry_delta_pct=self._pending_buy_delta,
-            entry_seconds_remaining=0.0,
+
+        if previous and previous.window_start != market.window_start:
+            self._probe_clob_recovery()
+
+    def _try_entry(self) -> None:
+        if self._pending_entry:
+            self._process_pending_entry()
+            return
+
+        signal_result = self.strategy.entry_signal()
+        if not signal_result:
+            return
+        if not self._entry_window_open():
+            return
+        if not self.strategy.baseline_ready():
+            return
+        if not self._clob_ok_for_trade():
+            return
+
+        ref_poly_price, ref_poly_received_ts = self._poly_reference_snapshot()
+        if ref_poly_price <= 0:
+            print("  Entry signal held: no Polymarket reference price yet")
+            return
+        latency_plan = self._latency_sync_plan()
+        now = time.time()
+        self._pending_entry = PendingSignal(
+            kind="entry",
+            created_ts=now,
+            deadline_ts=now + (latency_plan["deadline_ms"] / 1000.0),
+            ref_poly_price=ref_poly_price,
+            ref_poly_received_ts=ref_poly_received_ts,
+            signal=signal_result,
+            trend_start_ts=now + (latency_plan["trend_start_delay_ms"] / 1000.0),
+            latency_target_ms=latency_plan["target_ms"],
+            trend_window_ms=latency_plan["trend_window_ms"],
+            safety_margin_ms=latency_plan["safety_margin_ms"],
         )
-        self._clear_pending_buy()
+        print(
+            f"  Entry signal pending latency sync: Binance {signal_result.move_pct:+.4f}% | "
+            f"{self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f} | "
+            f"Poly ref ${ref_poly_price:.3f} | avg latency {self._latency_avg_ms:.0f}ms | "
+            f"trend starts +{latency_plan['trend_start_delay_ms']:.0f}ms "
+            f"(trend {latency_plan['trend_window_ms']:.0f}ms, safety {latency_plan['safety_margin_ms']:.0f}ms)"
+        )
+        self._process_pending_entry()
 
-    def _check_pending_buy_fill(self, now: float):
-        if not self._pending_buy_side or self._traded or self.dry_run:
+    def _process_pending_entry(self) -> None:
+        pending = self._pending_entry
+        if not pending:
             return
-        if self._pending_buy_started_at <= 0:
-            self._pending_buy_started_at = now
-        if self._pending_buy_expired(
-            self._pending_buy_started_at, self._pending_buy_window, now, "Trend follow"
-        ):
-            self._clear_pending_buy()
-            return
-        if now - self._pending_buy_last_check < 2.0:
-            return
-        self._pending_buy_last_check = now
+        signal_result = pending.signal
 
-        if self._pending_buy_order_id and self.executor._initialized:
-            matched = self.executor.check_buy_fill(
-                self._pending_buy_order_id,
-                self._pending_buy_price,
-            )
-            if matched:
-                self._activate_pending_buy(
-                    price=matched[0],
-                    amount=matched[1],
-                    shares=matched[2],
-                    source="order_api",
-                )
+        now = time.time()
+        self._log_pending_poly_observation(pending, "entry")
+        trend_start_ts = self._pending_trend_start_ts(pending)
+        if now < trend_start_ts:
+            return
+
+        current_poly_price, current_poly_received_ts = self._poly_reference_snapshot()
+        if current_poly_price <= 0:
+            return
+        trend = self._poly_recent_trend(trend_start_ts, self.latency_poly_trend_ticks)
+        if not trend:
+            if now < pending.deadline_ts:
                 return
+            print(
+                f"  Entry skipped: latency wait expired without {self.latency_poly_trend_ticks} "
+                f"Polymarket ticks after trend start +{(trend_start_ts - pending.created_ts) * 1000:.0f}ms"
+            )
+            self._pending_entry = None
+            return
 
-        if self.executor._initialized and self._balance_before_buy > 0:
-            real_bal = self.executor.get_balance()
-            spent = self._balance_before_buy - real_bal if real_bal > 0 else 0.0
-            if spent > 1.0:
-                current_tokens = self.executor.get_token_balance(self._pending_buy_token_id)
-                shares = max(0.0, current_tokens - self._pending_buy_token_balance_before)
-                if shares < 1:
-                    self._pending_buy_notice(
-                        "_pending_buy_last_notice",
-                        now,
-                        "  Pending buy balance moved but no token balance/order fill yet - waiting",
-                    )
-                    return
-                self.stats.bankroll = real_bal
-                self._last_real_balance = real_bal
-                self._activate_pending_buy(
-                    price=self._pending_buy_price,
-                    amount=spent,
-                    shares=shares,
-                    source="balance",
-                    balance_already_synced=True,
-                )
+        poly_delta = trend["delta"]
+        not_falling = poly_delta >= 0
+        if not not_falling and now < pending.deadline_ts:
+            return
+        if not not_falling:
+            print(
+                f"  Entry skipped: Poly still falling after latency wait | "
+                f"{self._format_trend(trend)}"
+            )
+            self._pending_entry = None
+            return
 
-    def _clear_pending_original_buy(self):
-        self._original_pending_side = ""
-        self._original_pending_token_id = ""
-        self._original_pending_order_id = ""
-        self._original_pending_price = 0.0
-        self._original_pending_amount = 0.0
-        self._original_pending_shares = 0.0
-        self._original_pending_balance_before = 0.0
-        self._original_pending_token_balance_before = 0.0
-        self._original_pending_last_check = 0.0
-        self._original_pending_started_at = 0.0
-        self._original_pending_window = 0
-        self._original_pending_last_notice = 0.0
+        token_id = self.market.token_id_up
+        buy_price = self._live_buy_price(token_id)
+        if buy_price <= 0:
+            print("  Entry skipped: no executable UP buy price")
+            self._pending_entry = None
+            return
+        if buy_price > self.config.max_buy_price:
+            print(f"  Entry skipped: UP ${buy_price:.3f} > cap ${self.config.max_buy_price:.2f}")
+            self._pending_entry = None
+            return
 
-    def _activate_original_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
-        self._original_traded = True
-        self._original_side = side
-        self._original_token_id = token_id
-        self._original_price = price
-        self._original_cost = amount
-        self._original_shares = shares
-        self._original_exit_revenue = 0.0
-        self.stats.bankroll -= amount
-        self.stats.hourly.record_trade(0.0, 0.0)
-        self._clear_pending_original_buy()
+        balance = self.executor.get_balance(refresh=False)
+        amount = round(self.config.trade_amount if self.dry_run else min(self.config.trade_amount, max(0.0, balance)), 2)
+        if not self.dry_run and amount < 5.0:
+            print(f"  Entry skipped: balance ${balance:.2f} below $5 minimum")
+            self._pending_entry = None
+            return
+
         print(
-            f"  Original model bought: {shares:.0f} {side} "
-            f"@ ${price:.3f} = ${amount:.2f} (hold to resolution)"
+            f"\n[ENTRY] {signal_result.reason}: BTC bucket "
+            f"{signal_result.move_pct:+.4f}% qty {signal_result.bucket.qty:.4f} "
+            f"(push {self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f}) | "
+            f"UP ask ${buy_price:.3f} | Poly trend {self._format_trend(trend)} | "
+            f"latency avg {self._latency_avg_ms:.0f}ms"
+        )
+        result = self.executor.buy(token_id, amount, price=buy_price)
+        if not result.success:
+            print(f"  Buy failed: {result.error}")
+            if result.error == "UNVERIFIED_BUY":
+                self.position = Position(
+                    side="UP",
+                    token_id=token_id,
+                    window_ts=self.market.window_start,
+                    market_slug=self.market.slug,
+                    entry_price=result.price or buy_price,
+                    shares=result.shares,
+                    cost=result.amount_usd or amount,
+                    entry_btc_price=self.current_btc_price,
+                    opening_price=self.opening_price,
+                    entry_ts=time.time(),
+                )
+                print("  Tracking unverified buy as pending exposure")
+            self._pending_entry = None
+            return
+
+        self.position = Position(
+            side="UP",
+            token_id=token_id,
+            window_ts=self.market.window_start,
+            market_slug=self.market.slug,
+            entry_price=result.price,
+            shares=result.shares,
+            cost=result.amount_usd,
+            entry_btc_price=self.current_btc_price,
+            opening_price=self.opening_price,
+            entry_ts=time.time(),
         )
         self.telegram.strategy_trade_alert(
-            strategy="Original model",
-            side=side,
-            price=price,
-            amount=amount,
-            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
+            strategy="Binance latency spike",
+            side="UP",
+            price=result.price,
+            amount=result.amount_usd,
+            market_slug=self.market.slug,
             dry_run=self.dry_run,
-            strategy_pnl=self._strategy_pnl.get("original", 0.0),
-            total_pnl=self.stats.total_pnl,
+            strategy_pnl=self.realized_pnl,
+            total_pnl=self.realized_pnl,
         )
+        self._pending_entry = None
 
-    def _check_pending_original_buy(self, now: float):
-        if not self._original_pending_side or self._original_traded or self.dry_run:
-            return
-        if self._original_pending_started_at <= 0:
-            self._original_pending_started_at = now
-        if self._pending_buy_expired(
-            self._original_pending_started_at, self._original_pending_window, now, "Original model"
-        ):
-            self._clear_pending_original_buy()
-            return
-        if now - self._original_pending_last_check < 2.0:
-            return
-        self._original_pending_last_check = now
+    def _entry_window_open(self) -> bool:
+        if not self.market:
+            return False
+        if self.entry_window_seconds <= 0:
+            return True
+        elapsed = time.time() - self.market.window_start
+        return 0 <= elapsed <= self.entry_window_seconds
 
-        if self._original_pending_order_id and self.executor._initialized:
-            matched = self.executor.check_buy_fill(
-                self._original_pending_order_id,
-                self._original_pending_price,
+    def _try_exit(self) -> None:
+        if not self.position:
+            return
+        sell_price = self._live_sell_price(self.position.token_id, self.position.shares)
+        if sell_price <= 0:
+            print("  Exit monitor skipped: no executable sell price")
+            return
+
+        signal_result = self.strategy.exit_signal()
+        unrealized_profit = self._update_profit_trail(sell_price)
+        min_sell_price = self.position.entry_price * (1.0 + self.config.min_profit_pct)
+
+        if self._pending_exit:
+            if self._process_pending_exit(sell_price, min_sell_price):
+                return
+
+        if signal_result:
+            ref_poly_price, ref_poly_received_ts = self._poly_reference_snapshot()
+            if ref_poly_price <= 0:
+                ref_poly_price = sell_price
+                ref_poly_received_ts = time.time()
+            latency_plan = self._latency_sync_plan()
+            now = time.time()
+            self._pending_exit = PendingSignal(
+                kind="exit",
+                created_ts=now,
+                deadline_ts=now + (latency_plan["deadline_ms"] / 1000.0),
+                ref_poly_price=ref_poly_price,
+                ref_poly_received_ts=ref_poly_received_ts,
+                signal=signal_result,
+                trend_start_ts=now + (latency_plan["trend_start_delay_ms"] / 1000.0),
+                latency_target_ms=latency_plan["target_ms"],
+                trend_window_ms=latency_plan["trend_window_ms"],
+                safety_margin_ms=latency_plan["safety_margin_ms"],
             )
-            if matched:
-                self._activate_original_buy(
-                    self._original_pending_side,
-                    self._original_pending_token_id,
-                    matched[0],
-                    matched[1],
-                    matched[2],
-                )
-                return
-
-        if self.executor._initialized and self._original_pending_balance_before > 0:
-            real_bal = self.executor.get_balance()
-            spent = self._original_pending_balance_before - real_bal if real_bal > 0 else 0.0
-            if spent > 1.0:
-                current_tokens = self.executor.get_token_balance(self._original_pending_token_id)
-                shares = max(0.0, current_tokens - self._original_pending_token_balance_before)
-                if shares < 1:
-                    self._pending_buy_notice(
-                        "_original_pending_last_notice",
-                        now,
-                        "  Original model pending balance moved but no token balance/order fill yet - waiting",
-                    )
-                    return
-                self.stats.bankroll = real_bal + spent
-                self._last_real_balance = real_bal
-                self._activate_original_buy(
-                    self._original_pending_side,
-                    self._original_pending_token_id,
-                    self._original_pending_price,
-                    spent,
-                    shares,
-                )
-
-    def _place_original_buy(self, sig, token_id: str, price: float):
-        result = self.executor.buy(token_id=token_id, amount_usd=round(sig.kelly_size, 2), price=price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._original_pending_side = sig.side
-                self._original_pending_token_id = token_id
-                self._original_pending_order_id = result.order_id
-                self._original_pending_price = result.price
-                self._original_pending_amount = result.amount_usd
-                self._original_pending_shares = result.shares
-                self._original_pending_balance_before = self.stats.bankroll
-                self._original_pending_token_balance_before = self.executor.get_token_balance(token_id)
-                self._original_pending_last_check = 0.0
-                self._original_pending_started_at = time.time()
-                self._original_pending_window = self._current_window
-                print("  Original model buy unverified - will poll order API and balance")
-                return
-            print(f"  Original model buy failed: {result.error}")
-            return
-        self._activate_original_buy(sig.side, token_id, result.price, result.amount_usd, result.shares)
-
-    def _try_original_model_entry(self, btc_price: float, seconds_remaining: float):
-        if not self._original_enabled:
-            return
-        if not self._check_risk_limits("original", "original model"):
-            self._original_trade_attempted = True
-            return
-        market = self._ensure_market_subscription()
-        if not market:
-            return
-
-        realized_vol = self._compute_realized_vol()
-        sig = evaluate(
-            btc_price=btc_price,
-            opening_price=self._opening_price,
-            up_market_price=self._cached_up,
-            down_market_price=self._cached_down,
-            seconds_remaining=seconds_remaining,
-            bankroll=self.stats.bankroll,
-            config=self.strategy_config,
-            realized_vol=realized_vol,
-        )
-        if not sig:
-            if seconds_remaining < self.strategy_config.entry_window_end:
-                self._original_trade_attempted = True
-            return
-
-        token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
-        trade_amount = round(sig.kelly_size, 2)
-        buy_price = self._cached_up if sig.side == "UP" else self._cached_down
-        if not self.dry_run and self.executor._initialized:
-            executable = self.executor.get_market_price(token_id, "BUY", trade_amount)
-            if executable > 0:
-                buy_price = round(executable, 2)
-                actual_edge = sig.true_prob - buy_price
-                if actual_edge < self.strategy_config.min_edge:
-                    print(
-                        f"  Original model skip: executable ${buy_price:.3f} "
-                        f"edge {actual_edge:.3f} < {self.strategy_config.min_edge:.3f}"
-                    )
-                    self._original_trade_attempted = True
-                    return
-
-        print(
-            f"\n  Original model signal: {sig.side} | prob={sig.true_prob:.2f} "
-            f"edge={sig.edge:.3f} | BTC={sig.btc_delta_pct:+.3f}% | "
-            f"amount ${trade_amount:.2f}"
-        )
-        self._original_trade_attempted = True
-        self._place_original_buy(sig, token_id, buy_price)
-
-    def _manage_original_model(self, now: float):
-        if not self._original_traded or self._original_exited:
-            return
-        self._reconcile_active_position_balance(
-            "Original model",
-            "_original_token_id",
-            "_original_shares",
-            "_original_cost",
-            "_original_price",
-        )
-        if now - self._original_last_check < 30.0:
-            return
-        self._original_last_check = now
-        live = self._live_token_price(self._original_token_id)
-        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
-        if sell_price > 0:
-            pnl = self._original_exit_revenue + self._original_shares * sell_price - self._original_cost
             print(
-                f"  Original model holding {self._original_side}: "
-                f"{self._original_shares:.0f} shares | bid ${sell_price:.3f} | "
-                f"unrealized ${pnl:+.2f} [hold-to-resolution]"
+                f"  Exit signal pending latency sync: Binance {signal_result.move_pct:+.4f}% | "
+                f"{self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f} | "
+                f"Poly ref ${ref_poly_price:.3f} | avg latency {self._latency_avg_ms:.0f}ms | "
+                f"trend starts +{latency_plan['trend_start_delay_ms']:.0f}ms "
+                f"(trend {latency_plan['trend_window_ms']:.0f}ms, safety {latency_plan['safety_margin_ms']:.0f}ms)"
             )
+            self._process_pending_exit(sell_price, min_sell_price)
+            return
 
-    def _ensure_market_subscription(self):
-        if self._current_market:
-            return self._current_market
+        retreat_hit, retreat_pct = self._profit_retreat_hit(unrealized_profit)
+        if not retreat_hit:
+            return
 
-        market = get_current_market(self.period)
-        if not market:
-            return None
+        price_zone = "above_50" if sell_price > 0.50 else "at_or_below_50"
+        self._sell_position(
+            sell_price,
+            reason=(
+                f"profit_retreat_{price_zone}: current ${unrealized_profit:+.2f}, "
+                f"peak ${self.position.peak_unrealized_profit:+.2f}, "
+                f"retreat {retreat_pct:.1%}"
+            ),
+        )
 
-        self._current_market = market
-        self._market_subscription_time = time.time()
-        if self._poly_ws_enabled:
-            self.poly_feed.subscribe(
-                [market.token_id_up, market.token_id_down],
-                labels={market.token_id_up: "UP", market.token_id_down: "DOWN"},
+    def _process_pending_exit(self, sell_price: float, min_sell_price: float) -> bool:
+        pending = self._pending_exit
+        if not pending:
+            return False
+
+        signal_result = pending.signal
+        now = time.time()
+        self._log_pending_poly_observation(pending, "exit")
+        trend_start_ts = self._pending_trend_start_ts(pending)
+        if now < trend_start_ts:
+            return True
+
+        current_poly_price, current_poly_received_ts = self._poly_reference_snapshot()
+        if current_poly_price <= 0:
+            current_poly_price = sell_price
+            current_poly_received_ts = time.time()
+        trend = self._poly_recent_trend(trend_start_ts, self.latency_poly_trend_ticks)
+        if not trend:
+            if now < pending.deadline_ts:
+                return True
+            print(
+                f"  Exit latency wait expired without {self.latency_poly_trend_ticks} "
+                f"Polymarket ticks after trend start +{(trend_start_ts - pending.created_ts) * 1000:.0f}ms"
             )
-        return market
+            trend = {
+                "count": 1,
+                "first": current_poly_price,
+                "last": current_poly_price,
+                "delta": 0.0,
+                "duration_ms": 0.0,
+            }
 
-    def _live_token_price(self, token_id: str):
-        if not self._poly_ws_enabled or not token_id:
+        poly_delta = trend["delta"]
+        falling = poly_delta < 0
+
+        if falling:
+            pass
+        elif pending.waits < 1 and now >= pending.deadline_ts:
+            pending.waits += 1
+            pending.deadline_ts = now + self._latency_wait_seconds()
+            print(
+                f"  Exit latency extended once: Poly not falling yet | "
+                f"{self._format_trend(trend)} | "
+                f"next deadline {self._latency_wait_seconds() * 1000:.0f}ms"
+            )
+            return True
+        elif now < pending.deadline_ts:
+            return True
+
+        if sell_price < min_sell_price:
+            print(
+                f"  Binance down signal held: sell ${sell_price:.3f} < "
+                f"min profit ${min_sell_price:.3f}"
+            )
+            self._pending_exit = None
+            return True
+
+        self._sell_position(
+            sell_price,
+            reason=(
+                f"{signal_result.reason}: BTC bucket {signal_result.move_pct:+.4f}% "
+                f"qty {signal_result.bucket.qty:.4f} "
+                f"(push {self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f}) | "
+                f"Poly trend {self._format_trend(trend)} | latency avg {self._latency_avg_ms:.0f}ms"
+            ),
+        )
+        self._pending_exit = None
+        return True
+
+    def _log_pending_poly_observation(self, pending: PendingSignal, label: str) -> None:
+        if pending.observation_logged:
+            return
+        if self.latency_poly_trend_delay_seconds <= 0:
+            pending.observation_logged = True
+            return
+        observe_end = pending.created_ts + self.latency_poly_trend_delay_seconds
+        if time.time() < observe_end:
+            return
+        pending.observation_logged = True
+        samples = self._poly_samples_between(pending.created_ts, observe_end)
+        if len(samples) < 2:
+            print(
+                f"  {label.title()} latency first {self.latency_poly_trend_delay_seconds * 1000:.0f}ms "
+                f"Poly observation: insufficient ticks ({len(samples)})"
+            )
+            return
+        first = samples[0]
+        last = samples[-1]
+        print(
+            f"  {label.title()} latency first {self.latency_poly_trend_delay_seconds * 1000:.0f}ms "
+            f"Poly observation: {len(samples)} ticks | "
+            f"${first.price:.3f}->{last.price:.3f} ({last.price - first.price:+.3f}) | "
+            f"{(last.ts - first.ts) * 1000:.0f}ms"
+        )
+
+    def _poly_recent_trend(self, start_ts: float, ticks: int) -> Optional[dict[str, float]]:
+        samples = self._poly_samples_since(start_ts)
+        if len(samples) < ticks:
             return None
-        price = self.poly_feed.get_price(token_id)
-        if not price:
-            return None
-        if self._market_subscription_time > 0 and price.timestamp < self._market_subscription_time:
-            return None
-        if time.time() - price.timestamp > 10:
-            return None
-        if price.best_bid > 0 and price.best_ask > 0 and price.best_bid >= price.best_ask:
-            return None
-        return price
+        window = samples[-ticks:]
+        first = window[0]
+        last = window[-1]
+        return {
+            "count": float(len(window)),
+            "first": first.price,
+            "last": last.price,
+            "delta": last.price - first.price,
+            "duration_ms": (last.ts - first.ts) * 1000.0,
+        }
+
+    def _poly_samples_since(self, start_ts: float) -> list[PriceSample]:
+        if not self.market:
+            return []
+        segment = self.market.window_start
+        return [
+            sample for sample in self._poly_price_samples
+            if sample.segment == segment and sample.ts >= start_ts
+        ]
+
+    def _poly_samples_between(self, start_ts: float, end_ts: float) -> list[PriceSample]:
+        if not self.market:
+            return []
+        segment = self.market.window_start
+        return [
+            sample for sample in self._poly_price_samples
+            if sample.segment == segment and start_ts <= sample.ts <= end_ts
+        ]
+
+    def _format_trend(self, trend: dict[str, float]) -> str:
+        return (
+            f"{int(trend['count'])} ticks "
+            f"${trend['first']:.3f}->{trend['last']:.3f} "
+            f"({trend['delta']:+.3f}, {trend['duration_ms']:.0f}ms)"
+        )
+
+    def _format_push_signal(self, signal_result: object) -> str:
+        deviation = getattr(signal_result, "push_deviation", 0.0)
+        delta = getattr(signal_result, "push_delta", 0.0)
+        mean = getattr(signal_result, "push_mean", 0.0)
+        std = getattr(signal_result, "push_std", 0.0)
+        count = int(getattr(signal_result, "push_count", 0) or 0)
+        current_count = int(getattr(signal_result, "push_current_count", 0) or 0)
+        current_mean = getattr(signal_result, "push_current_mean", 0.0)
+        mean_shift_z = getattr(signal_result, "push_mean_shift_z", 0.0)
+        std_ratio = getattr(signal_result, "push_std_ratio", 0.0)
+        if count <= 0:
+            return "push dev n/a"
+        return (
+            f"push window {deviation:+.2f}x "
+            f"(mean_z {mean_shift_z:+.2f}, mean ${mean:,.2f}->${current_mean:,.2f}, "
+            f"d ${delta:+.2f}, base_std ${std:.2f}, cur_std {std_ratio:.2f}x, "
+            f"n={current_count}/{count})"
+        )
+        return (
+            f"push dev {deviation:+.2f}σ "
+            f"(price-mean ${delta:+.2f}, mean ${mean:,.2f}, std ${std:.2f}, n={count})"
+        )
+
+    def _update_profit_trail(self, sell_price: float) -> float:
+        if not self.position:
+            return 0.0
+        self.position.last_sell_price = sell_price
+        unrealized_revenue = self.position.exit_revenue + self.position.shares * sell_price
+        unrealized_profit = unrealized_revenue - self.position.cost
+        if unrealized_profit > self.position.peak_unrealized_profit:
+            self.position.peak_unrealized_profit = unrealized_profit
+            self.position.peak_sell_price = sell_price
+        return unrealized_profit
+
+    def _profit_retreat_hit(self, unrealized_profit: float) -> tuple[bool, float]:
+        if not self.position:
+            return False, 0.0
+        peak = self.position.peak_unrealized_profit
+        if peak <= 0:
+            return False, 0.0
+        retreat = (peak - unrealized_profit) / peak
+        return retreat >= self.config.profit_retreat_pct, retreat
+
+    def _sell_position(self, sell_price: float, reason: str) -> None:
+        if not self.position:
+            return
+
+        print(f"\n[EXIT] {reason} | sell ${sell_price:.3f}")
+        result = self.executor.sell(self.position.token_id, self.position.shares, price=sell_price)
+        if not result.success:
+            print(f"  Sell failed: {result.error}")
+            return
+
+        self.position.exit_revenue += result.amount_usd
+        self.position.shares = max(0.0, self.position.shares - result.shares)
+        if self.position.shares < 1.0:
+            self.position.closed = True
+
+        profit = self.position.exit_revenue - self.position.cost
+        self.realized_pnl += profit
+        self._update_strategy_drawdown_guard()
+        print(f"  Exit filled: revenue ${result.amount_usd:.2f}, profit ${profit:+.2f}")
+        self.telegram.strategy_result_alert(
+            strategy="Binance latency spike",
+            profit=profit,
+            strategy_pnl=self.realized_pnl,
+            total_pnl=self.realized_pnl,
+        )
+
+    def _resolve_position(self, closing_btc_price: float) -> None:
+        if not self.position or self.position.closed:
+            return
+
+        winner = None if self.dry_run else get_market_winner(self.period_minutes, self.position.window_ts, asset="btc")
+        if not winner:
+            winner = "UP" if closing_btc_price >= self.position.opening_price else "DOWN"
+
+        if winner == self.position.side:
+            claim_price = 0.99
+            result = self.executor.sell(self.position.token_id, self.position.shares, price=claim_price)
+            revenue = result.amount_usd if result.success else self.position.shares
+            profit = self.position.exit_revenue + revenue - self.position.cost
+            print(f"  Resolved WIN: +${profit:.2f}")
+        else:
+            profit = self.position.exit_revenue - self.position.cost
+            print(f"  Resolved LOSS: ${profit:.2f}")
+
+        self.realized_pnl += profit
+        self._update_strategy_drawdown_guard()
+        self.position.closed = True
+        self.telegram.strategy_result_alert(
+            strategy="Binance latency spike",
+            profit=profit,
+            strategy_pnl=self.realized_pnl,
+            total_pnl=self.realized_pnl,
+        )
 
     def _live_buy_price(self, token_id: str) -> float:
-        if token_id.startswith("DRY-UP"):
-            return self._cached_up
-        if token_id.startswith("DRY-DOWN"):
-            return self._cached_down
-        price = self._live_token_price(token_id)
+        ws_price = self.poly_feed.get_price(token_id)
+        if ws_price and ws_price.best_ask > 0:
+            return round(ws_price.best_ask, 2)
+        return round(self.executor.get_market_price(token_id, "BUY", self.config.trade_amount), 2)
+
+    def _live_sell_price(self, token_id: str, shares: float) -> float:
+        ws_price = self.poly_feed.get_price(token_id)
+        if ws_price and ws_price.best_bid > 0:
+            return round(ws_price.best_bid, 2)
+        notional = max(1.0, shares * 0.50)
+        return round(self.executor.get_market_price(token_id, "SELL", notional), 2)
+
+    def _poly_reference_price(self) -> float:
+        return self._poly_reference_snapshot()[0]
+
+    def _poly_reference_snapshot(self) -> tuple[float, float]:
+        if not self.market:
+            return 0.0, 0.0
+        price = self.poly_feed.get_price(self.market.token_id_up)
         if not price:
-            return 0.0
-        return price.best_ask or price.last_trade or price.mid
+            return 0.0, 0.0
+        received_ts = getattr(price, "received_ts", 0.0) or getattr(price, "timestamp", 0.0) or 0.0
+        if price.best_bid > 0 and price.best_ask > 0:
+            return round((price.best_bid + price.best_ask) / 2.0, 4), received_ts
+        if price.best_ask > 0:
+            return round(price.best_ask, 4), received_ts
+        if price.best_bid > 0:
+            return round(price.best_bid, 4), received_ts
+        if price.last_trade > 0:
+            return round(price.last_trade, 4), received_ts
+        return 0.0, received_ts
 
-    def _arm_delayed_entry(
-        self, key: str, label: str, side: str, token_id: str, amount: float,
-        condition_price: float, cap_price: float, min_price: float = 0.0, meta: dict = None,
-    ):
-        if key in self._delayed_entries:
-            return
-        entry = {
-            "key": key,
-            "label": label,
-            "side": side,
-            "token_id": token_id,
-            "amount": amount,
-            "condition_price": condition_price,
-            "cap_price": cap_price,
-            "min_price": min_price,
-            "best_price": condition_price,
-            "last_sample_ts": 0.0,
-            "meta": meta or {},
+    def _latency_wait_seconds(self) -> float:
+        wait_ms = self._latency_avg_ms if self._latency_samples_ms else self.latency_default_ms
+        wait_ms = min(max(50.0, wait_ms), self.latency_max_wait_ms)
+        return wait_ms / 1000.0
+
+    def _latency_sync_plan(self) -> dict[str, float]:
+        target_ms = self._latency_avg_ms if self._latency_samples_ms else self.latency_default_ms
+        target_ms = min(max(50.0, target_ms), self.latency_max_wait_ms)
+        trend_window_ms = max(0.0, self.latency_poly_trend_window_ms)
+        safety_margin_ms = max(0.0, self.latency_safety_margin_ms)
+        trend_start_delay_ms = max(0.0, target_ms - trend_window_ms - safety_margin_ms)
+        deadline_ms = min(self.latency_max_wait_ms, max(target_ms, trend_start_delay_ms + trend_window_ms))
+        return {
+            "target_ms": target_ms,
+            "trend_start_delay_ms": trend_start_delay_ms,
+            "trend_window_ms": trend_window_ms,
+            "safety_margin_ms": safety_margin_ms,
+            "deadline_ms": max(50.0, deadline_ms),
         }
-        self._delayed_entries[key] = entry
-        self._entry_price_history[token_id] = [(time.time(), condition_price)]
-        print(
-            f"  BUY CONDITION TRIGGERED [{label}]: {side} trigger ask ${condition_price:.3f}, "
-            f"max buy ${cap_price:.3f} - watching until cost stops getting cheaper"
-        )
 
-    def _entry_price_stopped_getting_cheaper(
-        self, token_id: str, now: float, price: float, best_price: float
-    ) -> bool:
-        history = self._entry_price_history.setdefault(token_id, [])
-        source = self._live_token_price(token_id)
-        sample_ts = source.timestamp if source else now
-        if not history or sample_ts > history[-1][0] or abs(price - history[-1][1]) > 1e-9:
-            history.append((sample_ts, price))
-        max_samples = max(self._entry_price_trend_samples, self._entry_price_trend_min_samples)
-        if len(history) > max_samples:
-            del history[:-max_samples]
+    def _pending_trend_start_ts(self, pending: PendingSignal) -> float:
+        if pending.trend_start_ts > 0:
+            return pending.trend_start_ts
+        return pending.created_ts + self.latency_poly_trend_delay_seconds
 
-        previous_tick = history[-2][1] if len(history) >= 2 else price
-        if price > best_price and price >= previous_tick:
-            return True
-
-        recent = [row for row in history if now - row[0] <= self._entry_price_trend_window_seconds]
-        samples = recent if len(recent) >= self._entry_price_trend_min_samples else history[-max_samples:]
-        if len(samples) < self._entry_price_trend_min_samples:
+    def _record_channel_latency(self, latency_seconds: float) -> bool:
+        latency_ms = max(0.0, latency_seconds * 1000.0)
+        if latency_ms < self.config.bucket_ms:
             return False
-        if len(samples) >= self._entry_price_trend_min_samples * 2:
-            split = len(samples) // 2
-            previous_samples = samples[:split]
-            current_samples = samples[split:]
-        else:
-            previous_samples = samples[:-1]
-            current_samples = samples[1:]
-        if not previous_samples or not current_samples:
+        if latency_ms > self.waveform_max_lag_seconds * 1000.0:
             return False
-        previous_avg = sum(row[1] for row in previous_samples) / len(previous_samples)
-        current_avg = sum(row[1] for row in current_samples) / len(current_samples)
-        return current_avg >= previous_avg and price >= previous_tick
-
-    def _manage_delayed_entries(self, seconds_remaining: float, now: float):
-        if not self._delayed_entries:
-            return
-        for key, entry in list(self._delayed_entries.items()):
-            if self._delayed_entry_done(key):
-                self._delayed_entries.pop(key, None)
-                continue
-            price = self._live_buy_price(entry["token_id"])
-            if price <= 0:
-                continue
-            if price > entry["cap_price"]:
-                print(
-                    f"  {entry['label']} delayed entry cancelled: ask ${price:.3f} "
-                    f"> max buy ${entry['cap_price']:.3f}"
-                )
-                self._delayed_entries.pop(key, None)
-                continue
-            if entry["min_price"] > 0 and price < entry["min_price"]:
-                entry["best_price"] = min(entry["best_price"], price)
-                self._entry_price_stopped_getting_cheaper(entry["token_id"], now, price, entry["best_price"])
-                continue
-            if price < entry["best_price"]:
-                entry["best_price"] = price
-                self._entry_price_stopped_getting_cheaper(entry["token_id"], now, price, entry["best_price"])
-                continue
-            if not self._entry_price_stopped_getting_cheaper(
-                entry["token_id"], now, price, entry["best_price"]
-            ):
-                continue
-            self._delayed_entries.pop(key, None)
-            self._execute_delayed_entry(entry, price, seconds_remaining)
-
-    def _delayed_entry_done(self, key: str) -> bool:
-        if key == "trend":
-            return self._traded or self._exited
-        if key == "cheap":
-            return self._cheap_traded or self._cheap_exited
-        if key == "relative":
-            return self._relative_traded or self._relative_exited
-        if key == "panic":
-            return self._panic_traded or self._panic_exited
+        self._latency_samples_ms.append(latency_ms)
+        if len(self._latency_samples_ms) > self.latency_samples_limit:
+            self._latency_samples_ms = self._latency_samples_ms[-self.latency_samples_limit:]
+        self._latency_avg_ms = sum(self._latency_samples_ms) / len(self._latency_samples_ms)
+        now = time.time()
+        if now - self._last_latency_log_ts >= 10:
+            self._last_latency_log_ts = now
+            print(
+                f"[latency] Binance->Polymarket avg {self._latency_avg_ms:.0f}ms "
+                f"from {len(self._latency_samples_ms)} samples"
+            )
         return True
 
-    def _execute_delayed_entry(self, entry: dict, price: float, seconds_remaining: float):
-        key = entry["key"]
-        if not self._check_risk_limits(key, entry["label"]):
+    def _update_extrema_latency(self) -> None:
+        poly_price, poly_received_ts = self._poly_reference_snapshot()
+        if poly_price <= 0 or poly_received_ts <= 0:
             return
-        print(
-            f"  EXECUTING BUY [{entry['label']}]: {entry['side']} "
-            f"best ${entry['best_price']:.3f}, rebound ask ${price:.3f}, "
-            f"trigger ${entry['condition_price']:.3f}, max buy ${entry['cap_price']:.3f}"
-        )
-        if key == "trend":
-            self._place_trend_buy(entry["meta"]["signal"], seconds_remaining, entry["token_id"], price)
-        elif key == "cheap":
-            self._place_cheap_buy(entry["side"], entry["token_id"], entry["amount"], price)
-        elif key == "relative":
-            self._place_relative_buy(entry["side"], entry["token_id"], entry["amount"], price)
-        elif key == "panic":
-            self._place_panic_buy(entry["side"], entry["token_id"], entry["amount"], price)
-
-    def _refresh_cached_ws_prices(self):
-        market = self._current_market
-        if not market:
+        if poly_received_ts <= self._last_poly_extrema_received_ts:
             return
-        up = self._live_token_price(market.token_id_up)
-        down = self._live_token_price(market.token_id_down)
-        if up:
-            up_price = up.best_ask or up.last_trade or up.mid
-            if up_price > 0:
-                self._cached_up = up_price
-        if down:
-            down_price = down.best_ask or down.last_trade or down.mid
-            if down_price > 0:
-                self._cached_down = down_price
+        self._last_poly_extrema_received_ts = poly_received_ts
+        self._update_price_sample("poly", poly_price, poly_received_ts)
 
-    def _update_realtime_history(self, now: float, btc_price: float):
-        market = self._current_market
-        if not market or btc_price <= 0:
+    def _update_price_sample(self, source: str, price: float, ts: float) -> None:
+        if price <= 0 or ts <= 0:
             return
-        up = self._live_token_price(market.token_id_up)
-        down = self._live_token_price(market.token_id_down)
-        up_ask = up.best_ask if up else 0.0
-        up_bid = up.best_bid if up else 0.0
-        down_ask = down.best_ask if down else 0.0
-        down_bid = down.best_bid if down else 0.0
-        if up_ask <= 0 and down_ask <= 0:
+        samples = self._btc_price_samples if source == "btc" else self._poly_price_samples
+        segment = self.market.window_start if source == "poly" and self.market else 0
+        samples.append(PriceSample(ts=ts, price=price, segment=segment))
+        stats = self._feed_gap_stats.get(source)
+        if stats:
+            stats.update(ts)
+        keep_after = ts - 1800.0
+        while samples and samples[0].ts < keep_after:
+            samples.pop(0)
+
+    def _calibrate_completed_window(self, window: MarketWindow) -> None:
+        if window.window_start in self._calibrated_window_starts:
             return
-        self._realtime_history.append({
-            "ts": now,
-            "btc": btc_price,
-            "UP_ask": up_ask,
-            "UP_bid": up_bid,
-            "DOWN_ask": down_ask,
-            "DOWN_bid": down_bid,
-        })
-        self._remember_polymarket_window_price(self._current_window, self._realtime_history[-1])
-        cutoff = now - max(self._realtime_to_save, 1)
-        while self._realtime_history and self._realtime_history[0]["ts"] < cutoff:
-            self._realtime_history.pop(0)
+        self._calibrated_window_starts.add(window.window_start)
 
-    def _history_row_at_or_before(self, target_ts: float):
-        candidate = None
-        for row in self._realtime_history:
-            if row["ts"] <= target_ts:
-                candidate = row
-            else:
-                break
-        return candidate or (self._realtime_history[0] if self._realtime_history else None)
-
-    def _relative_expected_poly_move(self, side: str, btc_delta_pct: float, current_ts: float):
-        actuals = []
-        for row in self._realtime_history[:-1]:
-            base = self._history_row_at_or_before(row["ts"] - self._relative_lookback_seconds)
-            if not base or base is row or base["btc"] <= 0:
-                continue
-            base_price = base.get(f"{side}_ask", 0.0)
-            row_price = row.get(f"{side}_ask", 0.0)
-            if base_price <= 0 or row_price <= 0:
-                continue
-            hist_btc_delta = ((row["btc"] - base["btc"]) / base["btc"]) * 100
-            if abs(hist_btc_delta) < self._relative_min_btc_move_pct:
-                continue
-            if hist_btc_delta * btc_delta_pct <= 0:
-                continue
-            actuals.append(row_price - base_price)
-
-        if actuals:
-            return statistics.median(actuals)
-
-        # Fallback until enough same-direction history exists in the saved buffer.
-        direction = 1 if btc_delta_pct > 0 else -1
-        side_sign = 1 if side == "UP" else -1
-        return direction * side_sign * 0.20
-
-    def _relative_reaction_signal(self):
-        if len(self._realtime_history) < 3 or not self._current_market:
-            return None
-        now = time.time()
-        current = self._realtime_history[-1]
-        baseline = self._history_row_at_or_before(now - self._relative_lookback_seconds)
-        if not baseline or baseline["btc"] <= 0:
-            return None
-        btc_delta_pct = ((current["btc"] - baseline["btc"]) / baseline["btc"]) * 100
-        if abs(btc_delta_pct) < self._relative_min_btc_move_pct:
-            return None
-
-        candidates = []
-        for side, token_id in (("UP", self._current_market.token_id_up), ("DOWN", self._current_market.token_id_down)):
-            base_ask = baseline.get(f"{side}_ask", 0.0)
-            current_ask = current.get(f"{side}_ask", 0.0)
-            if base_ask <= 0 or current_ask <= 0:
-                continue
-            actual_move = current_ask - base_ask
-            expected_move = self._relative_expected_poly_move(side, btc_delta_pct, now)
-            gap = actual_move - expected_move
-            if gap <= -self._relative_overreaction_price:
-                candidates.append((abs(gap), side, token_id, current_ask, actual_move, expected_move, btc_delta_pct))
-        if not candidates:
-            return None
-        candidates.sort(reverse=True, key=lambda item: item[0])
-        return candidates[0]
-
-    def _get_live_sell_price(self, token_id: str, fallback_prob: float) -> float:
-        price = self._live_token_price(token_id)
-        if price and price.best_bid > 0:
-            return price.best_bid
-        if self.dry_run:
-            return round(max(fallback_prob, 0.01), 2)
-        sell_probe = round(self._trade_shares * self._trade_price, 2)
-        return self.executor.get_market_price(token_id, "SELL", max(sell_probe, 1.0))
-
-    def _profit_target_for_price(self, entry_price: float) -> float:
-        pct_target = entry_price * (1.0 + self._min_profit_pct)
-        fixed_target = self._take_profit_price if self._take_profit_price > 0 else 0.0
-        return round(max(pct_target, fixed_target), 2)
-
-    def _profit_target_price(self) -> float:
-        return self._profit_target_for_price(self._trade_price)
-
-    def _cheap_profit_target_price(self) -> float:
-        pct_target = self._cheap_price * (1.0 + self._cheap_min_profit_pct)
-        fixed_target = self._cheap_take_profit_price if self._cheap_take_profit_price > 0 else 0.0
-        return round(max(pct_target, fixed_target), 2)
-
-    def _panic_profit_target_price(self) -> float:
-        pct_target = self._panic_price * (1.0 + self._panic_min_profit_pct)
-        fixed_target = self._panic_take_profit_price if self._panic_take_profit_price > 0 else 0.0
-        return round(max(pct_target, fixed_target), 2)
-
-    def _update_panic_price_history(self, now: float):
-        market = self._current_market
-        if not market:
-            return
-        for side, token_id in (("UP", market.token_id_up), ("DOWN", market.token_id_down)):
-            price = self._live_token_price(token_id)
-            ask = price.best_ask if price else 0.0
-            bid = price.best_bid if price else 0.0
-            if ask <= 0:
-                continue
-            history = self._panic_price_history[side]
-            history.append((now, ask, bid))
-            cutoff = now - max(self._panic_lookback_seconds, 1)
-            while history and history[0][0] < cutoff:
-                history.pop(0)
-
-    def _cheap_scalp_candidate(self):
-        market = self._current_market
-        if not market:
-            return None
-        candidates = []
-        for side, token_id in (("UP", market.token_id_up), ("DOWN", market.token_id_down)):
-            price = self._live_token_price(token_id)
-            ask = price.best_ask if price else 0.0
-            if ask > 0 and ask <= self._cheap_entry_price:
-                candidates.append((ask, side, token_id))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0]
-
-    def _clear_pending_cheap_buy(self):
-        self._cheap_pending_side = ""
-        self._cheap_pending_token_id = ""
-        self._cheap_pending_order_id = ""
-        self._cheap_pending_price = 0.0
-        self._cheap_pending_amount = 0.0
-        self._cheap_pending_shares = 0.0
-        self._cheap_pending_balance_before = 0.0
-        self._cheap_pending_token_balance_before = 0.0
-        self._cheap_pending_last_check = 0.0
-        self._cheap_pending_started_at = 0.0
-        self._cheap_pending_window = 0
-        self._cheap_pending_last_notice = 0.0
-
-    def _activate_cheap_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
-        self._cheap_traded = True
-        self._cheap_side = side
-        self._cheap_token_id = token_id
-        self._cheap_price = price
-        self._cheap_cost = amount
-        self._cheap_shares = shares
-        self._cheap_trailing_armed = False
-        self._cheap_peak_profit = 0.0
-        self._exit_profit_history.pop("cheap", None)
-        self.stats.bankroll -= amount
-        self.stats.hourly.record_trade(0.0, 0.0)
-        self._clear_pending_cheap_buy()
-        print(
-            f"  Cheap scalp bought: {shares:.0f} {side} "
-            f"@ ${price:.3f} = ${amount:.2f}"
-        )
-        self.telegram.strategy_trade_alert(
-            strategy="Cheap scalp",
-            side=side,
-            price=price,
-            amount=amount,
-            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
-            dry_run=self.dry_run,
-            strategy_pnl=self._strategy_pnl.get("cheap", 0.0),
-            total_pnl=self.stats.total_pnl,
-        )
-
-    def _check_pending_cheap_buy(self, now: float):
-        if not self._cheap_pending_side or self._cheap_traded or self.dry_run:
-            return
-        if self._cheap_pending_started_at <= 0:
-            self._cheap_pending_started_at = now
-        if self._pending_buy_expired(
-            self._cheap_pending_started_at, self._cheap_pending_window, now, "Cheap scalp"
-        ):
-            self._clear_pending_cheap_buy()
-            return
-        if now - self._cheap_pending_last_check < 2.0:
-            return
-        self._cheap_pending_last_check = now
-
-        if self._cheap_pending_order_id and self.executor._initialized:
-            matched = self.executor.check_buy_fill(
-                self._cheap_pending_order_id,
-                self._cheap_pending_price,
-            )
-            if matched:
-                self._activate_cheap_buy(
-                    self._cheap_pending_side,
-                    self._cheap_pending_token_id,
-                    matched[0],
-                    matched[1],
-                    matched[2],
-                )
-                return
-
-        if self.executor._initialized and self._cheap_pending_balance_before > 0:
-            real_bal = self.executor.get_balance()
-            spent = self._cheap_pending_balance_before - real_bal if real_bal > 0 else 0.0
-            if spent > 1.0:
-                current_tokens = self.executor.get_token_balance(self._cheap_pending_token_id)
-                shares = max(0.0, current_tokens - self._cheap_pending_token_balance_before)
-                if shares < 1:
-                    self._pending_buy_notice(
-                        "_cheap_pending_last_notice",
-                        now,
-                        "  Cheap scalp pending balance moved but no token balance/order fill yet - waiting",
-                    )
-                    return
-                self.stats.bankroll = real_bal + spent
-                self._last_real_balance = real_bal
-                self._activate_cheap_buy(
-                    self._cheap_pending_side,
-                    self._cheap_pending_token_id,
-                    self._cheap_pending_price,
-                    spent,
-                    shares,
-                )
-
-    def _place_cheap_buy(self, side: str, token_id: str, amount: float, price: float):
-        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._cheap_pending_side = side
-                self._cheap_pending_token_id = token_id
-                self._cheap_pending_order_id = result.order_id
-                self._cheap_pending_price = result.price
-                self._cheap_pending_amount = result.amount_usd
-                self._cheap_pending_shares = result.shares
-                self._cheap_pending_balance_before = self.stats.bankroll
-                self._cheap_pending_token_balance_before = self.executor.get_token_balance(token_id)
-                self._cheap_pending_last_check = 0.0
-                self._cheap_pending_started_at = time.time()
-                self._cheap_pending_window = self._current_window
-                print("  Cheap scalp buy unverified - will poll order API and balance")
-                return
-            print(f"  Cheap scalp buy failed: {result.error}")
-            return
-        self._activate_cheap_buy(side, token_id, result.price, result.amount_usd, result.shares)
-
-    def _try_cheap_scalp_entry(self, seconds_remaining: float):
-        if not self._cheap_scalp_enabled:
-            return
-        if not self._check_risk_limits("cheap", "cheap scalp"):
-            self._cheap_trade_attempted = True
-            return
-        if not self.dry_run and not self.executor._initialized:
-            return
-        if not self._current_market:
-            return
-        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
-        if elapsed < 0:
-            return
-        if elapsed > self._cheap_entry_window_seconds:
-            self._cheap_trade_attempted = True
-            return
-
-        candidate = self._cheap_scalp_candidate()
-        if not candidate:
-            return
-
-        ws_ask, side, token_id = candidate
-        trade_amount = round(min(self._cheap_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
-        if trade_amount < self.strategy_config.min_bet:
-            return
-
-        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
-        if actual_price <= 0:
-            return
-
-        cap_price = min(self._cheap_entry_price, max_buy_price())
-        if actual_price > cap_price:
+        target_start = window.window_start + self.waveform_start_offset_seconds
+        match_start = self._waveform_available_start(window.window_start, target_start)
+        match_seconds = self.waveform_match_seconds
+        match_end = match_start + match_seconds
+        required_poly_end = match_end + self.waveform_max_lag_seconds
+        if match_seconds <= 0 or required_poly_end > window.window_end + 1e-9:
             print(
-                f"  Cheap scalp skip {side}: WS ask ${ws_ask:.3f}, "
-                f"executable ${actual_price:.3f} > cap ${cap_price:.2f}"
+                f"[latency] waveform skipped {window.slug}: early match window too short "
+                f"(start {self._format_ts(match_start)}, need until {self._format_ts(required_poly_end)})"
             )
+            return
+
+        best = self._match_waveform_candidate(window.window_start, match_start, match_seconds)
+
+        if not best:
+            detail = self._waveform_fail_reason or "unknown reason"
+            self._calibration_debug_reason = f"no waveform match for {window.slug}: {detail}"
+            print(f"[latency] waveform skipped {window.slug}: {self._calibration_debug_reason}")
             return
 
         print(
-            f"\n  Cheap scalp {side}: WS ask ${ws_ask:.3f}, "
-            f"executable ${actual_price:.3f}, amount ${trade_amount:.2f}"
-        )
-        self._cheap_trade_attempted = True
-        self._arm_delayed_entry(
-            "cheap", "Cheap scalp", side, token_id, trade_amount,
-            condition_price=cap_price, cap_price=cap_price,
+            f"[latency] waveform candidate {window.slug}: BTC early {self._format_ts(best.btc_start_ts)} "
+            f"lag {best.latency_ms:.0f}ms | sse {best.sse:.2f} | second {best.second_sse:.2f} | "
+            f"scale {best.scale:.1f}x | range btc ${best.btc_range:.2f}/poly ${best.poly_range:.3f} | "
+            f"top {best.top_lags}"
         )
 
-    def _manage_cheap_scalp(self, seconds_remaining: float, now: float):
-        if not self._cheap_traded or self._cheap_exited:
-            return
-        if now - self._cheap_last_check < POSITION_CHECK_INTERVAL:
-            return
-        self._cheap_last_check = now
-        self._reconcile_active_position_balance(
-            "Cheap scalp",
-            "_cheap_token_id",
-            "_cheap_shares",
-            "_cheap_cost",
-            "_cheap_price",
-        )
-
-        live = self._live_token_price(self._cheap_token_id)
-        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
-        if sell_price <= 0:
-            if self.executor._initialized and not self.dry_run:
-                probe = max(round(self._cheap_shares * self._cheap_price, 2), 1.0)
-                sell_price = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
-        if sell_price <= 0:
-            return
-
-        target = self._cheap_profit_target_price()
-        pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
-        if self._cheap_exit_revenue > 0 and self._cheap_shares * sell_price >= 5.0:
-            if not self.dry_run and self._confirm_ws_sell_price:
-                probe = max(round(self._cheap_shares * sell_price, 2), 1.0)
-                confirmed = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
-                if confirmed > 0:
-                    sell_price = confirmed
-                    pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
-            if pnl >= -0.01:
-                result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
-                if result.success:
-                    self._cheap_exit_revenue += result.amount_usd
-                    self.stats.bankroll += result.amount_usd
-                    if result.status == PARTIAL and result.shares_remaining >= 1:
-                        self._cheap_shares = result.shares_remaining
-                        self._cheap_exited = False
-                        print(
-                            f"  Cheap scalp exit (partial_recovery, partial): {result.shares:.0f} {self._cheap_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                        )
-                    else:
-                        self._cheap_exited = True
-                        profit = self._cheap_exit_revenue - self._cheap_cost
-                        self._record_cheap_result(profit)
-                        print(
-                            f"  Cheap scalp exit (partial_recovery): {result.shares:.0f} {self._cheap_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                        )
-                return
-        threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
-        if not threshold_reached and not self._cheap_trailing_armed:
-            return
-
-        if self._cheap_shares * sell_price < 5.0:
-            return
-
-        if not self.dry_run and self._confirm_ws_sell_price:
-            probe = max(round(self._cheap_shares * sell_price, 2), 1.0)
-            confirmed = self.executor.get_market_price(self._cheap_token_id, "SELL", probe)
-            if confirmed > 0:
-                sell_price = confirmed
-                pnl = self._cheap_exit_revenue + self._cheap_shares * sell_price - self._cheap_cost
-        threshold_reached = sell_price >= target and pnl >= self._cheap_min_profit_usd
-        if self._profit_floor_exit_ready(
-            "Cheap scalp", self._cheap_shares, self._cheap_cost,
-            sell_price, target, self._cheap_min_profit_usd,
-            "_cheap_trailing_armed", "cheap", self._cheap_token_id,
-            realized_revenue=self._cheap_exit_revenue,
-        ):
-            if not self._exit_price_is_profitable(
-                "Cheap scalp", self._cheap_shares, self._cheap_cost,
-                sell_price, self._cheap_min_profit_usd, "cheap", self._cheap_token_id,
-                allow_below_min_profit=True, realized_revenue=self._cheap_exit_revenue,
-            ):
-                return
-            result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
-            if result.success:
-                self._cheap_exit_revenue += result.amount_usd
-                self.stats.bankroll += result.amount_usd
-                if result.status == PARTIAL and result.shares_remaining >= 1:
-                    self._cheap_shares = result.shares_remaining
-                    self._cheap_exited = False
-                    print(
-                        f"  Cheap scalp exit (profit_floor, partial): {result.shares:.0f} {self._cheap_side} "
-                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                    )
-                else:
-                    self._cheap_exited = True
-                    profit = self._cheap_exit_revenue - self._cheap_cost
-                    self._record_cheap_result(profit)
-                    print(
-                        f"  Cheap scalp exit (profit_floor): {result.shares:.0f} {self._cheap_side} "
-                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                    )
-            return
-        if not self._trailing_profit_exit_ready(
-            "Cheap scalp", pnl, threshold_reached,
-            self._cheap_profit_retreat_pct,
-            "_cheap_trailing_armed", "_cheap_peak_profit", "cheap",
-        ):
-            return
-        if not self._exit_price_is_profitable(
-            "Cheap scalp", self._cheap_shares, self._cheap_cost,
-            sell_price, self._cheap_min_profit_usd, "cheap", self._cheap_token_id,
-            realized_revenue=self._cheap_exit_revenue,
-        ):
-            return
-
-        result = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=sell_price)
-        if result.success:
-            self._cheap_exit_revenue += result.amount_usd
-            self.stats.bankroll += result.amount_usd
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                self._cheap_shares = result.shares_remaining
-                self._cheap_exited = False
-                print(
-                    f"  Cheap scalp exit (partial): {result.shares:.0f} {self._cheap_side} "
-                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                )
-            else:
-                self._cheap_exited = True
-                profit = self._cheap_exit_revenue - self._cheap_cost
-                self._record_cheap_result(profit)
-                print(
-                    f"  Cheap scalp exit: {result.shares:.0f} {self._cheap_side} "
-                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                )
-
-    def _resolve_cheap_scalp(self, closing_btc_price: float):
-        if not self._cheap_traded or self._cheap_exited:
-            return
-        if self.dry_run:
-            won = self._dry_run_resolution_won(self._cheap_side, self._current_window)
-            if won is None:
-                print("  Cheap scalp dry-run resolution pending Polymarket final result")
-                self._queue_dry_resolution(
-                    "cheap", "Cheap scalp", self._cheap_side,
-                    self._cheap_shares, self._cheap_cost,
-                    self._cheap_exit_revenue, self._current_window,
-                )
-                self._cheap_exited = True
-                return
-        else:
-            won = False
-            if self._opening_price > 0 and closing_btc_price > 0:
-                won = (closing_btc_price >= self._opening_price) == (self._cheap_side == "UP")
-
-        if won:
-            if self.dry_run:
-                revenue = self._cheap_shares
-            else:
-                claim = self.executor.sell(self._cheap_token_id, self._cheap_shares, price=0.99)
-                if not claim.success:
-                    print(f"  Cheap scalp claim not verified: {claim.error} - not booking win yet")
-                    return
-                revenue = claim.amount_usd
-            profit = revenue - self._cheap_cost
-            self.stats.bankroll += revenue
-            self._record_cheap_result(profit)
-            print(f"  Cheap scalp resolved WIN +${profit:.2f}")
-        else:
-            loss = self._cheap_cost - self._cheap_exit_revenue
-            self._record_cheap_result(-loss)
-            print(f"  Cheap scalp resolved LOSS -${loss:.2f}")
-        self._cheap_exited = True
-
-    def _relative_profit_target_price(self) -> float:
-        pct_target = self._relative_price * (1.0 + self._relative_min_profit_pct)
-        fixed_target = self._relative_take_profit_price if self._relative_take_profit_price > 0 else 0.0
-        return round(max(pct_target, fixed_target), 2)
-
-    def _clear_pending_relative_buy(self):
-        self._relative_pending_side = ""
-        self._relative_pending_token_id = ""
-        self._relative_pending_order_id = ""
-        self._relative_pending_price = 0.0
-        self._relative_pending_amount = 0.0
-        self._relative_pending_shares = 0.0
-        self._relative_pending_balance_before = 0.0
-        self._relative_pending_token_balance_before = 0.0
-        self._relative_pending_last_check = 0.0
-        self._relative_pending_started_at = 0.0
-        self._relative_pending_window = 0
-        self._relative_pending_last_notice = 0.0
-
-    def _activate_relative_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
-        self._relative_traded = True
-        self._relative_side = side
-        self._relative_token_id = token_id
-        self._relative_price = price
-        self._relative_cost = amount
-        self._relative_shares = shares
-        self._relative_trailing_armed = False
-        self._relative_peak_profit = 0.0
-        self._exit_profit_history.pop("relative", None)
-        self.stats.bankroll -= amount
-        self.stats.hourly.record_trade(0.0, 0.0)
-        self._clear_pending_relative_buy()
-        print(f"  Relative overreaction bought: {shares:.0f} {side} @ ${price:.3f} = ${amount:.2f}")
-        self.telegram.strategy_trade_alert(
-            strategy="Relative overreaction",
-            side=side,
-            price=price,
-            amount=amount,
-            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
-            dry_run=self.dry_run,
-            strategy_pnl=self._strategy_pnl.get("relative", 0.0),
-            total_pnl=self.stats.total_pnl,
-        )
-
-    def _check_pending_relative_buy(self, now: float):
-        if not self._relative_pending_side or self._relative_traded or self.dry_run:
-            return
-        if self._relative_pending_started_at <= 0:
-            self._relative_pending_started_at = now
-        if self._pending_buy_expired(
-            self._relative_pending_started_at, self._relative_pending_window, now, "Relative overreaction"
-        ):
-            self._clear_pending_relative_buy()
-            return
-        if now - self._relative_pending_last_check < 2.0:
-            return
-        self._relative_pending_last_check = now
-
-        if self._relative_pending_order_id and self.executor._initialized:
-            matched = self.executor.check_buy_fill(
-                self._relative_pending_order_id,
-                self._relative_pending_price,
-            )
-            if matched:
-                self._activate_relative_buy(
-                    self._relative_pending_side,
-                    self._relative_pending_token_id,
-                    matched[0],
-                    matched[1],
-                    matched[2],
-                )
-                return
-
-        if self.executor._initialized and self._relative_pending_balance_before > 0:
-            real_bal = self.executor.get_balance()
-            spent = self._relative_pending_balance_before - real_bal if real_bal > 0 else 0.0
-            if spent > 1.0:
-                current_tokens = self.executor.get_token_balance(self._relative_pending_token_id)
-                shares = max(0.0, current_tokens - self._relative_pending_token_balance_before)
-                if shares < 1:
-                    self._pending_buy_notice(
-                        "_relative_pending_last_notice",
-                        now,
-                        "  Relative overreaction pending balance moved but no token balance/order fill yet - waiting",
-                    )
-                    return
-                self.stats.bankroll = real_bal + spent
-                self._last_real_balance = real_bal
-                self._activate_relative_buy(
-                    self._relative_pending_side,
-                    self._relative_pending_token_id,
-                    self._relative_pending_price,
-                    spent,
-                    shares,
-                )
-
-    def _place_relative_buy(self, side: str, token_id: str, amount: float, price: float):
-        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._relative_pending_side = side
-                self._relative_pending_token_id = token_id
-                self._relative_pending_order_id = result.order_id
-                self._relative_pending_price = result.price
-                self._relative_pending_amount = result.amount_usd
-                self._relative_pending_shares = result.shares
-                self._relative_pending_balance_before = self.stats.bankroll
-                self._relative_pending_token_balance_before = self.executor.get_token_balance(token_id)
-                self._relative_pending_last_check = 0.0
-                self._relative_pending_started_at = time.time()
-                self._relative_pending_window = self._current_window
-                print("  Relative overreaction buy unverified - will poll order API and balance")
-                return
-            print(f"  Relative overreaction buy failed: {result.error}")
-            return
-        self._activate_relative_buy(side, token_id, result.price, result.amount_usd, result.shares)
-
-    def _try_relative_reaction_entry(self, seconds_remaining: float):
-        if not self._relative_enabled:
-            return
-        if not self._check_risk_limits("relative", "relative overreaction"):
-            self._relative_trade_attempted = True
-            return
-        if not self.dry_run and not self.executor._initialized:
-            return
-        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
-        if elapsed < 0:
-            return
-        if elapsed > self._relative_entry_window_seconds:
-            self._relative_trade_attempted = True
-            return
-        signal = self._relative_reaction_signal()
-        if not signal:
-            return
-        gap_abs, side, token_id, ws_ask, actual_move, expected_move, btc_delta_pct = signal
-        trade_amount = round(min(self._relative_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
-        if trade_amount < self.strategy_config.min_bet:
-            return
-        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
-        if actual_price <= 0:
-            return
-        cap_price = min(self._relative_max_buy_price, max_buy_price())
-        if actual_price < self._relative_min_buy_price:
+        sse_edge = best.second_sse - best.sse if best.second_sse > 0 else 0.0
+        sse_edge_pct = sse_edge / max(abs(best.sse), 1.0)
+        if sse_edge < self.waveform_min_sse_improvement or sse_edge_pct < self.waveform_min_sse_improvement_pct:
             print(
-                f"  Relative skip {side}: executable ${actual_price:.3f} "
-                f"< min ${self._relative_min_buy_price:.2f}"
+                f"[latency] waveform rejected {window.slug}: weak SSE separation "
+                f"edge {sse_edge:.2f}/{sse_edge_pct:.3%} below "
+                f"{self.waveform_min_sse_improvement:.2f}/{self.waveform_min_sse_improvement_pct:.3%} | "
+                f"top {best.top_lags}"
             )
             return
-        if actual_price > cap_price:
-            print(f"  Relative skip {side}: executable ${actual_price:.3f} > cap ${cap_price:.2f}")
+
+        baseline_ready = len(self._latency_samples_ms) >= self.waveform_min_baseline_samples
+        if baseline_ready and (
+            best.latency_ms < self.waveform_min_accept_ms or best.latency_ms > self.waveform_max_accept_ms
+        ):
+            print(
+                f"[latency] waveform rejected {window.slug}: lag {best.latency_ms:.0f}ms outside accepted "
+                f"range {self.waveform_min_accept_ms:.0f}-{self.waveform_max_accept_ms:.0f}ms | "
+                f"sse {best.sse:.2f} | top {best.top_lags}"
+            )
             return
 
+        if baseline_ready:
+            reference = float(np.median(np.array(self._latency_samples_ms, dtype=np.float64)))
+            deviation = abs(best.latency_ms - reference)
+            if deviation > self.waveform_max_sample_deviation_ms:
+                print(
+                    f"[latency] waveform rejected {window.slug}: lag {best.latency_ms:.0f}ms "
+                    f"deviates {deviation:.0f}ms from median {reference:.0f}ms "
+                    f"(limit {self.waveform_max_sample_deviation_ms:.0f}ms) | "
+                    f"BTC early {self._format_ts(best.btc_start_ts)} | sse {best.sse:.2f}"
+                )
+                return
+
+        if not self._record_channel_latency(best.latency_ms / 1000.0):
+            print(
+                f"[latency] waveform rejected {window.slug}: lag {best.latency_ms:.0f}ms outside valid "
+                f"range {self.config.bucket_ms:.0f}-{self.waveform_max_lag_seconds * 1000:.0f}ms | "
+                f"BTC early {self._format_ts(best.btc_start_ts)} | sse {best.sse:.2f}"
+            )
+            return
+
+        self._latency_calibrated = True
+        self._window_latency_matches.append(best)
+        del self._window_latency_matches[:-self.latency_samples_limit]
+        baseline_state = (
+            "baseline locked"
+            if len(self._latency_samples_ms) >= self.waveform_min_baseline_samples
+            else f"baseline collecting {len(self._latency_samples_ms)}/{self.waveform_min_baseline_samples}"
+        )
         print(
-            f"\n  Relative overreaction {side}: BTC {btc_delta_pct:+.3f}% | "
-            f"poly actual {actual_move:+.3f}, expected {expected_move:+.3f}, gap -${gap_abs:.3f}"
-        )
-        self._relative_trade_attempted = True
-        self._arm_delayed_entry(
-            "relative", "Relative overreaction", side, token_id, trade_amount,
-            condition_price=cap_price, cap_price=cap_price,
-            min_price=self._relative_min_buy_price,
+            f"[latency] waveform matched {window.slug}: BTC early2m {self._format_ts(best.btc_start_ts)} "
+            f"lag {best.latency_ms:.0f}ms | sse {best.sse:.2f} | "
+            f"second {best.second_sse:.2f} | scale {best.scale:.1f}x | "
+            f"range btc ${best.btc_range:.2f}/poly ${best.poly_range:.3f} | top {best.top_lags} | "
+            f"avg {self._latency_avg_ms:.0f}ms/{len(self._latency_samples_ms)} | {baseline_state}"
         )
 
-    def _relative_is_overbought_exit(self) -> bool:
-        if not self._relative_traded or len(self._realtime_history) < 3:
-            return False
-        now = time.time()
-        current = self._realtime_history[-1]
-        baseline = self._history_row_at_or_before(now - self._relative_lookback_seconds)
-        if not baseline or baseline["btc"] <= 0:
-            return False
-        btc_delta_pct = ((current["btc"] - baseline["btc"]) / baseline["btc"]) * 100
-        if abs(btc_delta_pct) < self._relative_min_btc_move_pct:
-            return False
-        base_ask = baseline.get(f"{self._relative_side}_ask", 0.0)
-        current_bid = current.get(f"{self._relative_side}_bid", 0.0)
-        if base_ask <= 0 or current_bid <= 0:
-            return False
-        actual_move = current_bid - base_ask
-        expected_move = self._relative_expected_poly_move(self._relative_side, btc_delta_pct, now)
-        return (actual_move - expected_move) >= self._relative_overreaction_price
-
-    def _manage_relative_reaction(self, seconds_remaining: float, now: float):
-        if not self._relative_traded or self._relative_exited:
-            return
-        if now - self._relative_last_check < POSITION_CHECK_INTERVAL:
-            return
-        self._relative_last_check = now
-        self._reconcile_active_position_balance(
-            "Relative overreaction",
-            "_relative_token_id",
-            "_relative_shares",
-            "_relative_cost",
-            "_relative_price",
+    def _match_waveform_candidate(
+        self,
+        window_start: int,
+        btc_start_ts: float,
+        match_seconds: Optional[float] = None,
+    ) -> Optional[WindowLatencyMatch]:
+        sample_seconds = self.waveform_sample_ms / 1000.0
+        match_seconds = match_seconds or self.waveform_match_seconds
+        btc_values = self._resample_price_series(
+            self._btc_price_samples,
+            btc_start_ts,
+            btc_start_ts + match_seconds,
+            sample_seconds,
+            segment=None,
         )
-        live = self._live_token_price(self._relative_token_id)
-        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
-        if sell_price <= 0 and not self.dry_run and self.executor._initialized:
-            probe = max(round(self._relative_shares * self._relative_price, 2), 1.0)
-            sell_price = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
-        if sell_price <= 0:
-            return
-        pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
-        if self._relative_exit_revenue > 0 and self._relative_shares * sell_price >= 5.0:
-            if not self.dry_run and self._confirm_ws_sell_price:
-                probe = max(round(self._relative_shares * sell_price, 2), 1.0)
-                confirmed = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
-                if confirmed > 0:
-                    sell_price = confirmed
-                    pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
-            if pnl >= -0.01:
-                result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
-                if result.success:
-                    self._relative_exit_revenue += result.amount_usd
-                    self.stats.bankroll += result.amount_usd
-                    if result.status == PARTIAL and result.shares_remaining >= 1:
-                        self._relative_shares = result.shares_remaining
-                        self._relative_exited = False
-                        print(
-                            f"  Relative overreaction exit (partial_recovery, partial): {result.shares:.0f} {self._relative_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                        )
-                    else:
-                        self._relative_exited = True
-                        profit = self._relative_exit_revenue - self._relative_cost
-                        self._record_relative_result(profit)
-                        print(
-                            f"  Relative overreaction exit (partial_recovery): {result.shares:.0f} {self._relative_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                        )
-                return
-        target = self._relative_profit_target_price()
-        overbought_exit = self._relative_is_overbought_exit()
-        threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
-        if not threshold_reached and not self._relative_trailing_armed:
-            return
-        if self._relative_shares * sell_price < 5.0:
-            return
-        if not self.dry_run and self._confirm_ws_sell_price:
-            probe = max(round(self._relative_shares * sell_price, 2), 1.0)
-            confirmed = self.executor.get_market_price(self._relative_token_id, "SELL", probe)
-            if confirmed > 0:
-                sell_price = confirmed
-                pnl = self._relative_exit_revenue + self._relative_shares * sell_price - self._relative_cost
-        threshold_reached = (sell_price >= target or overbought_exit) and pnl >= self._relative_min_profit_usd
-        if self._profit_floor_exit_ready(
-            "Relative overreaction", self._relative_shares, self._relative_cost,
-            sell_price, target, self._relative_min_profit_usd,
-            "_relative_trailing_armed", "relative", self._relative_token_id,
-            realized_revenue=self._relative_exit_revenue,
-        ):
-            if not self._exit_price_is_profitable(
-                "Relative overreaction", self._relative_shares, self._relative_cost,
-                sell_price, self._relative_min_profit_usd, "relative", self._relative_token_id,
-                allow_below_min_profit=True, realized_revenue=self._relative_exit_revenue,
-            ):
-                return
-            result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
-            if result.success:
-                self._relative_exit_revenue += result.amount_usd
-                self.stats.bankroll += result.amount_usd
-                if result.status == PARTIAL and result.shares_remaining >= 1:
-                    self._relative_shares = result.shares_remaining
-                    self._relative_exited = False
-                    print(
-                        f"  Relative overreaction exit (profit_floor, partial): {result.shares:.0f} {self._relative_side} "
-                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                    )
-                else:
-                    self._relative_exited = True
-                    profit = self._relative_exit_revenue - self._relative_cost
-                    self._record_relative_result(profit)
-                    print(f"  Relative overreaction exit (profit_floor): {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
-            return
-        if not self._trailing_profit_exit_ready(
-            "Relative overreaction", pnl, threshold_reached,
-            self._relative_profit_retreat_pct,
-            "_relative_trailing_armed", "_relative_peak_profit", "relative",
-        ):
-            return
-        if not self._exit_price_is_profitable(
-            "Relative overreaction", self._relative_shares, self._relative_cost,
-            sell_price, self._relative_min_profit_usd, "relative", self._relative_token_id,
-            realized_revenue=self._relative_exit_revenue,
-        ):
-            return
-        result = self.executor.sell(self._relative_token_id, self._relative_shares, price=sell_price)
-        if result.success:
-            self._relative_exit_revenue += result.amount_usd
-            self.stats.bankroll += result.amount_usd
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                self._relative_shares = result.shares_remaining
-                self._relative_exited = False
-                print(
-                    f"  Relative overreaction exit (partial): {result.shares:.0f} {self._relative_side} "
-                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                )
-            else:
-                self._relative_exited = True
-                profit = self._relative_exit_revenue - self._relative_cost
-                self._record_relative_result(profit)
-                print(f"  Relative overreaction exit: {result.shares:.0f} {self._relative_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
-
-    def _resolve_relative_reaction(self, closing_btc_price: float):
-        if not self._relative_traded or self._relative_exited:
-            return
-        if self.dry_run:
-            won = self._dry_run_resolution_won(self._relative_side, self._current_window)
-            if won is None:
-                print("  Relative overreaction dry-run resolution pending Polymarket final result")
-                self._queue_dry_resolution(
-                    "relative", "Relative overreaction", self._relative_side,
-                    self._relative_shares, self._relative_cost,
-                    self._relative_exit_revenue, self._current_window,
-                )
-                self._relative_exited = True
-                return
-        else:
-            won = False
-            if self._opening_price > 0 and closing_btc_price > 0:
-                won = (closing_btc_price >= self._opening_price) == (self._relative_side == "UP")
-        if won:
-            if self.dry_run:
-                revenue = self._relative_shares
-            else:
-                claim = self.executor.sell(self._relative_token_id, self._relative_shares, price=0.99)
-                if not claim.success:
-                    print(f"  Relative overreaction claim not verified: {claim.error} - not booking win yet")
-                    return
-                revenue = claim.amount_usd
-            profit = revenue - self._relative_cost
-            self.stats.bankroll += revenue
-            self._record_relative_result(profit)
-            print(f"  Relative overreaction resolved WIN +${profit:.2f}")
-        else:
-            loss = self._relative_cost - self._relative_exit_revenue
-            self._record_relative_result(-loss)
-            print(f"  Relative overreaction resolved LOSS -${loss:.2f}")
-        self._relative_exited = True
-
-    def _panic_candidate(self, btc_price: float):
-        if not self._current_market or self._opening_price <= 0:
-            return None
-        btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
-        candidates = []
-        for side in ("UP", "DOWN"):
-            history = self._panic_price_history.get(side, [])
-            if len(history) < 2:
-                continue
-            current_ask = history[-1][1]
-            recent_high = max(row[1] for row in history)
-            if current_ask <= 0 or recent_high <= 0:
-                continue
-            if recent_high < self._panic_min_high_price:
-                continue
-            drop_pct = (recent_high - current_ask) / recent_high
-            if drop_pct < self._panic_drop_pct or current_ask > self._panic_max_buy_price:
-                continue
-            if side == "UP" and btc_delta_pct < -self._panic_max_btc_against_pct:
-                continue
-            if side == "DOWN" and btc_delta_pct > self._panic_max_btc_against_pct:
-                continue
-            token_id = self._current_market.token_id_up if side == "UP" else self._current_market.token_id_down
-            candidates.append((drop_pct, current_ask, recent_high, side, token_id, btc_delta_pct))
-        if not candidates:
-            return None
-        candidates.sort(reverse=True, key=lambda item: item[0])
-        return candidates[0]
-
-    def _clear_pending_panic_buy(self):
-        self._panic_pending_side = ""
-        self._panic_pending_token_id = ""
-        self._panic_pending_order_id = ""
-        self._panic_pending_price = 0.0
-        self._panic_pending_amount = 0.0
-        self._panic_pending_shares = 0.0
-        self._panic_pending_balance_before = 0.0
-        self._panic_pending_token_balance_before = 0.0
-        self._panic_pending_last_check = 0.0
-        self._panic_pending_started_at = 0.0
-        self._panic_pending_window = 0
-        self._panic_pending_last_notice = 0.0
-
-    def _activate_panic_buy(self, side: str, token_id: str, price: float, amount: float, shares: float):
-        self._panic_traded = True
-        self._panic_side = side
-        self._panic_token_id = token_id
-        self._panic_price = price
-        self._panic_cost = amount
-        self._panic_shares = shares
-        self._panic_trailing_armed = False
-        self._panic_peak_profit = 0.0
-        self._exit_profit_history.pop("panic", None)
-        self.stats.bankroll -= amount
-        self.stats.hourly.record_trade(0.0, 0.0)
-        self._clear_pending_panic_buy()
-        print(f"  Panic rebound bought: {shares:.0f} {side} @ ${price:.3f} = ${amount:.2f}")
-        self.telegram.strategy_trade_alert(
-            strategy="Panic rebound",
-            side=side,
-            price=price,
-            amount=amount,
-            market_slug=f"btc-updown-{self.period}m-{self._current_window}",
-            dry_run=self.dry_run,
-            strategy_pnl=self._strategy_pnl.get("panic", 0.0),
-            total_pnl=self.stats.total_pnl,
-        )
-
-    def _check_pending_panic_buy(self, now: float):
-        if not self._panic_pending_side or self._panic_traded or self.dry_run:
-            return
-        if self._panic_pending_started_at <= 0:
-            self._panic_pending_started_at = now
-        if self._pending_buy_expired(
-            self._panic_pending_started_at, self._panic_pending_window, now, "Panic rebound"
-        ):
-            self._clear_pending_panic_buy()
-            return
-        if now - self._panic_pending_last_check < 2.0:
-            return
-        self._panic_pending_last_check = now
-
-        if self._panic_pending_order_id and self.executor._initialized:
-            matched = self.executor.check_buy_fill(
-                self._panic_pending_order_id,
-                self._panic_pending_price,
+        if btc_values is None or len(btc_values) < self.waveform_min_points:
+            self._waveform_fail_reason = (
+                f"BTC resample insufficient for {self._format_ts(btc_start_ts)}-"
+                f"{self._format_ts(btc_start_ts + match_seconds)} | "
+                f"{self._sample_span_debug(self._btc_price_samples, None)}"
             )
-            if matched:
-                self._activate_panic_buy(
-                    self._panic_pending_side,
-                    self._panic_pending_token_id,
-                    matched[0],
-                    matched[1],
-                    matched[2],
-                )
-                return
+            return None
+        btc_wave = self._anchor_waveform(btc_values)
+        btc_range = self._waveform_range(btc_wave)
+        if btc_wave is None or btc_range <= 1e-9:
+            self._waveform_fail_reason = "BTC waveform flat/low variance after anchor"
+            return None
 
-        if self.executor._initialized and self._panic_pending_balance_before > 0:
-            real_bal = self.executor.get_balance()
-            spent = self._panic_pending_balance_before - real_bal if real_bal > 0 else 0.0
-            if spent > 1.0:
-                current_tokens = self.executor.get_token_balance(self._panic_pending_token_id)
-                shares = max(0.0, current_tokens - self._panic_pending_token_balance_before)
-                if shares < 1:
-                    self._pending_buy_notice(
-                        "_panic_pending_last_notice",
-                        now,
-                        "  Panic rebound pending balance moved but no token balance/order fill yet - waiting",
-                    )
-                    return
-                self.stats.bankroll = real_bal + spent
-                self._last_real_balance = real_bal
-                self._activate_panic_buy(
-                    self._panic_pending_side,
-                    self._panic_pending_token_id,
-                    self._panic_pending_price,
-                    spent,
-                    shares,
-                )
+        match_len = len(btc_wave)
+        lag_step = max(1, int(round(self.waveform_lag_step_ms / self.waveform_sample_ms)))
+        max_offset = int(round(self.waveform_max_lag_seconds / sample_seconds))
 
-    def _place_panic_buy(self, side: str, token_id: str, amount: float, price: float):
-        result = self.executor.buy(token_id=token_id, amount_usd=amount, price=price)
-        if not result.success:
-            if result.error == "UNVERIFIED_BUY":
-                self._panic_pending_side = side
-                self._panic_pending_token_id = token_id
-                self._panic_pending_order_id = result.order_id
-                self._panic_pending_price = result.price
-                self._panic_pending_amount = result.amount_usd
-                self._panic_pending_shares = result.shares
-                self._panic_pending_balance_before = self.stats.bankroll
-                self._panic_pending_token_balance_before = self.executor.get_token_balance(token_id)
-                self._panic_pending_last_check = 0.0
-                self._panic_pending_started_at = time.time()
-                self._panic_pending_window = self._current_window
-                print("  Panic rebound buy unverified - will poll order API and balance")
-                return
-            print(f"  Panic rebound buy failed: {result.error}")
-            return
-        self._activate_panic_buy(side, token_id, result.price, result.amount_usd, result.shares)
+        best_latency_ms = None
+        best_sse = None
+        second_sse = None
+        best_scale = 0.0
+        best_btc_range = btc_range
+        best_poly_range = 0.0
+        max_seen_poly_range = 0.0
+        scored: list[tuple[float, float]] = []
+        for offset in range(0, max_offset + 1, lag_step):
+            lag_seconds = offset * sample_seconds
+            poly_slice = self._resample_price_series(
+                self._poly_price_samples,
+                btc_start_ts + lag_seconds,
+                btc_start_ts + lag_seconds + match_seconds,
+                sample_seconds,
+                segment=window_start,
+            )
+            if poly_slice is None or len(poly_slice) != match_len:
+                continue
+            poly_wave = self._anchor_waveform(poly_slice)
+            poly_range = self._waveform_range(poly_wave)
+            if poly_wave is None or poly_range <= 1e-9:
+                continue
+            max_seen_poly_range = max(max_seen_poly_range, poly_range)
+            if poly_range < self.waveform_min_poly_range:
+                continue
+            scale = btc_range / poly_range
+            if self.waveform_max_scale > 0 and scale > self.waveform_max_scale:
+                continue
+            scaled_poly = poly_wave * scale
+            diff = btc_wave - scaled_poly
+            sse = float(np.dot(diff, diff))
+            scored.append((offset * self.waveform_sample_ms, sse))
+            if best_sse is None or sse < best_sse:
+                second_sse = best_sse
+                best_sse = sse
+                best_latency_ms = offset * self.waveform_sample_ms
+                best_scale = scale
+                best_poly_range = poly_range
+            elif second_sse is None or sse < second_sse:
+                second_sse = sse
 
-    def _try_panic_rebound_entry(self, btc_price: float, seconds_remaining: float):
-        if not self._panic_enabled:
-            return
-        if not self._check_risk_limits("panic", "panic rebound"):
-            self._panic_trade_attempted = True
-            return
-        if not self.dry_run and not self.executor._initialized:
-            return
-        elapsed = PERIOD_SECONDS[self.period] - seconds_remaining
-        if elapsed < 0:
-            return
-        if elapsed > self._panic_entry_window_seconds:
-            self._panic_trade_attempted = True
-            return
-        candidate = self._panic_candidate(btc_price)
-        if not candidate:
-            return
-        drop_pct, ws_ask, recent_high, side, token_id, btc_delta_pct = candidate
-        trade_amount = round(min(self._panic_trade_amount, self.strategy_config.max_bet, self.stats.bankroll), 2)
-        if trade_amount < self.strategy_config.min_bet:
-            return
-        actual_price = ws_ask if self.dry_run else self.executor.get_market_price(token_id, "BUY", trade_amount)
-        if actual_price <= 0:
-            return
-        cap_price = min(self._panic_max_buy_price, max_buy_price())
-        if actual_price > cap_price:
-            print(f"  Panic skip {side}: WS ask ${ws_ask:.3f}, executable ${actual_price:.3f} > cap ${cap_price:.2f}")
-            return
-        print(f"\n  Panic rebound {side}: ask ${ws_ask:.3f} from high ${recent_high:.3f} drop {drop_pct:.0%}, BTC {btc_delta_pct:+.3f}%")
-        self._panic_trade_attempted = True
-        self._arm_delayed_entry(
-            "panic", "Panic rebound", side, token_id, trade_amount,
-            condition_price=cap_price, cap_price=cap_price,
+        if best_latency_ms is None:
+            self._waveform_fail_reason = (
+                f"no usable Poly lag slices for segment {window_start} "
+                f"{self._format_ts(btc_start_ts)}-{self._format_ts(btc_start_ts + match_seconds + self.waveform_max_lag_seconds)} | "
+                f"min poly range ${self.waveform_min_poly_range:.3f}, max seen ${max_seen_poly_range:.3f}, "
+                f"max scale {self.waveform_max_scale:.0f}x | "
+                f"{self._sample_span_debug(self._poly_price_samples, window_start)}"
+            )
+            return None
+        top_lags = ", ".join(
+            f"{latency:.0f}ms:{sse:.1f}" for latency, sse in sorted(scored, key=lambda item: item[1])[:5]
+        )
+        self._waveform_fail_reason = ""
+        return WindowLatencyMatch(
+            window_start=window_start,
+            btc_start_ts=btc_start_ts,
+            latency_ms=best_latency_ms,
+            sse=best_sse,
+            samples=match_len,
+            second_sse=second_sse or 0.0,
+            top_lags=top_lags,
+            scale=best_scale,
+            btc_range=best_btc_range,
+            poly_range=best_poly_range,
         )
 
-    def _manage_panic_rebound(self, seconds_remaining: float, now: float):
-        if not self._panic_traded or self._panic_exited:
-            return
-        if now - self._panic_last_check < POSITION_CHECK_INTERVAL:
-            return
-        self._panic_last_check = now
-        self._reconcile_active_position_balance(
-            "Panic rebound",
-            "_panic_token_id",
-            "_panic_shares",
-            "_panic_cost",
-            "_panic_price",
-        )
-        live = self._live_token_price(self._panic_token_id)
-        sell_price = live.best_bid if live and live.best_bid > 0 else 0.0
-        if sell_price <= 0 and not self.dry_run and self.executor._initialized:
-            probe = max(round(self._panic_shares * self._panic_price, 2), 1.0)
-            sell_price = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
-        if sell_price <= 0:
-            return
-        target = self._panic_profit_target_price()
-        pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
-        if self._panic_exit_revenue > 0 and self._panic_shares * sell_price >= 5.0:
-            if not self.dry_run and self._confirm_ws_sell_price:
-                probe = max(round(self._panic_shares * sell_price, 2), 1.0)
-                confirmed = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
-                if confirmed > 0:
-                    sell_price = confirmed
-                    pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
-            if pnl >= -0.01:
-                result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
-                if result.success:
-                    self._panic_exit_revenue += result.amount_usd
-                    self.stats.bankroll += result.amount_usd
-                    if result.status == PARTIAL and result.shares_remaining >= 1:
-                        self._panic_shares = result.shares_remaining
-                        self._panic_exited = False
-                        print(
-                            f"  Panic rebound exit (partial_recovery, partial): {result.shares:.0f} {self._panic_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                            f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                        )
-                    else:
-                        self._panic_exited = True
-                        profit = self._panic_exit_revenue - self._panic_cost
-                        self._record_panic_result(profit)
-                        print(
-                            f"  Panic rebound exit (partial_recovery): {result.shares:.0f} {self._panic_side} "
-                            f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}"
-                        )
-                return
-        threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
-        if not threshold_reached and not self._panic_trailing_armed:
-            return
-        if self._panic_shares * sell_price < 5.0:
-            return
-        if not self.dry_run and self._confirm_ws_sell_price:
-            probe = max(round(self._panic_shares * sell_price, 2), 1.0)
-            confirmed = self.executor.get_market_price(self._panic_token_id, "SELL", probe)
-            if confirmed > 0:
-                sell_price = confirmed
-                pnl = self._panic_exit_revenue + self._panic_shares * sell_price - self._panic_cost
-        threshold_reached = sell_price >= target and pnl >= self._panic_min_profit_usd
-        if self._profit_floor_exit_ready(
-            "Panic rebound", self._panic_shares, self._panic_cost,
-            sell_price, target, self._panic_min_profit_usd,
-            "_panic_trailing_armed", "panic", self._panic_token_id,
-            realized_revenue=self._panic_exit_revenue,
-        ):
-            if not self._exit_price_is_profitable(
-                "Panic rebound", self._panic_shares, self._panic_cost,
-                sell_price, self._panic_min_profit_usd, "panic", self._panic_token_id,
-                allow_below_min_profit=True, realized_revenue=self._panic_exit_revenue,
-            ):
-                return
-            result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
-            if result.success:
-                self._panic_exit_revenue += result.amount_usd
-                self.stats.bankroll += result.amount_usd
-                if result.status == PARTIAL and result.shares_remaining >= 1:
-                    self._panic_shares = result.shares_remaining
-                    self._panic_exited = False
-                    print(
-                        f"  Panic rebound exit (profit_floor, partial): {result.shares:.0f} {self._panic_side} "
-                        f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                        f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                    )
-                else:
-                    self._panic_exited = True
-                    profit = self._panic_exit_revenue - self._panic_cost
-                    self._record_panic_result(profit)
-                    print(f"  Panic rebound exit (profit_floor): {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
-            return
-        if not self._trailing_profit_exit_ready(
-            "Panic rebound", pnl, threshold_reached,
-            self._panic_profit_retreat_pct,
-            "_panic_trailing_armed", "_panic_peak_profit", "panic",
-        ):
-            return
-        if not self._exit_price_is_profitable(
-            "Panic rebound", self._panic_shares, self._panic_cost,
-            sell_price, self._panic_min_profit_usd, "panic", self._panic_token_id,
-            realized_revenue=self._panic_exit_revenue,
-        ):
-            return
-        result = self.executor.sell(self._panic_token_id, self._panic_shares, price=sell_price)
-        if result.success:
-            self._panic_exit_revenue += result.amount_usd
-            self.stats.bankroll += result.amount_usd
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                self._panic_shares = result.shares_remaining
-                self._panic_exited = False
-                print(
-                    f"  Panic rebound exit (partial): {result.shares:.0f} {self._panic_side} "
-                    f"@ ${result.price:.3f} = ${result.amount_usd:.2f} | "
-                    f"{result.shares_remaining:.0f} remaining -> keep monitoring"
-                )
-            else:
-                self._panic_exited = True
-                profit = self._panic_exit_revenue - self._panic_cost
-                self._record_panic_result(profit)
-                print(f"  Panic rebound exit: {result.shares:.0f} {self._panic_side} @ ${result.price:.3f} = ${result.amount_usd:.2f} | Profit ${profit:+.2f}")
+    def _waveform_available_start(self, window_start: int, target_start: float) -> float:
+        btc_first = self._first_sample_ts(self._btc_price_samples, segment=None, after_ts=target_start)
+        poly_first = self._first_sample_ts(self._poly_price_samples, segment=window_start, after_ts=target_start)
+        available = max(target_start, btc_first or target_start)
+        if available > target_start + 0.001:
+            print(
+                f"[latency] waveform start shifted: target {self._format_ts(target_start)} -> "
+                f"{self._format_ts(available)} "
+                f"(btc first {self._format_ts(btc_first) if btc_first else 'none'}, "
+                f"poly first {self._format_ts(poly_first) if poly_first else 'none'})"
+            )
+        return available
 
-    def _resolve_panic_rebound(self, closing_btc_price: float):
-        if not self._panic_traded or self._panic_exited:
-            return
-        if self.dry_run:
-            won = self._dry_run_resolution_won(self._panic_side, self._current_window)
-            if won is None:
-                print("  Panic rebound dry-run resolution pending Polymarket final result")
-                self._queue_dry_resolution(
-                    "panic", "Panic rebound", self._panic_side,
-                    self._panic_shares, self._panic_cost,
-                    self._panic_exit_revenue, self._current_window,
-                )
-                self._panic_exited = True
-                return
-        else:
-            won = False
-            if self._opening_price > 0 and closing_btc_price > 0:
-                won = (closing_btc_price >= self._opening_price) == (self._panic_side == "UP")
-        if won:
-            if self.dry_run:
-                revenue = self._panic_shares
-            else:
-                claim = self.executor.sell(self._panic_token_id, self._panic_shares, price=0.99)
-                if not claim.success:
-                    print(f"  Panic rebound claim not verified: {claim.error} - not booking win yet")
-                    return
-                revenue = claim.amount_usd
-            profit = revenue - self._panic_cost
-            self.stats.bankroll += revenue
-            self._record_panic_result(profit)
-            print(f"  Panic rebound resolved WIN +${profit:.2f}")
-        else:
-            loss = self._panic_cost - self._panic_exit_revenue
-            self._record_panic_result(-loss)
-            print(f"  Panic rebound resolved LOSS -${loss:.2f}")
-        self._panic_exited = True
+    def _first_sample_ts(
+        self,
+        samples: list[PriceSample],
+        segment: Optional[int],
+        after_ts: float,
+    ) -> Optional[float]:
+        for sample in samples:
+            if sample.ts >= after_ts and (segment is None or sample.segment == segment):
+                return sample.ts
+        return None
 
-    def _resolve_original_model(self, closing_btc_price: float):
-        if not self._original_traded or self._original_exited:
-            return
-        if self.dry_run:
-            won = self._dry_run_resolution_won(self._original_side, self._current_window)
-            if won is None:
-                print("  Original model dry-run resolution pending Polymarket final result")
-                self._queue_dry_resolution(
-                    "original", "Original model", self._original_side,
-                    self._original_shares, self._original_cost,
-                    self._original_exit_revenue, self._current_window,
-                )
-                self._original_exited = True
-                return
-        else:
-            winner = self._polymarket_winner_for_window(self._current_window)
-            if winner:
-                won = winner == self._original_side
-            elif self._opening_price > 0 and closing_btc_price > 0:
-                won = (closing_btc_price >= self._opening_price) == (self._original_side == "UP")
-            else:
-                print("  Original model resolution unknown - waiting for next window")
-                return
+    def _resample_price_series(
+        self,
+        samples: list[PriceSample],
+        start_ts: float,
+        end_ts: float,
+        step_seconds: float,
+        segment: Optional[int],
+    ) -> Optional[np.ndarray]:
+        points = [
+            sample for sample in samples
+            if sample.ts <= end_ts + self.waveform_max_sample_gap_seconds
+            and sample.ts >= start_ts - self.waveform_max_sample_gap_seconds
+            and (segment is None or sample.segment == segment)
+        ]
+        if len(points) < 2:
+            return None
+        points.sort(key=lambda sample: sample.ts)
+        ts = np.array([sample.ts for sample in points], dtype=np.float64)
+        prices = np.array([sample.price for sample in points], dtype=np.float64)
+        unique_ts, unique_indices = np.unique(ts, return_index=True)
+        unique_prices = prices[unique_indices]
+        if len(unique_ts) < 2:
+            return None
 
-        if won:
-            if self.dry_run:
-                revenue = self._original_shares
-            else:
-                revenue = self._original_shares
-                if self._original_shares * 0.99 >= 5.0:
-                    claim = self.executor.sell(self._original_token_id, self._original_shares, price=0.99)
-                    if claim.success:
-                        revenue = claim.amount_usd
-                    else:
-                        print(
-                            f"  Original model claim not verified: {claim.error} "
-                            "- booking resolution payout for strategy P&L"
-                        )
-                else:
-                    print("  Original model winning shares below $5 claim minimum - booking resolution payout")
-            profit = self._original_exit_revenue + revenue - self._original_cost
-            self.stats.bankroll += revenue
-            self._record_original_result(profit)
-            print(f"  Original model resolved WIN +${profit:.2f}")
-        else:
-            loss = self._original_cost - self._original_exit_revenue
-            self._record_original_result(-loss)
-            print(f"  Original model resolved LOSS -${loss:.2f}")
-        self._original_exited = True
+        first_idx = int(np.searchsorted(unique_ts, start_ts, side="right") - 1)
+        if first_idx < 0:
+            return None
+        grid = np.arange(start_ts, end_ts, step_seconds, dtype=np.float64)
+        if len(grid) < self.waveform_min_points:
+            return None
+        if len(grid) <= 0 or grid[0] < unique_ts[0] or grid[-1] > unique_ts[-1]:
+            return None
 
-    # 鈹€鈹€ Market prices (cached, complement engine) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        if segment is not None:
+            return self._resample_poly_price_series(unique_ts, unique_prices, grid, step_seconds)
 
-    def _compute_realized_vol(self) -> float:
-        """Rolling std dev of recent window closing deltas.
+        right_indices = np.searchsorted(unique_ts, grid, side="left")
+        exact = (right_indices < len(unique_ts)) & np.isclose(unique_ts[right_indices], grid, rtol=0.0, atol=1e-9)
+        left_indices = np.where(exact, right_indices, right_indices - 1)
+        right_indices = np.where(exact, right_indices, right_indices)
+        if np.any(left_indices < 0) or np.any(right_indices >= len(unique_ts)):
+            return None
+        bracket_gaps = unique_ts[right_indices] - unique_ts[left_indices]
+        if float(np.max(bracket_gaps)) > self.waveform_max_sample_gap_seconds:
+            return None
+        return np.interp(grid, unique_ts, unique_prices)
 
-        Returns the realized vol to pass into the Brownian motion model.
-        Falls back to 0.12 until at least 6 windows have accumulated.
-        Floored/capped to prevent extreme values breaking the model.
-        """
-        min_samples = max(6, self._rolling_vol_windows // 2)
-        if len(self._recent_window_deltas) >= min_samples:
-            vol = statistics.stdev(self._recent_window_deltas)
-            return max(self._vol_floor, min(self._vol_cap, vol))
-        return self._vol_fallback
+    def _resample_poly_price_series(
+        self,
+        ts: np.ndarray,
+        prices: np.ndarray,
+        grid: np.ndarray,
+        step_seconds: float,
+    ) -> Optional[np.ndarray]:
+        bin_sums = np.zeros(len(grid), dtype=np.float64)
+        bin_counts = np.zeros(len(grid), dtype=np.int32)
+        raw_indices = np.rint((ts - grid[0]) / step_seconds).astype(np.int64)
+        valid = (raw_indices >= 0) & (raw_indices < len(grid))
+        for idx, price in zip(raw_indices[valid], prices[valid]):
+            bin_sums[idx] += float(price)
+            bin_counts[idx] += 1
 
-    def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
-        if self.dry_run or not self.executor._initialized:
-            if self._opening_price <= 0:
-                return 0.50, 0.50
-            delta_pct = (btc_price - self._opening_price) / self._opening_price
-            time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
-            lag_factor = min(time_factor * 0.7, 0.85)
-            implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
-            up = round(min(max(implied, 0.02), 0.98), 3)
-            return up, round(1.0 - up, 3)
+        known = bin_counts > 0
+        if int(np.count_nonzero(known)) < self.waveform_min_points:
+            return None
 
-        market = self._ensure_market_subscription()
-        if market:
-            up_live = self._live_token_price(market.token_id_up)
-            down_live = self._live_token_price(market.token_id_down)
-            if up_live and down_live:
-                up_price = up_live.best_ask or up_live.last_trade or up_live.mid
-                down_price = down_live.best_ask or down_live.last_trade or down_live.mid
-                if up_price > 0 and down_price > 0:
-                    self._cached_up = up_price
-                    self._cached_down = down_price
-                    return up_price, down_price
+        binned = np.full(len(grid), np.nan, dtype=np.float64)
+        binned[known] = bin_sums[known] / bin_counts[known]
+        known_indices = np.flatnonzero(known)
+        max_missing_bins = max(1, int(math.ceil(self.waveform_max_sample_gap_seconds / step_seconds)))
+        if int(np.max(np.diff(known_indices))) > max_missing_bins:
+            return None
+        if known_indices[0] > 0 or known_indices[-1] < len(grid) - 1:
+            return None
+        all_indices = np.arange(len(grid), dtype=np.float64)
+        return np.interp(all_indices, known_indices.astype(np.float64), binned[known])
 
+    def _anchor_waveform(self, values: np.ndarray) -> Optional[np.ndarray]:
+        if len(values) < self.waveform_min_points:
+            return None
+        return values.astype(np.float64) - float(values[0])
+
+    def _waveform_range(self, values: Optional[np.ndarray]) -> float:
+        if values is None or len(values) <= 0:
+            return 0.0
+        return float(np.max(values) - np.min(values))
+
+    def _maybe_print_calibration_debug(self) -> None:
         now = time.time()
-        if now - self._price_last_fetched < self._PRICE_REFRESH:
-            return self._cached_up, self._cached_down
+        if now - self._last_calibration_debug_ts < 30:
+            return
+        self._last_calibration_debug_ts = now
+        print(f"[latency] calibration pending: {self._calibration_debug_reason}")
 
+    def _format_ts(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+
+    def _sample_span_debug(self, samples: list[PriceSample], segment: Optional[int]) -> str:
+        selected = [sample for sample in samples if segment is None or sample.segment == segment]
+        if not selected:
+            return "samples=0"
+        gaps = [
+            (selected[i].ts - selected[i - 1].ts) * 1000.0
+            for i in range(1, len(selected))
+            if selected[i].ts > selected[i - 1].ts
+        ]
+        gap_text = (
+            f", max_gap={max(gaps):.0f}ms, avg_gap={sum(gaps) / len(gaps):.0f}ms"
+            if gaps
+            else ""
+        )
+        return (
+            f"samples={len(selected)}, first={self._format_ts(selected[0].ts)}, "
+            f"last={self._format_ts(selected[-1].ts)}{gap_text}"
+        )
+
+    def _clob_ok_for_trade(self) -> bool:
+        if self.dry_run:
+            return True
         try:
-            market = self._ensure_market_subscription()
-            if not market:
-                return self._cached_up, self._cached_down
+            ok = bool(self.executor.client and self.executor.client.get_ok())
+        except Exception as exc:
+            ok = False
+            print(f"  CLOB health check failed: {exc}")
 
-            probe_amount = 5.0
-            up_price = self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
-            down_price = self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
+        if ok:
+            self._consecutive_clob_failures = 0
+            return True
 
-            if up_price <= 0 and down_price <= 0:
-                return self._cached_up, self._cached_down
-            if up_price <= 0:
-                up_price = round(1.0 - down_price, 3)
-            if down_price <= 0:
-                down_price = round(1.0 - up_price, 3)
+        self._consecutive_clob_failures += 1
+        if self._consecutive_clob_failures >= 3:
+            self._clob_halted = True
+            self.telegram.error_alert("CLOB health failed 3 times; trading halted until next window recovery.")
+        return False
 
-            self._cached_up = up_price
-            self._cached_down = down_price
-            self._price_last_fetched = now
+    def _strategy_is_cooling_down(self) -> bool:
+        if self._strategy_cooldown_until <= 0:
+            return False
+        remaining = self._strategy_cooldown_until - time.time()
+        if remaining <= 0:
+            self._strategy_cooldown_until = 0.0
+            print("  Strategy cooldown expired - entries enabled")
+            return False
+        return True
 
-            return up_price, down_price
-
-        except Exception as e:
-            print(f"[price] Error: {e}")
-            return self._cached_up, self._cached_down
-
-    # 鈹€鈹€ Entry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    def _place_trend_buy(self, sig, seconds_remaining: float, token_id: str, hint_price: float):
-        slug = f"btc-updown-{self.period}m-{self._current_window}"
-        trade_amount = round(sig.kelly_size, 2)
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
-
-        if result.success:
-            self._consecutive_buy_failures = 0
-            self._traded = True
-            self._trade_side = sig.side
-            self._trade_price = result.price
-            self._trade_cost = result.amount_usd
-            self._trade_shares = result.shares
-            self._trade_token_id = token_id
-            self._trend_trailing_armed = False
-            self._trend_peak_profit = 0.0
-            self._exit_profit_history.pop("trend", None)
-
-            self.stats.bankroll -= result.amount_usd
-            self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
-
-            btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-            self.tracker.log_signal(
-                window_ts=self._current_window,
-                btc_price=btc_approx,
-                opening_price=self._opening_price,
-                up_price=self._cached_up,
-                down_price=self._cached_down,
-                seconds_remaining=seconds_remaining,
-                side=sig.side,
-                true_prob=sig.true_prob,
-                market_price=sig.market_price,
-                edge=sig.edge,
-                kelly_size=sig.kelly_size,
-                action="traded",
-                actual_price=result.price,
-                actual_edge=sig.true_prob - result.price,
-                fill_price=result.price,
-            )
-            self.tracker.log_trade_entry(
-                window_ts=self._current_window,
-                side=sig.side,
-                entry_price=result.price,
-                entry_shares=result.shares,
-                entry_cost=result.amount_usd,
-                edge=sig.edge,
-                prob=sig.true_prob,
-                btc_delta=sig.btc_delta_pct,
-                seconds_remaining=seconds_remaining,
-                entry_delta_pct=sig.btc_delta_pct,
-                entry_seconds_remaining=seconds_remaining,
-            )
-
-            mode = "PAPER" if self.dry_run else "LIVE"
-            print(f"  閴?{mode}: {result.shares:.0f} shares @ "
-                  f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     Watching live Polymarket bid for profit exit")
-
-            self.telegram.strategy_trade_alert(
-                strategy="Trend follow",
-                side=sig.side,
-                price=result.price,
-                amount=result.amount_usd,
-                market_slug=slug,
-                dry_run=self.dry_run,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
+    def _update_strategy_drawdown_guard(self) -> None:
+        self._strategy_pnl_peak = max(self._strategy_pnl_peak, self.realized_pnl)
+        if self.strategy_peak_loss_drop <= 0:
             return
-
-        if result.error == "UNVERIFIED_BUY":
-            self._pending_buy_side = sig.side
-            self._pending_buy_price = result.price
-            self._pending_buy_amount = result.amount_usd
-            self._pending_buy_shares = result.shares
-            self._pending_buy_token_id = token_id
-            self._pending_buy_edge = sig.edge
-            self._pending_buy_delta = sig.btc_delta_pct
-            self._pending_buy_order_id = result.order_id
-            self._pending_buy_last_check = 0.0
-            self._balance_before_buy = self.stats.bankroll
-            self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
-            self._pending_buy_started_at = time.time()
-            self._pending_buy_window = self._current_window
-            print(f"  Buy sent but unverified - will poll order API and balance")
+        drawdown = self._strategy_pnl_peak - self.realized_pnl
+        if drawdown < self.strategy_peak_loss_drop:
             return
-
-        print(f"  閴?Buy failed: {result.error}")
-        err = str(result.error).lower()
-        if "request exception" in err or "service not ready" in err or "status_code=none" in err:
-            self._consecutive_buy_failures += 1
-            if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
-                self._clob_halted = True
-                msg = (f"棣冩敳 CLOB HALTED after {self._consecutive_buy_failures} "
-                       f"consecutive API failures 閳?stopping trades until restart")
-                print(f"\n  {msg}")
-                self.telegram.status_update({"alert": msg})
-
-    def _execute_trade(self, sig, seconds_remaining: float):
-        self._trade_attempted = True
-
-        if not self._check_risk_limits("trend", "trend trade"):
-            return
-
-        # 鈹€鈹€ Circuit breaker: CLOB health check 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-        if self._clob_halted:
-            print(f"  馃攲 CLOB HALTED 鈥?skipping trade ({self._consecutive_buy_failures} consecutive failures)")
-            return
-
-        if not self.dry_run and self.executor._initialized:
-            try:
-                self.executor.client.get_ok()
-            except Exception as e:
-                self._consecutive_buy_failures += 1
-                print(f"  馃攲 CLOB health check failed: {e}")
-                if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
-                    self._clob_halted = True
-                    msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
-                           f"consecutive health check failures 鈥?stopping trades until recovery")
-                    print(f"\n  {msg}")
-                    self.telegram.status_update({"alert": msg})
-                return
-
-        market = self._ensure_market_subscription()
-        token_id = ""
-        if market:
-            token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
-        else:
-            token_id = f"DRY-{sig.side}-{self._current_window}"
-
-        slug = f"btc-updown-{self.period}m-{self._current_window}"
-        trade_amount = round(sig.kelly_size, 2)
-
-        print(f"\n  馃幆 {sig.side} | edge={sig.edge:.3f} | "
-              f"prob={sig.true_prob:.2f} | BTC 螖={sig.btc_delta_pct:+.3f}%")
-        print(f"     Amount: ${trade_amount:.2f} | T-{seconds_remaining:.0f}s")
-
-        # Preview actual market price, re-check edge, then pass price into buy()
-        # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
-        hint_price = 0.0
-        if self.dry_run:
-            hint_price = self._cached_up if sig.side == "UP" else self._cached_down
-        elif self.executor._initialized:
-            live_price = self._live_token_price(token_id)
-            if live_price:
-                print(
-                    f"  WS {sig.side}: bid ${live_price.best_bid:.3f} | "
-                    f"ask ${live_price.best_ask:.3f} | last ${live_price.last_trade:.3f}"
-                )
-            actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
-            if actual_price > 0:
-                actual_edge = sig.true_prob - actual_price
-                print(
-                    f"  Executable buy price for ${trade_amount:.2f}: "
-                    f"${actual_price:.3f} (edge: {actual_edge:.3f})"
-                )
-
-                if False and actual_edge < self.strategy_config.min_edge:
-                    print(f"  鈿狅笍  Edge gone at market price 鈥?skipping")
-                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                    self.tracker.log_signal(
-                        window_ts=self._current_window,
-                        btc_price=btc_approx,
-                        opening_price=self._opening_price,
-                        up_price=self._cached_up,
-                        down_price=self._cached_down,
-                        seconds_remaining=seconds_remaining,
-                        side=sig.side,
-                        true_prob=sig.true_prob,
-                        market_price=actual_price,
-                        edge=actual_edge,
-                        kelly_size=sig.kelly_size,
-                        action="skipped_edge_gone",
-                        skip_reason="edge_gone_at_market",
-                        actual_price=actual_price,
-                        actual_edge=actual_edge,
-                    )
-                    return
-
-                hint_price = actual_price
-
-        cap_price = max_buy_price()
-        if hint_price > cap_price:
-            print(f"  SKIP: buy price ${hint_price:.3f} > MAX_BUY_PRICE ${cap_price:.2f}")
-            self.tracker.log_signal(
-                window_ts=self._current_window,
-                btc_price=self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0,
-                opening_price=self._opening_price,
-                up_price=self._cached_up,
-                down_price=self._cached_down,
-                seconds_remaining=seconds_remaining,
-                side=sig.side,
-                true_prob=sig.true_prob,
-                market_price=hint_price,
-                edge=sig.edge,
-                kelly_size=sig.kelly_size,
-                action="skipped_price_cap",
-                skip_reason="buy_price_above_cap",
-                actual_price=hint_price,
-            )
-            return
-
-        print(f"  BUY CONDITION TRIGGERED [Trend follow]: {sig.side} - executing immediately")
-        self._place_trend_buy(sig, seconds_remaining, token_id, hint_price)
-        return
-
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
-
-        if result.success:
-            self._consecutive_buy_failures = 0  # Reset circuit breaker
-            self._traded = True
-            self._trade_side = sig.side
-            self._trade_price = result.price
-            self._trade_cost = result.amount_usd
-            self._trade_shares = result.shares
-            self._trade_token_id = token_id
-            self._trend_trailing_armed = False
-            self._trend_peak_profit = 0.0
-
-            self.stats.bankroll -= result.amount_usd
-            self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
-
-            btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-            self.tracker.log_signal(
-                window_ts=self._current_window,
-                btc_price=btc_approx,
-                opening_price=self._opening_price,
-                up_price=self._cached_up,
-                down_price=self._cached_down,
-                seconds_remaining=seconds_remaining,
-                side=sig.side,
-                true_prob=sig.true_prob,
-                market_price=sig.market_price,
-                edge=sig.edge,
-                kelly_size=sig.kelly_size,
-                action="traded",
-                actual_price=result.price,
-                actual_edge=sig.true_prob - result.price,
-                fill_price=result.price,
-            )
-            self.tracker.log_trade_entry(
-                window_ts=self._current_window,
-                side=sig.side,
-                entry_price=result.price,
-                entry_shares=result.shares,
-                entry_cost=result.amount_usd,
-                edge=sig.edge,
-                prob=sig.true_prob,
-                btc_delta=sig.btc_delta_pct,
-                seconds_remaining=seconds_remaining,
-                entry_delta_pct=sig.btc_delta_pct,
-                entry_seconds_remaining=seconds_remaining,
-            )
-
-            mode = "PAPER" if self.dry_run else "LIVE"
-            print(f"  鉁?{mode}: {result.shares:.0f} shares @ "
-                  f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     Watching live Polymarket bid for profit exit")
-
-            self.telegram.strategy_trade_alert(
-                strategy="Trend follow",
-                side=sig.side,
-                price=result.price,
-                amount=result.amount_usd,
-                market_slug=slug,
-                dry_run=self.dry_run,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
-        else:
-            if result.error == "UNVERIFIED_BUY":
-                # Order likely filled but Polygon hasn't settled.
-                # Save details 鈥?window boundary sync will detect the fill.
-                self._pending_buy_side = sig.side
-                self._pending_buy_price = result.price
-                self._pending_buy_amount = result.amount_usd
-                self._pending_buy_shares = result.shares
-                self._pending_buy_token_id = token_id
-                self._pending_buy_edge = sig.edge
-                self._pending_buy_delta = sig.btc_delta_pct
-                self._pending_buy_order_id = result.order_id
-                self._pending_buy_last_check = 0.0
-                self._balance_before_buy = self.stats.bankroll
-                self._pending_buy_token_balance_before = self.executor.get_token_balance(token_id)
-                self._pending_buy_started_at = time.time()
-                self._pending_buy_window = self._current_window
-                print(f"  Buy sent but unverified - will poll order API and balance")
-            else:
-                print(f"  鉂?Buy failed: {result.error}")
-                # Circuit breaker: track consecutive API failures
-                err = str(result.error).lower()
-                if "request exception" in err or "service not ready" in err or "status_code=none" in err:
-                    self._consecutive_buy_failures += 1
-                    if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
-                        self._clob_halted = True
-                        msg = (f"馃攲 CLOB HALTED after {self._consecutive_buy_failures} "
-                               f"consecutive API failures 鈥?stopping trades until restart")
-                        print(f"\n  {msg}")
-                        self.telegram.status_update({"alert": msg})
-
-    # 鈹€鈹€ Resolve (partial fill aware) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-    def _resolve_previous_trade(self):
-        if self._exited:
-            profit = self._exit_revenue - self._trade_cost
-            self._record_trend_result(profit)
-            result_emoji = "鉁?WIN" if profit > 0 else "鉂?LOSS"
-            residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
-            print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.strategy_result_alert(
-                strategy="Trend follow",
-                profit=profit,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.log_trade_resolve(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=profit > 0,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="exited",
-            )
-            return
-
-        original_cost = self._trade_cost
-        remaining_shares = self._trade_shares
-
-        # 鈹€鈹€ Dry run: Binance price fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-        if self.dry_run:
-            won = self._dry_run_resolution_won(self._trade_side, self._current_window)
-            if won is None:
-                print("  Trend follow dry-run resolution pending Polymarket final result")
-                self._queue_dry_resolution(
-                    "trend", "Trend follow", self._trade_side,
-                    remaining_shares, original_cost,
-                    self._exit_revenue, self._current_window,
-                )
-                return
-            self._record_resolution(
-                won=won,
-                original_cost=original_cost,
-                remaining_shares=remaining_shares,
-                resolution_method=self._winner_resolution_method(self._current_window),
-                claim_revenue=0.0,
-                claim_result=self._winner_source_cache.get(self._current_window, "gamma_final"),
-            )
-            return
-
-        # 鈹€鈹€ Live: attempt claim sell first 鈥?result is the truth 鈹€鈹€鈹€鈹€鈹€
-        # Binance price and oracle can disagree when BTC is near the opening
-        # price at resolution. The claim sell result is ground truth:
-        #   - Sell succeeds at ~$0.99 鈫?shares had value 鈫?won
-        #   - "no match" or near-zero fill 鈫?shares worthless 鈫?lost
-        won = None
-        claim_revenue = 0.0
-        claim_result = "not_attempted"
-        resolution_method = "claim_sell"
-
-        claim_notional = remaining_shares * 0.99
-        live_token = (self._trade_token_id
-                      and not self._trade_token_id.startswith("DRY-")
-                      and self.executor._initialized)
-
-        # Short-circuit: if last observed sell price is below $0.50, market has
-        # already priced these shares as worthless 鈥?skip the claim API call.
-        if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
-            self._record_trend_result(profit)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  鉂?LOSS{partial_note} -${net_loss:.2f} [market_price] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.strategy_result_alert(
-                strategy="Trend follow",
-                profit=profit,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.log_trade_resolve(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=False,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="market_price",
-                claim_result="skipped_losing",
-            )
-            return
-
-        pre_sell_balance = 0.0
-        if live_token and claim_notional >= 5.0:
-            print(f"  馃挵 Claiming: sell {remaining_shares:.0f} shares @ $0.99...")
-            pre_sell_balance = self.executor.get_balance()
-            claim = self.executor.sell(
-                token_id=self._trade_token_id,
-                shares=remaining_shares,
-                price=0.99,
-            )
-            if claim.success and claim.amount_usd > remaining_shares * 0.50:
-                # API says success 鈥?verify with balance check to catch phantom fills
-                time.sleep(2)
-                post_sell_balance = self.executor.get_balance()
-                balance_increase = max(0.0, post_sell_balance - pre_sell_balance) if (
-                    pre_sell_balance > 0 and post_sell_balance > 0
-                ) else claim.amount_usd
-                if balance_increase > remaining_shares * 0.99 * 0.50:
-                    # Balance confirmed 鈥?real fill
-                    won = True
-                    claim_revenue = claim.amount_usd
-                    claim_result = "filled"
-                    self.stats.bankroll += claim_revenue
-                else:
-                    # API said success but no USDC arrived yet 鈥?defer to next window
-                    print(f"  鈴?Possible phantom sell "
-                          f"(api=${claim.amount_usd:.2f}, balance_increase=${balance_increase:.2f})"
-                          f" 鈥?deferring to next window balance sync")
-            elif "no match" in claim.error.lower() or (
-                claim.success and claim.amount_usd < remaining_shares * 0.10
-            ):
-                # No buyers for these shares 鈫?shares worthless 鈫?definitive loss
-                won = False
-                claim_result = "no_match"
-            elif "not enough balance" in claim.error.lower():
-                # Tracked share count is slightly above on-chain balance (rounding).
-                # Retry with one fewer share to clear the discrepancy.
-                retry_shares = int(remaining_shares) - 1
-                print(f"  馃攧 Rounding fix: retrying claim with {retry_shares} shares...")
-                if retry_shares > 0 and float(retry_shares) * 0.99 >= 5.0:
-                    retry = self.executor.sell(
-                        token_id=self._trade_token_id,
-                        shares=float(retry_shares),
-                        price=0.99,
-                    )
-                    if retry.success and retry.amount_usd > retry_shares * 0.50:
-                        time.sleep(2)
-                        post_bal = self.executor.get_balance()
-                        balance_increase = max(0.0, post_bal - pre_sell_balance)
-                        if balance_increase > float(retry_shares) * 0.99 * 0.50:
-                            won = True
-                            claim_revenue = retry.amount_usd
-                            claim_result = "filled"
-                            self.stats.bankroll += claim_revenue
-                        # else: retry succeeded but balance unconfirmed 鈥?fall to defer
-                # else: retry failed or too small 鈥?fall to defer (won still None)
-            # else: any other error 鈥?fall to defer (won still None)
-        else:
-            if live_token and claim_notional < 5.0:
-                print(f"  馃挵 {remaining_shares:.0f} shares below $5 min 鈥?deferring to auto-resolution")
-
-        # 鈹€鈹€ Deferred fallback 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-        # The old balance check fired before auto-resolution settled on-chain.
-        # Any unresolved case is now deferred to the next window boundary
-        # (~5 min), where Polygon settlement is guaranteed to have landed.
-        if won is None:
-            if not live_token:
-                # No valid token/executor 鈥?Binance price as last resort
-                btc_price, _ = self.price_feed.get_price()
-                if self._opening_price > 0 and btc_price > 0:
-                    won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-                    resolution_method = "binance_fallback"
-                    print(f"  鈿狅笍  No live token 鈥?using Binance fallback")
-                else:
-                    print(f"  鈿狅笍  Cannot determine resolution outcome 鈥?skipping")
-                    return
-            else:
-                if pre_sell_balance <= 0:
-                    pre_sell_balance = self.executor.get_balance()
-                print(f"  鈴?Resolution deferred to next window balance sync")
-                self._pending_phantom = {
-                    "pre_sell_balance": pre_sell_balance,
-                    "expected_revenue": remaining_shares * 0.99,
-                    "cost": original_cost,
-                    "exit_revenue": self._exit_revenue,
-                    "shares": remaining_shares,
-                    "side": self._trade_side,
-                    "token_id": self._trade_token_id,
-                    "window_ts": self._current_window,
-                    "opening_price": self._opening_price,
-                }
-                return
-
-        if won is None:
-            return
-
-        self._record_resolution(
-            won=won,
-            original_cost=original_cost,
-            remaining_shares=remaining_shares,
-            resolution_method=resolution_method,
-            claim_revenue=claim_revenue,
-            claim_result=claim_result,
+        self._strategy_cooldown_until = time.time() + max(0.0, self.strategy_cooling_down_period)
+        print(
+            f"  Strategy peak drawdown ${drawdown:.2f} >= "
+            f"${self.strategy_peak_loss_drop:.2f}; cooling down "
+            f"{self.strategy_cooling_down_period:.0f}s"
+        )
+        self.telegram.error_alert(
+            f"Strategy cooldown: peak drawdown ${drawdown:.2f} >= "
+            f"${self.strategy_peak_loss_drop:.2f}"
         )
 
-    def _record_resolution(
-        self, won: bool, original_cost: float, remaining_shares: float,
-        resolution_method: str, claim_revenue: float, claim_result: str = "not_attempted",
-    ):
-        """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
-        if won:
-            resolution_payout = 0.0
-            if claim_revenue > 0:
-                total_received = self._exit_revenue + claim_revenue
-            else:
-                resolution_payout = remaining_shares * 1.0
-                total_received = self._exit_revenue + resolution_payout
-                self.stats.bankroll += resolution_payout
-                self._unclaimed_winnings += resolution_payout
-            profit = total_received - original_cost
-            self._record_trend_result(profit)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            claimed_note = (
-                f" (claimed ${claim_revenue:.2f})"
-                if claim_revenue > 0
-                else f" (unclaimed payout ${resolution_payout:.2f})"
-            )
-            print(f"  鉁?WIN{partial_note}{claimed_note} +${profit:.2f} [{resolution_method}] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.strategy_result_alert(
-                strategy="Trend follow",
-                profit=profit,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
-        else:
-            net_loss = original_cost - self._exit_revenue
-            profit = -net_loss
-            self._record_trend_result(profit)
-            partial_note = f" (partial exit ${self._exit_revenue:.2f})" if self._exit_revenue > 0 else ""
-            print(f"  鉂?LOSS{partial_note} -${net_loss:.2f} [{resolution_method}] | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            self.telegram.strategy_result_alert(
-                strategy="Trend follow",
-                profit=profit,
-                strategy_pnl=self._strategy_pnl.get("trend", 0.0),
-                total_pnl=self.stats.total_pnl,
-            )
+    def _probe_clob_recovery(self) -> None:
+        if not self._clob_halted or self.dry_run:
+            return
+        try:
+            if self.executor.client and self.executor.client.get_ok():
+                self._clob_halted = False
+                self._consecutive_clob_failures = 0
+                print("  CLOB recovered - trading resumed")
+                self.telegram.send("*CLOB recovered* - trading resumed")
+        except Exception:
+            pass
 
-        btc_price, _ = self.price_feed.get_price()
-        self.tracker.log_trade_resolve(
-            btc_final_price=btc_price,
-            opening_price=self._opening_price,
-            won=won,
-            profit=profit,
-            exit_revenue=self._exit_revenue,
-            resolution_method=resolution_method,
-            claim_result=claim_result,
+    def _check_daily_loss_limit(self) -> None:
+        if self.dry_run or self.daily_loss_limit <= 0:
+            return
+        balance = self.executor.get_balance(refresh=False)
+        if balance <= 0:
+            return
+        pnl = balance - self.session_start_balance
+        if pnl <= -self.daily_loss_limit:
+            self._running = False
+            self.telegram.error_alert(f"Daily loss limit hit: ${pnl:.2f}")
+            print(f"Daily loss limit hit: ${pnl:.2f}; stopping.")
+
+    def _print_status(self) -> None:
+        now = time.time()
+        if now - self._last_status_ts < self.status_interval:
+            return
+        self._last_status_ts = now
+
+        pos = "flat"
+        if self.position and not self.position.closed:
+            pos = f"UP {self.position.shares:.0f} @ ${self.position.entry_price:.2f}"
+        elif self._strategy_is_cooling_down():
+            pos = f"cooldown {self._strategy_cooldown_until - time.time():.0f}s"
+        seconds = self.market.seconds_remaining if self.market else 0.0
+        print(
+            f"[status] BTC ${self.current_btc_price:,.2f} | T-{seconds:.0f}s | "
+            f"{pos} | waveform-latency {self._latency_avg_ms:.0f}ms/{len(self._latency_samples_ms)} "
+            f"({'locked' if len(self._latency_samples_ms) >= self.waveform_min_baseline_samples else 'collecting'}, "
+            f"windows {len(self._window_latency_matches)}) | "
+            f"feed gaps {self._feed_gap_summary()} | "
+            f"baseline {self.strategy.baseline_summary()}"
         )
 
-    # 鈹€鈹€ Hourly + shutdown 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    def _feed_gap_summary(self) -> str:
+        now = time.time()
+        return (
+            f"btc last/max/avg {self._format_gap('btc', now)}; "
+            f"poly last/max/avg {self._format_gap('poly', now)}"
+        )
 
-    def _check_hourly_summary(self):
-        current_hour = int(time.time() // 3600)
-        if current_hour != self._last_hour_check:
-            self._last_hour_check = current_hour
-            h = self.stats.hourly.to_dict()
-            o = self.stats.to_dict()
+    def _format_gap(self, source: str, now: float) -> str:
+        stats = self._feed_gap_stats[source]
+        current_gap_ms = (now - stats.last_ts) * 1000.0 if stats.last_ts > 0 else 0.0
+        last_gap_ms = max(stats.last_gap_ms, current_gap_ms)
+        max_gap_ms = max(stats.max_gap_ms, current_gap_ms)
+        return f"{last_gap_ms:.0f}/{max_gap_ms:.0f}/{stats.avg_gap_ms:.0f}ms"
 
-            # Sync real balance for accuracy
-            if not self.dry_run and self.executor._initialized:
-                real_bal = self.executor.get_balance()
-                if real_bal > 0:
-                    self.stats.bankroll = real_bal
-                    self._last_real_balance = real_bal
-                    o["bankroll"] = real_bal
-
-            real_pnl = self.stats.bankroll - self._session_start_balance
-
-            print("\n" + "=" * 55)
-            print("  HOURLY SUMMARY")
-            print(f"  This hour: {h['trades']} trades | "
-                  f"{h['wins']}W/{h['losses']}L | "
-                  f"P&L: ${h['pnl']:+.2f}")
-            if h['trades'] > 0:
-                print(f"  Avg edge: {h['avg_edge']*100:.1f}%")
-            print(f"  Windows: {h['windows_seen']} seen, "
-                  f"{h['windows_skipped']} skipped")
-            print(f"  Overall: {o['total_trades']} trades | "
-                  f"P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
-            print(f"  Real P&L (balance): ${real_pnl:+.2f} "
-                  f"(${self._session_start_balance:.2f} -> ${self.stats.bankroll:.2f})")
-            if self._unclaimed_winnings > 0:
-                print(f"  Unclaimed: ${self._unclaimed_winnings:.2f}")
-            print("=" * 55 + "\n")
-            self.telegram.hourly_summary(h, o)
-            self.stats.hourly.reset()
-
-    def _handle_shutdown(self, signum, frame):
-        print(f"\n\n馃洃 Shutting down...")
+    def _handle_shutdown(self, *_):
+        print("\nStopping PolyBot...")
         self._running = False
         self.price_feed.stop()
         self.poly_feed.stop()
-        if self.executor._initialized:
-            self.executor.cancel_all()
+        self.telegram.send("*PolyBot stopped*")
 
-        # Final real balance sync
-        if not self.dry_run and self.executor._initialized:
-            real_bal = self.executor.get_balance()
-            if real_bal > 0:
-                self.stats.bankroll = real_bal
-                self._last_real_balance = real_bal
-
-        real_pnl = self.stats.bankroll - self._session_start_balance
-        o = self.stats.to_dict()
-        print("\n" + "=" * 55)
-        print(f"  FINAL: {o['total_trades']} trades | "
-              f"{o['wins']}W/{o['losses']}L | "
-              f"WR: {o['win_rate']:.1f}%")
-        print(f"  Tracked P&L: ${o['pnl']:+.2f} | Bank: ${o['bankroll']:.2f}")
-        print(f"  Real P&L: ${real_pnl:+.2f} "
-              f"(${self._session_start_balance:.2f} -> ${self.stats.bankroll:.2f})")
-        if self._unclaimed_winnings > 0:
-            print(f"  Unclaimed: ${self._unclaimed_winnings:.2f}")
-        print("=" * 55)
-
-        self.telegram.status_update(o)
-
-        self.tracker.log_session(
-            start_time=self._session_start_time,
-            end_time=time.time(),
-            start_balance=self._session_start_balance,
-            end_balance=self.stats.bankroll,
-            tracked_pnl=o["pnl"],
-            trades=o["total_trades"],
-            wins=o["wins"],
-            losses=o["losses"],
-            avg_entry_price=self.stats.hourly.avg_edge,   # proxy via hourly stats
-            avg_edge=self.stats.hourly.avg_edge,
-            avg_delta=self.stats.hourly.avg_delta,
-        )
-
-        time.sleep(1)
-        sys.exit(0)
+    def _as_float(self, value) -> float:
+        try:
+            if value in ("", None):
+                return 0.0
+            return float(value)
+        except Exception:
+            return 0.0
 
 
 if __name__ == "__main__":
-    bot = PolyBot()
-    bot.start()
-
-
+    PolyBot().start()
