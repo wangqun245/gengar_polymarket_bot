@@ -1,0 +1,30 @@
+﻿{
+    "updated_at":  "2026-05-19T15:02:22",
+    "count":  3,
+    "models":  [
+                   {
+                       "file":  "edge_t3s_p2c_btc20_qty20_fifo10.json",
+                       "time_buckets":  100,
+                       "poly_buckets":  50,
+                       "btc_bins":  20,
+                       "qty_bins":  20,
+                       "fifo":  10
+                   },
+                   {
+                       "file":  "edge_t4s_p3c_btc20_qty20_fifo10.json",
+                       "time_buckets":  75,
+                       "poly_buckets":  33,
+                       "btc_bins":  20,
+                       "qty_bins":  20,
+                       "fifo":  10
+                   },
+                   {
+                       "file":  "edge_t5s_p5c_btc20_qty20_fifo20.json",
+                       "time_buckets":  60,
+                       "poly_buckets":  20,
+                       "btc_bins":  20,
+                       "qty_bins":  20,
+                       "fifo":  20
+                   }
+               ]
+}

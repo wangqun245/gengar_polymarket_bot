@@ -12,7 +12,7 @@ class TelegramNotifier:
     def __init__(self, bot_token: str = None, chat_id: str = None):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
-        self.title_suffix = os.getenv("TELEGRAM_TITLE_SUFFIX", "_EU")
+        self.title_suffix = os.getenv("TELEGRAM_TITLE_SUFFIX", "_EUWEST1")
         self.enabled = bool(self.bot_token and self.chat_id)
         if not self.enabled:
             print("[telegram] No token/chat_id configured — notifications disabled")

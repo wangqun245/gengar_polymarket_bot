@@ -1,7 +1,7 @@
 """Single latency strategy for BTC 5-minute Polymarket markets.
 
 The strategy watches Binance trade prints in fixed 50ms buckets and compares
-the newest bucket with rolling baseline statistics from the last few hours.
+the newest signal window with rolling baseline statistics from the last few hours.
 It enters UP when Binance price and trade volume both spike upward, then exits
 when Binance price abruptly reverses downward on elevated volume, provided the
 Polymarket sell price clears the configured minimum profit.
@@ -147,6 +147,7 @@ class BucketStats:
 class PushPricePoint:
     ts: float
     price: float
+    qty: float = 0.0
 
 
 @dataclass
@@ -163,6 +164,7 @@ class PushDeviationStats:
     mean_shift_z: float
     std_ratio: float
     direction: str
+    source: str = "window"
 
 
 @dataclass
@@ -191,6 +193,7 @@ class StrategySignal:
     push_current_std: float = 0.0
     push_mean_shift_z: float = 0.0
     push_std_ratio: float = 0.0
+    push_source: str = "window"
 
 
 class LatencySpikeStrategy:
@@ -224,7 +227,7 @@ class LatencySpikeStrategy:
         closed: list[TradeBucket] = []
 
         with self._lock:
-            self._push_prices.append(PushPricePoint(ts=event_ts, price=price))
+            self._push_prices.append(PushPricePoint(ts=event_ts, price=price, qty=max(0.0, qty)))
             self._trim_push_prices(event_ts)
 
             if self._current is None:
@@ -255,17 +258,17 @@ class LatencySpikeStrategy:
         stats = self._stats()
         if not stats:
             return None
-        push_stats = self._push_deviation(bucket.updated_ts)
+        push_stats = self._push_deviation(bucket.updated_ts, preferred_direction="up")
         if not push_stats:
             return None
 
         move_pct = self._latest_move_pct(bucket)
         price_z = self._z(move_pct, stats.move_mean, stats.move_std)
-        volume_z = self._z(bucket.qty, stats.qty_mean, stats.qty_std)
+        signal_qty, volume_z = self._signal_volume_z(bucket.updated_ts)
         candidate_ok = (
             push_stats.deviation >= self.config.entry_push_std_mult
             and push_stats.direction == "up"
-            and bucket.qty >= self.config.entry_min_qty
+            and signal_qty >= self.config.entry_min_qty
         )
         adaptive_threshold = self._entry_volume_threshold(bucket.updated_ts)
         volume_threshold = adaptive_threshold if self.config.entry_volume_adaptive else self.config.entry_volume_z
@@ -295,6 +298,7 @@ class LatencySpikeStrategy:
                 push_current_std=push_stats.current_std,
                 push_mean_shift_z=push_stats.mean_shift_z,
                 push_std_ratio=push_stats.std_ratio,
+                push_source=push_stats.source,
             )
         if (
             candidate_ok
@@ -304,7 +308,7 @@ class LatencySpikeStrategy:
             print(
                 "  Entry blocked by volume gate: "
                 f"push {push_stats.deviation:+.2f}x, mean_z {push_stats.mean_shift_z:+.2f}, "
-                f"qty {bucket.qty:.4f}, qty z {volume_z:.2f} < {volume_threshold:.2f} "
+                f"signal qty {signal_qty:.4f}, qty z {volume_z:.2f} < {volume_threshold:.2f} "
                 f"({self._entry_volume_threshold_summary(bucket.updated_ts)})"
             )
         return None
@@ -319,7 +323,7 @@ class LatencySpikeStrategy:
         stats = self._stats()
         if not stats:
             return None
-        push_stats = self._push_deviation(bucket.updated_ts)
+        push_stats = self._push_deviation(bucket.updated_ts, preferred_direction="down")
         if not push_stats:
             return None
 
@@ -351,6 +355,7 @@ class LatencySpikeStrategy:
                 push_current_std=push_stats.current_std,
                 push_mean_shift_z=push_stats.mean_shift_z,
                 push_std_ratio=push_stats.std_ratio,
+                push_source=push_stats.source,
             )
         return None
 
@@ -571,7 +576,44 @@ class LatencySpikeStrategy:
             return 0.0
         return (value - mean) / std
 
-    def _push_deviation(self, current_ts: float) -> Optional[PushDeviationStats]:
+    def _signal_volume_z(self, current_ts: float) -> tuple[float, float]:
+        if current_ts <= 0:
+            return 0.0, 0.0
+
+        signal_seconds = max(0.001, self.config.push_signal_ms / 1000.0)
+        current_cutoff = current_ts - signal_seconds
+        baseline_cutoff = current_cutoff - self.config.push_std_minutes * 60.0
+        points = self._push_snapshot()
+        current_qty = sum(
+            point.qty for point in points
+            if current_cutoff <= point.ts <= current_ts
+        )
+        baseline_points = [
+            point for point in points
+            if baseline_cutoff <= point.ts < current_cutoff
+        ]
+        if len(baseline_points) < self.config.push_std_min_samples:
+            return current_qty, 0.0
+
+        window_qtys: list[float] = []
+        rolling_qty = 0.0
+        left = 0
+        for right, point in enumerate(baseline_points):
+            rolling_qty += point.qty
+            cutoff = point.ts - signal_seconds
+            while left <= right and baseline_points[left].ts < cutoff:
+                rolling_qty -= baseline_points[left].qty
+                left += 1
+            window_qtys.append(rolling_qty)
+
+        qty_mean, qty_std = self._mean_std(window_qtys)
+        return current_qty, self._z(current_qty, qty_mean, max(qty_std, 0.00001))
+
+    def _push_deviation(
+        self,
+        current_ts: float,
+        preferred_direction: str | None = None,
+    ) -> Optional[PushDeviationStats]:
         if current_ts <= 0:
             return None
         signal_seconds = max(0.001, self.config.push_signal_ms / 1000.0)
@@ -582,39 +624,79 @@ class LatencySpikeStrategy:
             point.price for point in points
             if baseline_cutoff <= point.ts < current_cutoff and point.price > 0
         ]
-        current_prices = [
-            point.price for point in points
+        current_points = [
+            point for point in points
             if current_cutoff <= point.ts <= current_ts and point.price > 0
         ]
         if len(baseline_prices) < self.config.push_std_min_samples:
             return None
-        if len(current_prices) < max(2, self.config.push_signal_min_samples):
-            return None
         mean_price, std_price = self._mean_std(baseline_prices)
         std_price = max(std_price, 0.01)
-        current_mean, current_std = self._mean_std(current_prices)
-        current_baseline_var = sum((price - mean_price) ** 2 for price in current_prices) / (len(current_prices) - 1)
-        current_baseline_std = math.sqrt(max(0.0, current_baseline_var))
-        delta = current_mean - mean_price
-        direction = "up" if delta > 0 else "down" if delta < 0 else "flat"
-        unsigned_deviation = current_baseline_std / std_price
-        deviation = unsigned_deviation if delta >= 0 else -unsigned_deviation
-        mean_shift_z = delta / std_price
-        std_ratio = current_std / std_price
-        return PushDeviationStats(
-            count=len(baseline_prices),
-            current_count=len(current_prices),
-            mean_price=mean_price,
-            std_price=std_price,
-            current_mean=current_mean,
-            current_std=current_std,
-            current_baseline_std=current_baseline_std,
-            deviation=deviation,
-            delta=delta,
-            mean_shift_z=mean_shift_z,
-            std_ratio=std_ratio,
-            direction=direction,
-        )
+
+        candidates: list[PushDeviationStats] = []
+        current_prices = [point.price for point in current_points]
+        if len(current_prices) >= max(2, self.config.push_signal_min_samples):
+            current_mean, current_std = self._mean_std(current_prices)
+            delta = current_prices[-1] - current_prices[0]
+            direction = "up" if delta > 0 else "down" if delta < 0 else "flat"
+            current_baseline_std = abs(delta)
+            unsigned_deviation = current_baseline_std / std_price
+            deviation = unsigned_deviation if delta >= 0 else -unsigned_deviation
+            candidates.append(PushDeviationStats(
+                count=len(baseline_prices),
+                current_count=len(current_prices),
+                mean_price=mean_price,
+                std_price=std_price,
+                current_mean=current_mean,
+                current_std=current_std,
+                current_baseline_std=current_baseline_std,
+                deviation=deviation,
+                delta=delta,
+                mean_shift_z=delta / std_price,
+                std_ratio=current_std / std_price,
+                direction=direction,
+                source="window",
+            ))
+
+        recent_points = [point for point in points if point.ts <= current_ts and point.price > 0]
+        recent_n = max(2, self.config.push_signal_min_samples)
+        if len(recent_points) >= recent_n:
+            recent_prices = [point.price for point in recent_points[-recent_n:]]
+            recent_mean, recent_std = self._mean_std(recent_prices)
+            delta = recent_prices[-1] - recent_prices[0]
+            direction = "up" if delta > 0 else "down" if delta < 0 else "flat"
+            deviation = abs(delta) / std_price
+            if delta < 0:
+                deviation = -deviation
+            candidates.append(PushDeviationStats(
+                count=len(baseline_prices),
+                current_count=len(recent_prices),
+                mean_price=mean_price,
+                std_price=std_price,
+                current_mean=recent_mean,
+                current_std=recent_std,
+                current_baseline_std=abs(delta),
+                deviation=deviation,
+                delta=delta,
+                mean_shift_z=delta / std_price,
+                std_ratio=recent_std / std_price,
+                direction=direction,
+                source="recent",
+            ))
+
+        if not candidates:
+            return None
+        if preferred_direction == "up":
+            up_candidates = [stats for stats in candidates if stats.direction == "up" and stats.deviation > 0]
+            if up_candidates:
+                return max(up_candidates, key=lambda stats: stats.deviation)
+            return None
+        if preferred_direction == "down":
+            down_candidates = [stats for stats in candidates if stats.direction == "down" and stats.deviation < 0]
+            if down_candidates:
+                return min(down_candidates, key=lambda stats: stats.deviation)
+            return None
+        return max(candidates, key=lambda stats: abs(stats.deviation))
 
     def _push_summary(self) -> str:
         bucket = self._current_snapshot()
@@ -624,7 +706,7 @@ class LatencySpikeStrategy:
         if not stats:
             return "push dev warming"
         return (
-            f"push window {stats.deviation:+.2f}x "
+            f"push {stats.source} {stats.deviation:+.2f}x "
             f"(mean_z {stats.mean_shift_z:+.2f}, d ${stats.delta:+.2f}, "
             f"base_std ${stats.std_price:.2f}, cur_std {stats.std_ratio:.2f}x, "
             f"n={stats.current_count}/{stats.count})"

@@ -12,13 +12,18 @@ Only one strategy is active:
 from __future__ import annotations
 
 import builtins
+import atexit
+import json
 import math
 import os
+import random
 import signal
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -143,6 +148,142 @@ class FeedGapStats:
         self.last_ts = max(self.last_ts, ts)
 
 
+@dataclass
+class BinanceTradePoint:
+    ts: float
+    price: float
+    qty: float
+    segment: int = 0
+
+
+@dataclass
+class EdgeModelFeatures:
+    key: tuple[int, int, int, int]
+    elapsed_seconds: float
+    poly_price: float
+    btc_move_pct: float
+    qty_ratio: float
+    signal_qty: float
+    sample_count: int
+
+
+@dataclass
+class PendingEdgeObservation:
+    due_ts: float
+    created_ts: float
+    window_start: int
+    key: tuple[int, int, int, int]
+    elapsed_seconds: float
+    start_poly_price: float
+    btc_move_pct: float
+    qty_ratio: float
+    signal_qty: float
+    sample_count: int
+
+
+@dataclass
+class PendingBuyOrder:
+    order_id: str
+    token_id: str
+    window_ts: int
+    market_slug: str
+    price: float
+    shares: float
+    amount_usd: float
+    opening_price: float
+    entry_btc_price: float
+    created_ts: float
+    next_check_ts: float
+    balance_before: float = 0.0
+    token_balance_before: Optional[float] = None
+    negative_windows: int = 0
+    cancel_requested: bool = False
+    cancel_reason: str = ""
+    next_cancel_ts: float = 0.0
+    check_attempts: int = 0
+    required_confirm_checks: int = 1
+    dry_cancel_decided: bool = False
+    dry_cancel_blocked: bool = False
+
+
+@dataclass
+class PendingSellOrder:
+    order_id: str
+    token_id: str
+    window_ts: int
+    market_slug: str
+    price: float
+    shares: float
+    reason: str
+    created_ts: float
+    next_check_ts: float
+    balance_before: float = 0.0
+    token_balance_before: Optional[float] = None
+    cancel_requested: bool = False
+    cancel_reason: str = ""
+    next_cancel_ts: float = 0.0
+    check_attempts: int = 0
+    required_confirm_checks: int = 1
+    last_signal_seq: int = 0
+    dry_cancel_decided: bool = False
+    dry_cancel_blocked: bool = False
+
+
+@dataclass
+class EdgeModelPrediction:
+    key: tuple[int, int, int, int]
+    samples: int
+    expected_delta: float
+    positive_rate: float
+    source: str
+    nearest_distance: int = 0
+    initialized: bool = False
+
+
+@dataclass
+class EdgeModelSignal:
+    action: str
+    side: str
+    reason: str
+    bucket: object
+    move_pct: float
+    price_z: float
+    volume_z: float
+    push_deviation: float = 0.0
+    push_mean: float = 0.0
+    push_std: float = 0.0
+    push_delta: float = 0.0
+    push_count: int = 0
+    push_current_count: int = 0
+    push_current_mean: float = 0.0
+    push_current_std: float = 0.0
+    push_mean_shift_z: float = 0.0
+    push_std_ratio: float = 0.0
+    push_source: str = "edge_model"
+    expected_delta: float = 0.0
+    expected_profit_pct: float = 0.0
+    rolling_delta: float = 0.0
+    rolling_profit_pct: float = 0.0
+    model_name: str = ""
+
+
+@dataclass
+class EdgeModelSpec:
+    name: str
+    path: Path
+    time_bucket_seconds: float
+    poly_price_bucket: float
+    btc_move_bins: int
+    qty_ratio_bins: int
+    cell_samples: int
+    initializer: dict
+    cells: dict[tuple[int, int, int, int], deque[float]]
+    recent_deltas: deque[float]
+    realized_pnl: float = 0.0
+    paper_position_shares: float = 0.0
+    paper_position_cost: float = 0.0
+
+
 class PolyBot:
     def __init__(self):
         load_dotenv()
@@ -183,6 +324,36 @@ class PolyBot:
         self.waveform_min_poly_range = float(os.getenv("CHANNEL_WAVEFORM_MIN_POLY_RANGE", "0.50"))
         self.waveform_max_scale = float(os.getenv("CHANNEL_WAVEFORM_MAX_SCALE", "350"))
         self._waveform_fail_reason = ""
+        self.edge_model_enabled = os.getenv("EDGE_MODEL_ENABLED", "true").lower() == "true"
+        self.edge_model_time_bucket_seconds = float(os.getenv("EDGE_MODEL_TIME_BUCKET_SECONDS", "5"))
+        self.edge_model_poly_price_bucket = float(os.getenv("EDGE_MODEL_POLY_PRICE_BUCKET", "0.05"))
+        self.edge_model_btc_move_bins = int(float(os.getenv("EDGE_MODEL_BTC_MOVE_BINS", "16")))
+        self.edge_model_btc_move_max_pct = float(os.getenv("EDGE_MODEL_BTC_MOVE_MAX_PCT", "0.10"))
+        self.edge_model_qty_ratio_bins = int(float(os.getenv("EDGE_MODEL_QTY_RATIO_BINS", "16")))
+        self.edge_model_qty_ratio_max = float(os.getenv("EDGE_MODEL_QTY_RATIO_MAX", "5.0"))
+        self.edge_model_cell_samples = int(float(os.getenv("EDGE_MODEL_CELL_SAMPLES", "20")))
+        self.edge_model_min_samples = int(float(os.getenv("EDGE_MODEL_MIN_SAMPLES", "3")))
+        self.edge_model_nearest_cells = int(float(os.getenv("EDGE_MODEL_NEAREST_CELLS", "8")))
+        self.edge_model_signal_ms = float(os.getenv("EDGE_MODEL_BINANCE_SIGNAL_MS", "1000"))
+        self.edge_model_min_expected_delta = float(os.getenv("EDGE_MODEL_MIN_EXPECTED_POLY_DELTA", "0.02"))
+        self.edge_model_min_expected_profit_pct = self.config.min_profit_pct
+        self.edge_model_max_pending = int(float(os.getenv("EDGE_MODEL_MAX_PENDING", "5000")))
+        self.edge_model_log_interval_seconds = float(os.getenv("EDGE_MODEL_LOG_INTERVAL_SECONDS", "10"))
+        self.edge_model_dir = Path(os.getenv("EDGE_MODEL_DIR", "edge_models"))
+        self.edge_model_file = os.getenv("EDGE_MODEL_FILE", "").strip()
+        self.edge_model_compare_files = [
+            item.strip()
+            for item in os.getenv("EDGE_MODEL_COMPARE_FILES", "").split(",")
+            if item.strip()
+        ]
+        self.edge_model_save_on_stop = os.getenv("EDGE_MODEL_SAVE_ON_STOP", "true").lower() == "true"
+        self.edge_model_use_initialized_cells = os.getenv("EDGE_MODEL_USE_INITIALIZED_CELLS", "true").lower() == "true"
+        self.edge_model_profit_window = int(float(os.getenv("EDGE_MODEL_PROFIT_WINDOW", "3")))
+        self.simulated_order_failure_rate = float(os.getenv("SIMULATED_ORDER_FAILURE_RATE", "0.10"))
+        self.simulated_cancel_success_rate = float(os.getenv("SIMULATED_CANCEL_SUCCESS_RATE", "0.20"))
+        self.pending_sell_cancel_btc_move_pct = float(os.getenv("PENDING_SELL_CANCEL_BTC_MOVE_PCT", "0.015"))
+        self.trade_cooldown_seconds = float(os.getenv("TRADE_COOLDOWN_SECONDS", "10"))
+        self.max_buys_per_window = int(float(os.getenv("MAX_BUYS_PER_WINDOW", "2")))
 
         self.executor = Executor(
             private_key=os.getenv("PRIVATE_KEY", ""),
@@ -210,6 +381,8 @@ class PolyBot:
         self._clob_halted = False
         self._pending_entry: Optional[PendingSignal] = None
         self._pending_exit: Optional[PendingSignal] = None
+        self._pending_buy: Optional[PendingBuyOrder] = None
+        self._pending_sell: Optional[PendingSellOrder] = None
         self._latency_samples_ms: list[float] = []
         self._latency_avg_ms = self.latency_default_ms
         self._last_latency_log_ts = 0.0
@@ -222,9 +395,37 @@ class PolyBot:
         self._window_latency_matches: list[WindowLatencyMatch] = []
         self._calibrated_window_starts: set[int] = set()
         self._latency_calibrated = False
+        self._binance_trade_points: list[BinanceTradePoint] = []
+        self._edge_model_cells: dict[tuple[int, int, int, int], deque[float]] = defaultdict(
+            lambda: deque(maxlen=max(1, self.edge_model_cell_samples))
+        )
+        self._edge_model_pending: deque[PendingEdgeObservation] = deque()
+        self._edge_model_recent_deltas: deque[float] = deque(maxlen=max(1, self.edge_model_profit_window))
+        self._edge_model_last_log_ts = 0.0
+        self._edge_model_last_block_bucket = None
+        self._edge_model_last_compare_log_ts = 0.0
+        self._edge_model_metadata: dict = {}
+        self._edge_model_path: Optional[Path] = None
+        self._edge_model_specs: list[EdgeModelSpec] = []
+        self._edge_model_signal_seq = 0
+        self._edge_model_last_evaluated_seq = 0
+        self._pending_buy_last_signal_seq = 0
+        self._buy_window_ts = 0
+        self._buy_count_in_window = 0
+        self._edge_model_init = {
+            "intercept": 0.0,
+            "btc_slope": 0.0,
+            "qty_slope": 0.0,
+            "time_slope": 0.0,
+            "poly_slope": 0.0,
+        }
+        self._last_trade_action_ts = 0.0
+        self._pending_buy_check_interval_seconds = 3.0
         self._last_poly_extrema_received_ts = 0.0
         self._last_calibration_debug_ts = 0.0
         self._calibration_debug_reason = "waiting for completed 5m waveform windows"
+        self._edge_model_load()
+        atexit.register(self._edge_model_save)
 
     def start(self) -> None:
         print("=" * 72)
@@ -274,6 +475,20 @@ class PolyBot:
             f"min poly range ${self.waveform_min_poly_range:.3f}, "
             f"max scale {self.waveform_max_scale:.0f}x"
         )
+        if self.edge_model_enabled:
+            print(
+                f"Edge model: time {self.edge_model_time_bucket_seconds:.0f}s, "
+                f"poly ${self.edge_model_poly_price_bucket:.3f}, "
+                f"btc bins {self.edge_model_btc_move_bins} over +/-{self.edge_model_btc_move_max_pct:.3f}%, "
+                f"qty bins {self.edge_model_qty_ratio_bins} over 0-{self.edge_model_qty_ratio_max:.1f}x, "
+                f"cell FIFO {self.edge_model_cell_samples}, min samples {self.edge_model_min_samples}, "
+                f"window {self.edge_model_profit_window}, "
+                f"min edge ${self.edge_model_min_expected_delta:.3f}/{self.edge_model_min_expected_profit_pct:.1%}, "
+                f"sim fail {self.simulated_order_failure_rate:.0%}, "
+                f"sim cancel {self.simulated_cancel_success_rate:.0%}, "
+                f"sell cancel BTC +{self.pending_sell_cancel_btc_move_pct:.4f}%, "
+                f"cooldown {self.trade_cooldown_seconds:.0f}s"
+            )
         print(f"Trade amount: ${self.config.trade_amount:.2f}")
         print(f"Entry window: first {self.entry_window_seconds:.0f}s of each market")
 
@@ -320,6 +535,8 @@ class PolyBot:
         qty = self._as_float(raw.get("q"))
         self.strategy.ingest_trade(self.current_btc_price, qty=qty, event_ts=event_ts)
         self._update_price_sample("btc", self.current_btc_price, received_ts or time.time())
+        self._edge_model_on_binance_trade(self.current_btc_price, qty, received_ts or time.time())
+        self._edge_model_signal_seq += 1
 
     def _tick(self) -> None:
         if self.current_btc_price <= 0:
@@ -329,6 +546,12 @@ class PolyBot:
         if not self.market:
             return
         self._update_extrema_latency()
+        self._edge_model_process_due()
+        self._process_pending_buy()
+        self._process_pending_sell()
+        if self._pending_sell:
+            self._print_status()
+            return
 
         self._check_daily_loss_limit()
         if self.position and not self.position.closed:
@@ -336,6 +559,8 @@ class PolyBot:
                 self._resolve_position(self.current_btc_price)
             else:
                 self._try_exit()
+                if self.position and not self.position.closed:
+                    self._try_entry()
         elif not self._clob_halted and not self._strategy_is_cooling_down():
             self._try_entry()
         else:
@@ -366,6 +591,9 @@ class PolyBot:
         self.opening_price = self.current_btc_price
         self._pending_entry = None
         self._pending_exit = None
+        if self._buy_window_ts != market.window_start:
+            self._buy_window_ts = market.window_start
+            self._buy_count_in_window = 0
         self.poly_feed.subscribe(
             [market.token_id_up, market.token_id_down],
             {market.token_id_up: "UP", market.token_id_down: "DOWN"},
@@ -379,11 +607,11 @@ class PolyBot:
             self._probe_clob_recovery()
 
     def _try_entry(self) -> None:
-        if self._pending_entry:
-            self._process_pending_entry()
+        if self._pending_buy:
             return
-
-        signal_result = self.strategy.entry_signal()
+        if self._buy_limit_reached():
+            return
+        signal_result = self._edge_model_entry_signal()
         if not signal_result:
             return
         if not self._entry_window_open():
@@ -392,140 +620,830 @@ class PolyBot:
             return
         if not self._clob_ok_for_trade():
             return
+        if not self._trade_cooldown_ready("buy"):
+            return
+        self._execute_entry(signal_result)
 
-        ref_poly_price, ref_poly_received_ts = self._poly_reference_snapshot()
-        if ref_poly_price <= 0:
-            print("  Entry signal held: no Polymarket reference price yet")
-            return
-        latency_plan = self._latency_sync_plan()
-        now = time.time()
-        self._pending_entry = PendingSignal(
-            kind="entry",
-            created_ts=now,
-            deadline_ts=now + (latency_plan["deadline_ms"] / 1000.0),
-            ref_poly_price=ref_poly_price,
-            ref_poly_received_ts=ref_poly_received_ts,
-            signal=signal_result,
-            trend_start_ts=now + (latency_plan["trend_start_delay_ms"] / 1000.0),
-            latency_target_ms=latency_plan["target_ms"],
-            trend_window_ms=latency_plan["trend_window_ms"],
-            safety_margin_ms=latency_plan["safety_margin_ms"],
-        )
-        print(
-            f"  Entry signal pending latency sync: Binance {signal_result.move_pct:+.4f}% | "
-            f"{self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f} | "
-            f"Poly ref ${ref_poly_price:.3f} | avg latency {self._latency_avg_ms:.0f}ms | "
-            f"trend starts +{latency_plan['trend_start_delay_ms']:.0f}ms "
-            f"(trend {latency_plan['trend_window_ms']:.0f}ms, safety {latency_plan['safety_margin_ms']:.0f}ms)"
-        )
-        self._process_pending_entry()
+    def _buy_limit_reached(self) -> bool:
+        if not self.market or self.max_buys_per_window <= 0:
+            return False
+        if self._buy_window_ts != self.market.window_start:
+            self._buy_window_ts = self.market.window_start
+            self._buy_count_in_window = 0
+        return self._buy_count_in_window >= self.max_buys_per_window
 
-    def _process_pending_entry(self) -> None:
-        pending = self._pending_entry
-        if not pending:
-            return
-        signal_result = pending.signal
-
-        now = time.time()
-        self._log_pending_poly_observation(pending, "entry")
-        trend_start_ts = self._pending_trend_start_ts(pending)
-        if now < trend_start_ts:
-            return
-
-        current_poly_price, current_poly_received_ts = self._poly_reference_snapshot()
-        if current_poly_price <= 0:
-            return
-        trend = self._poly_recent_trend(trend_start_ts, self.latency_poly_trend_ticks)
-        if not trend:
-            if now < pending.deadline_ts:
-                return
-            print(
-                f"  Entry skipped: latency wait expired without {self.latency_poly_trend_ticks} "
-                f"Polymarket ticks after trend start +{(trend_start_ts - pending.created_ts) * 1000:.0f}ms"
-            )
-            self._pending_entry = None
-            return
-
-        poly_delta = trend["delta"]
-        not_falling = poly_delta >= 0
-        if not not_falling and now < pending.deadline_ts:
-            return
-        if not not_falling:
-            print(
-                f"  Entry skipped: Poly still falling after latency wait | "
-                f"{self._format_trend(trend)}"
-            )
-            self._pending_entry = None
+    def _execute_entry(self, signal_result: object) -> None:
+        if not self.market:
             return
 
         token_id = self.market.token_id_up
         buy_price = self._live_buy_price(token_id)
         if buy_price <= 0:
             print("  Entry skipped: no executable UP buy price")
-            self._pending_entry = None
             return
         if buy_price > self.config.max_buy_price:
             print(f"  Entry skipped: UP ${buy_price:.3f} > cap ${self.config.max_buy_price:.2f}")
-            self._pending_entry = None
             return
 
         balance = self.executor.get_balance(refresh=False)
         amount = round(self.config.trade_amount if self.dry_run else min(self.config.trade_amount, max(0.0, balance)), 2)
         if not self.dry_run and amount < 5.0:
             print(f"  Entry skipped: balance ${balance:.2f} below $5 minimum")
-            self._pending_entry = None
+            return
+        if self._simulate_order_failure("BUY"):
             return
 
+        existing = self.position and not self.position.closed
         print(
-            f"\n[ENTRY] {signal_result.reason}: BTC bucket "
+            f"\n[{'ADD' if existing else 'ENTRY'}] {signal_result.reason}: BTC "
             f"{signal_result.move_pct:+.4f}% qty {signal_result.bucket.qty:.4f} "
             f"(push {self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f}) | "
-            f"UP ask ${buy_price:.3f} | Poly trend {self._format_trend(trend)} | "
-            f"latency avg {self._latency_avg_ms:.0f}ms"
+            f"UP ask ${buy_price:.3f} | model {getattr(signal_result, 'model_name', '')} | "
+            f"expected {getattr(signal_result, 'rolling_delta', 0.0):+.3f}/"
+            f"{getattr(signal_result, 'rolling_profit_pct', 0.0):.1%}"
         )
-        result = self.executor.buy(token_id, amount, price=buy_price)
+        result = self.executor.place_buy_order(token_id, amount, price=buy_price)
         if not result.success:
-            print(f"  Buy failed: {result.error}")
-            if result.error == "UNVERIFIED_BUY":
-                self.position = Position(
-                    side="UP",
-                    token_id=token_id,
-                    window_ts=self.market.window_start,
-                    market_slug=self.market.slug,
-                    entry_price=result.price or buy_price,
-                    shares=result.shares,
-                    cost=result.amount_usd or amount,
-                    entry_btc_price=self.current_btc_price,
-                    opening_price=self.opening_price,
-                    entry_ts=time.time(),
-                )
-                print("  Tracking unverified buy as pending exposure")
-            self._pending_entry = None
+            print(f"  Buy submit failed: {result.error}")
             return
 
-        self.position = Position(
-            side="UP",
+        now = time.time()
+        required_confirm_checks = random.choices([2, 3, 4], weights=[25, 50, 25], k=1)[0] if self.dry_run else 1
+        self._pending_buy = PendingBuyOrder(
+            order_id=result.order_id,
             token_id=token_id,
             window_ts=self.market.window_start,
             market_slug=self.market.slug,
-            entry_price=result.price,
+            price=result.price or buy_price,
             shares=result.shares,
-            cost=result.amount_usd,
-            entry_btc_price=self.current_btc_price,
+            amount_usd=result.amount_usd or amount,
             opening_price=self.opening_price,
-            entry_ts=time.time(),
+            entry_btc_price=self.current_btc_price,
+            created_ts=now,
+            next_check_ts=now + self._pending_buy_check_interval_seconds,
+            balance_before=result.balance_before,
+            token_balance_before=result.token_balance_before,
+            required_confirm_checks=required_confirm_checks,
+        )
+        self._pending_buy_last_signal_seq = self._edge_model_signal_seq
+        self._last_trade_action_ts = now
+        self._buy_count_in_window += 1
+        print(
+            f"  Buy order pending: {result.order_id} | "
+            f"{result.shares:.0f} shares @ ${result.price:.3f}; "
+            f"check every {self._pending_buy_check_interval_seconds:.0f}s | "
+            f"confirm after {required_confirm_checks} checks | "
+            f"window buys {self._buy_count_in_window}/{self.max_buys_per_window}"
+        )
+
+    def _apply_buy_fill(self, result, pending: PendingBuyOrder) -> None:
+        existing = self.position and not self.position.closed
+        if existing and self.position:
+            total_cost = self.position.cost + result.amount_usd
+            total_shares = self.position.shares + result.shares
+            self.position.cost = total_cost
+            self.position.shares = total_shares
+            self.position.entry_price = total_cost / total_shares if total_shares > 0 else result.price
+            self.position.entry_ts = time.time()
+            self.position.peak_unrealized_profit = 0.0
+            self.position.peak_sell_price = 0.0
+            self.position.last_sell_price = 0.0
+            print(
+                f"  Added position: +{result.shares:.0f} shares ${result.amount_usd:.2f}; "
+                f"total {self.position.shares:.0f} @ avg ${self.position.entry_price:.3f}"
+            )
+        else:
+            self.position = Position(
+                side="UP",
+                token_id=pending.token_id,
+                window_ts=pending.window_ts,
+                market_slug=pending.market_slug,
+                entry_price=result.price,
+                shares=result.shares,
+                cost=result.amount_usd,
+                entry_btc_price=pending.entry_btc_price,
+                opening_price=pending.opening_price,
+                entry_ts=time.time(),
+            )
+        self._last_trade_action_ts = time.time()
+        print(
+            f"  Buy filled: {result.shares:.0f} shares @ ${result.price:.3f}, "
+            f"cost ${result.amount_usd:.2f}, status {result.status}"
         )
         self.telegram.strategy_trade_alert(
             strategy="Binance latency spike",
             side="UP",
             price=result.price,
             amount=result.amount_usd,
-            market_slug=self.market.slug,
+            market_slug=pending.market_slug,
             dry_run=self.dry_run,
             strategy_pnl=self.realized_pnl,
             total_pnl=self.realized_pnl,
         )
-        self._pending_entry = None
+
+    def _process_pending_buy(self) -> None:
+        pending = self._pending_buy
+        if not pending:
+            return
+        if not self.market or pending.window_ts != self.market.window_start:
+            print(f"  Pending buy {pending.order_id} window changed; attempting cancel")
+            pending.cancel_requested = True
+            pending.cancel_reason = "market window changed"
+            self._cancel_pending_buy(pending.cancel_reason)
+            return
+
+        now = time.time()
+        if pending.cancel_requested:
+            if now >= pending.next_cancel_ts:
+                self._cancel_pending_buy(pending.cancel_reason or "cancel requested")
+            return
+
+        if self._pending_buy_cancel_signal(pending):
+            self._cancel_pending_buy(pending.cancel_reason or "negative follow-through")
+            return
+
+        if now < pending.next_check_ts:
+            return
+
+        pending.check_attempts += 1
+        result = self.executor.check_pending_buy(
+            pending.order_id,
+            pending.price,
+            pending.shares,
+            pending.token_id,
+            pending.balance_before,
+            pending.token_balance_before,
+        )
+        pending.next_check_ts = now + self._pending_buy_check_interval_seconds
+        if not result:
+            print(f"  Pending buy check: {pending.order_id} not filled yet")
+            return
+        if self.dry_run and pending.check_attempts < pending.required_confirm_checks:
+            print(
+                f"  Pending buy check {pending.check_attempts}/"
+                f"{pending.required_confirm_checks}: simulated order still pending"
+            )
+            return
+
+        self._pending_buy = None
+        self._apply_buy_fill(result, pending)
+
+    def _pending_buy_cancel_signal(self, pending: PendingBuyOrder) -> bool:
+        if self.dry_run and pending.dry_cancel_blocked:
+            return False
+        if self._edge_model_signal_seq > self._pending_buy_last_signal_seq:
+            self._pending_buy_last_signal_seq = self._edge_model_signal_seq
+            features = self._edge_model_features(time.time(), self.current_btc_price)
+            if features and features.btc_move_pct < 0:
+                pending.negative_windows += 1
+            elif features:
+                pending.negative_windows = 0
+            if pending.negative_windows >= 2:
+                pending.cancel_reason = (
+                    f"two negative Binance windows ({features.btc_move_pct:+.4f}%)"
+                    if features else "two negative Binance windows"
+                )
+                return True
+
+        if self._poly_recently_falling(pending.created_ts, self.latency_poly_trend_ticks):
+            pending.cancel_reason = f"Polymarket falling over {self.latency_poly_trend_ticks} ticks"
+            return True
+        return False
+
+    def _cancel_pending_buy(self, reason: str) -> None:
+        pending = self._pending_buy
+        if not pending:
+            return
+        if self.dry_run:
+            if not pending.dry_cancel_decided:
+                pending.dry_cancel_decided = True
+                cancel_rate = min(max(0.0, self.simulated_cancel_success_rate), 1.0)
+                pending.dry_cancel_blocked = random.random() >= cancel_rate
+            if not pending.dry_cancel_blocked:
+                print(
+                    f"  DRY pending buy cancelled {pending.order_id}: {reason} "
+                    f"(sim cancel success {self.simulated_cancel_success_rate:.0%})"
+                )
+                self._pending_buy = None
+                self._last_trade_action_ts = time.time()
+                return
+            print(
+                f"  DRY pending buy cancel failed/already matched {pending.order_id}: {reason} "
+                f"(sim cancel success {self.simulated_cancel_success_rate:.0%}); keeping order pending"
+            )
+            pending.cancel_requested = False
+            pending.next_cancel_ts = 0.0
+            return
+        fill = self.executor.check_pending_buy(
+            pending.order_id,
+            pending.price,
+            pending.shares,
+            pending.token_id,
+            pending.balance_before,
+            pending.token_balance_before,
+        )
+        if fill:
+            print(f"  Pending buy already filled before cancel: {pending.order_id}")
+            self._pending_buy = None
+            self._apply_buy_fill(fill, pending)
+            return
+        if self.executor.order_is_cancelled(pending.order_id):
+            print(f"  Pending buy cancel confirmed: {pending.order_id}")
+            self._pending_buy = None
+            self._last_trade_action_ts = time.time()
+            return
+
+        print(f"  Cancelling pending buy {pending.order_id}: {reason}")
+        pending.cancel_requested = True
+        pending.cancel_reason = reason
+        if self.executor.cancel_order(pending.order_id):
+            now = time.time()
+            pending.next_cancel_ts = now + 1.0
+            pending.next_check_ts = min(pending.next_check_ts, now + 1.0)
+            self._last_trade_action_ts = now
+            print("  Pending buy cancel sent; retrying every 1s until order state is confirmed")
+            return
+
+        now = time.time()
+        pending.next_cancel_ts = now + 1.0
+        pending.next_check_ts = min(pending.next_check_ts, now + 1.0)
+        print("  Pending buy cancel failed; keeping order under observation")
+
+    def _edge_model_on_binance_trade(self, price: float, qty: float, ts: float) -> None:
+        if not self.edge_model_enabled or price <= 0 or ts <= 0:
+            return
+        segment = self.market.window_start if self.market else 0
+        self._binance_trade_points.append(BinanceTradePoint(ts=ts, price=price, qty=max(0.0, qty), segment=segment))
+        keep_after = ts - 1800.0
+        while self._binance_trade_points and self._binance_trade_points[0].ts < keep_after:
+            self._binance_trade_points.pop(0)
+        if not self.market:
+            return
+        features = self._edge_model_features(ts, price)
+        if not features:
+            return
+        latency_ms = self._latency_avg_ms if self._latency_samples_ms else self.latency_default_ms
+        latency_ms = min(max(50.0, latency_ms), self.latency_max_wait_ms)
+        self._edge_model_pending.append(PendingEdgeObservation(
+            due_ts=ts + latency_ms / 1000.0,
+            created_ts=ts,
+            window_start=self.market.window_start,
+            key=features.key,
+            elapsed_seconds=features.elapsed_seconds,
+            start_poly_price=features.poly_price,
+            btc_move_pct=features.btc_move_pct,
+            qty_ratio=features.qty_ratio,
+            signal_qty=features.signal_qty,
+            sample_count=features.sample_count,
+        ))
+        while len(self._edge_model_pending) > max(1, self.edge_model_max_pending):
+            self._edge_model_pending.popleft()
+
+    def _edge_model_process_due(self) -> None:
+        if not self.edge_model_enabled or not self.market:
+            return
+        now = time.time()
+        processed = 0
+        remaining: deque[PendingEdgeObservation] = deque()
+        while self._edge_model_pending:
+            observation = self._edge_model_pending.popleft()
+            if observation.due_ts > now:
+                remaining.append(observation)
+                continue
+            if observation.window_start != self.market.window_start:
+                continue
+            poly_price, _ = self._poly_reference_snapshot()
+            if poly_price <= 0:
+                continue
+            delta = poly_price - observation.start_poly_price
+            self._edge_model_cells[observation.key].append(delta)
+            for spec in self._edge_model_specs:
+                spec_features = EdgeModelFeatures(
+                    key=observation.key,
+                    elapsed_seconds=observation.elapsed_seconds,
+                    poly_price=observation.start_poly_price,
+                    btc_move_pct=observation.btc_move_pct,
+                    qty_ratio=observation.qty_ratio,
+                    signal_qty=observation.signal_qty,
+                    sample_count=observation.sample_count,
+                )
+                spec_key = self._edge_model_key_for_spec(spec_features, spec)
+                spec.cells.setdefault(spec_key, deque(maxlen=max(1, spec.cell_samples))).append(delta)
+            processed += 1
+        self._edge_model_pending = remaining
+        if processed > 0 and now - self._edge_model_last_log_ts >= self.edge_model_log_interval_seconds:
+            self._edge_model_last_log_ts = now
+            cell_count = len(self._edge_model_cells)
+            sample_count = sum(len(values) for values in self._edge_model_cells.values())
+            print(
+                f"[edge-model] updated {processed} observations | "
+                f"cells {cell_count}, samples {sample_count}, latency {self._latency_avg_ms:.0f}ms"
+            )
+
+    def _edge_model_entry_signal(self) -> Optional[EdgeModelSignal]:
+        if not self.edge_model_enabled or not self.market:
+            return None
+        if self._edge_model_signal_seq <= self._edge_model_last_evaluated_seq:
+            return None
+        self._edge_model_last_evaluated_seq = self._edge_model_signal_seq
+        if not self._entry_window_open() or not self.strategy.baseline_ready():
+            return None
+        features = self._edge_model_features(time.time(), self.current_btc_price)
+        if not features:
+            return None
+        prediction = self._edge_model_prediction(features.key)
+        if not prediction or prediction.samples < self.edge_model_min_samples:
+            self._edge_model_log_block(features, prediction, "warming")
+            return None
+        buy_price = self._live_buy_price(self.market.token_id_up)
+        if buy_price <= 0:
+            buy_price = features.poly_price
+        signed_delta = prediction.expected_delta
+        self._edge_model_recent_deltas.append(signed_delta)
+        rolling_delta = sum(self._edge_model_recent_deltas)
+        expected_exit = min(0.99, features.poly_price + rolling_delta)
+        expected_profit_pct = 0.0 if buy_price <= 0 else (expected_exit - buy_price) / buy_price
+        self._edge_model_log_compare(features, buy_price)
+        if rolling_delta <= 0 and self.position and not self.position.closed:
+            print(
+                f"  Edge model cancel/hold: rolling delta {rolling_delta:+.3f}; "
+                "no cancellable open order tracked, holding position"
+            )
+            return None
+        if (
+            features.btc_move_pct <= 0
+            or rolling_delta < self.edge_model_min_expected_delta
+            or expected_profit_pct < self.edge_model_min_expected_profit_pct
+        ):
+            self._edge_model_log_block(features, prediction, "edge_low", buy_price, expected_profit_pct)
+            return None
+
+        print(
+            "  Edge model entry candidate: "
+            f"poly ${features.poly_price:.3f}, buy ${buy_price:.3f}, "
+            f"expected {prediction.expected_delta:+.3f}, rolling {rolling_delta:+.3f}, "
+            f"profit {expected_profit_pct:.1%}, "
+            f"p+ {prediction.positive_rate:.0%}, samples {prediction.samples} ({prediction.source}), "
+            f"btc {features.btc_move_pct:+.4f}%, qty {features.qty_ratio:.2f}x, key {features.key}"
+        )
+        return EdgeModelSignal(
+            action="BUY",
+            side="UP",
+            reason="edge_model_latency_distribution",
+            bucket=SimpleNamespace(qty=features.signal_qty),
+            move_pct=features.btc_move_pct,
+            price_z=prediction.expected_delta,
+            volume_z=features.qty_ratio,
+            push_deviation=rolling_delta,
+            push_delta=self.current_btc_price * features.btc_move_pct / 100.0,
+            push_count=prediction.samples,
+            push_current_count=features.sample_count,
+            push_current_mean=self.current_btc_price,
+            push_mean_shift_z=features.btc_move_pct,
+            push_std_ratio=features.qty_ratio,
+            push_source=f"edge/{prediction.source}",
+            expected_delta=prediction.expected_delta,
+            expected_profit_pct=expected_profit_pct,
+            rolling_delta=rolling_delta,
+            rolling_profit_pct=expected_profit_pct,
+            model_name=self._edge_model_path.name if self._edge_model_path else "edge-model",
+        )
+
+    def _edge_model_features(self, ts: float, price: float) -> Optional[EdgeModelFeatures]:
+        if not self.market or price <= 0:
+            return None
+        signal_seconds = max(0.05, self.edge_model_signal_ms / 1000.0)
+        signal_start = ts - signal_seconds
+        previous_start = signal_start - signal_seconds
+        segment = self.market.window_start
+        window_points = [
+            point for point in self._binance_trade_points
+            if point.segment == segment and point.ts <= ts and point.price > 0
+        ]
+        signal_points = [point for point in window_points if point.ts >= signal_start]
+        previous_points = [
+            point for point in window_points
+            if previous_start <= point.ts < signal_start
+        ]
+        if len(signal_points) < 1 or len(previous_points) < 1:
+            return None
+        poly_price = self._poly_price_near(signal_start, ts)
+        if poly_price <= 0:
+            return None
+        previous_avg = sum(point.price for point in previous_points) / len(previous_points)
+        current_avg = sum(point.price for point in signal_points) / len(signal_points)
+        if previous_avg <= 0:
+            return None
+        btc_move_pct = (current_avg - previous_avg) / previous_avg * 100.0
+        signal_qty = sum(point.qty for point in signal_points)
+        elapsed = max(0.0, signal_start - segment)
+        previous_qty = sum(point.qty for point in previous_points)
+        qty_ratio = signal_qty / previous_qty if previous_qty > 0 else 0.0
+        key = (
+            self._edge_time_bucket(elapsed),
+            self._edge_poly_bucket(poly_price),
+            self._edge_btc_move_bucket(btc_move_pct),
+            self._edge_qty_ratio_bucket(qty_ratio),
+        )
+        return EdgeModelFeatures(
+            key=key,
+            elapsed_seconds=elapsed,
+            poly_price=poly_price,
+            btc_move_pct=btc_move_pct,
+            qty_ratio=qty_ratio,
+            signal_qty=signal_qty,
+            sample_count=len(signal_points),
+        )
+
+    def _edge_model_prediction(self, key: tuple[int, int, int, int]) -> Optional[EdgeModelPrediction]:
+        exact = list(self._edge_model_cells.get(key, []))
+        if len(exact) >= self.edge_model_min_samples:
+            return self._edge_prediction_from_values(key, exact, "exact", 0)
+        neighbors: list[tuple[int, list[float]]] = []
+        for other_key, values in self._edge_model_cells.items():
+            if not values:
+                continue
+            distance = sum(abs(a - b) for a, b in zip(key, other_key))
+            neighbors.append((distance, list(values)))
+        if not neighbors:
+            return None
+        neighbors.sort(key=lambda item: item[0])
+        merged: list[float] = []
+        max_distance = 0
+        for distance, values in neighbors[: max(1, self.edge_model_nearest_cells)]:
+            merged.extend(values)
+            max_distance = max(max_distance, distance)
+            if len(merged) >= self.edge_model_min_samples:
+                break
+        if not merged:
+            return self._edge_model_initialized_prediction(key)
+        if len(merged) < self.edge_model_min_samples:
+            initialized = self._edge_model_initialized_prediction(key)
+            if initialized:
+                return initialized
+        return self._edge_prediction_from_values(key, merged, "nearest", max_distance)
+
+    def _edge_model_initialized_prediction(self, key: tuple[int, int, int, int]) -> Optional[EdgeModelPrediction]:
+        if not self.edge_model_use_initialized_cells:
+            return None
+        value = self._edge_model_initialized_delta(key)
+        samples = max(1, self.edge_model_min_samples)
+        positive_rate = 1.0 if value > 0 else 0.0
+        return EdgeModelPrediction(
+            key=key,
+            samples=samples,
+            expected_delta=value,
+            positive_rate=positive_rate,
+            source="initialized",
+            nearest_distance=0,
+            initialized=True,
+        )
+
+    def _edge_model_initialized_delta(self, key: tuple[int, int, int, int]) -> float:
+        time_idx, poly_idx, btc_idx, qty_idx = key
+        time_buckets = max(1, int(math.ceil(self.period_minutes * 60.0 / max(1.0, self.edge_model_time_bucket_seconds))))
+        poly_buckets = max(1, int(math.ceil(1.0 / max(0.001, self.edge_model_poly_price_bucket))))
+        btc_mid = (max(1, self.edge_model_btc_move_bins) - 1) / 2.0
+        qty_mid = (max(1, self.edge_model_qty_ratio_bins) - 1) / 2.0
+        time_norm = 0.0 if time_buckets <= 1 else time_idx / (time_buckets - 1)
+        poly_norm = 0.0 if poly_buckets <= 1 else poly_idx / (poly_buckets - 1)
+        btc_norm = 0.0 if btc_mid <= 0 else (btc_idx - btc_mid) / btc_mid
+        qty_norm = 0.0 if qty_mid <= 0 else (qty_idx - qty_mid) / qty_mid
+        value = (
+            float(self._edge_model_init.get("intercept", 0.0))
+            + float(self._edge_model_init.get("btc_slope", 0.0)) * btc_norm
+            + float(self._edge_model_init.get("qty_slope", 0.0)) * qty_norm
+            + float(self._edge_model_init.get("time_slope", 0.0)) * time_norm
+            + float(self._edge_model_init.get("poly_slope", 0.0)) * poly_norm
+        )
+        return max(-0.99, min(0.99, value))
+
+    def _edge_model_log_compare(self, features: EdgeModelFeatures, buy_price: float) -> None:
+        if not self._edge_model_specs:
+            return
+        now = time.time()
+        if now - self._edge_model_last_compare_log_ts < self.edge_model_log_interval_seconds:
+            return
+        self._edge_model_last_compare_log_ts = now
+        parts = []
+        for spec in self._edge_model_specs:
+            key = self._edge_model_key_for_spec(features, spec)
+            pred = self._edge_model_prediction_for_spec(key, spec)
+            spec.recent_deltas.append(pred.expected_delta)
+            rolling = sum(spec.recent_deltas)
+            expected_exit = min(0.99, features.poly_price + rolling)
+            profit_pct = 0.0 if buy_price <= 0 else (expected_exit - buy_price) / buy_price
+            parts.append(
+                f"{spec.name}: d {pred.expected_delta:+.3f}/roll {rolling:+.3f}/"
+                f"{profit_pct:+.1%}/pnl ${self.config.trade_amount * profit_pct:+.2f} "
+                f"n={pred.samples} {pred.source}"
+            )
+        print("[edge-compare] " + " | ".join(parts))
+
+    def _edge_model_key_for_spec(
+        self,
+        features: EdgeModelFeatures,
+        spec: EdgeModelSpec,
+    ) -> tuple[int, int, int, int]:
+        return (
+            self._edge_time_bucket_for(features.elapsed_seconds, spec.time_bucket_seconds),
+            self._edge_poly_bucket_for(features.poly_price, spec.poly_price_bucket),
+            self._edge_btc_move_bucket_for(features.btc_move_pct, spec.btc_move_bins),
+            self._edge_qty_ratio_bucket_for(features.qty_ratio, spec.qty_ratio_bins),
+        )
+
+    def _edge_model_prediction_for_spec(
+        self,
+        key: tuple[int, int, int, int],
+        spec: EdgeModelSpec,
+    ) -> EdgeModelPrediction:
+        values = list(spec.cells.get(key, []))
+        if values:
+            return self._edge_prediction_from_values(key, values, "exact", 0)
+        value = self._edge_model_initialized_delta_for_spec(key, spec)
+        return EdgeModelPrediction(
+            key=key,
+            samples=max(1, self.edge_model_min_samples),
+            expected_delta=value,
+            positive_rate=1.0 if value > 0 else 0.0,
+            source="initialized",
+            initialized=True,
+        )
+
+    def _edge_model_initialized_delta_for_spec(
+        self,
+        key: tuple[int, int, int, int],
+        spec: EdgeModelSpec,
+    ) -> float:
+        time_idx, poly_idx, btc_idx, qty_idx = key
+        time_buckets = max(1, int(math.ceil(self.period_minutes * 60.0 / max(1.0, spec.time_bucket_seconds))))
+        poly_buckets = max(1, int(math.ceil(1.0 / max(0.001, spec.poly_price_bucket))))
+        btc_mid = (max(1, spec.btc_move_bins) - 1) / 2.0
+        qty_mid = (max(1, spec.qty_ratio_bins) - 1) / 2.0
+        time_norm = 0.0 if time_buckets <= 1 else time_idx / (time_buckets - 1)
+        poly_norm = 0.0 if poly_buckets <= 1 else poly_idx / (poly_buckets - 1)
+        btc_norm = 0.0 if btc_mid <= 0 else (btc_idx - btc_mid) / btc_mid
+        qty_norm = 0.0 if qty_mid <= 0 else (qty_idx - qty_mid) / qty_mid
+        init = spec.initializer
+        value = (
+            float(init.get("intercept", 0.0))
+            + float(init.get("btc_slope", 0.0)) * btc_norm
+            + float(init.get("qty_slope", 0.0)) * qty_norm
+            + float(init.get("time_slope", 0.0)) * time_norm
+            + float(init.get("poly_slope", 0.0)) * poly_norm
+        )
+        return max(-0.99, min(0.99, value))
+
+    def _edge_prediction_from_values(
+        self,
+        key: tuple[int, int, int, int],
+        values: list[float],
+        source: str,
+        nearest_distance: int,
+    ) -> EdgeModelPrediction:
+        samples = len(values)
+        expected_delta = sum(values) / samples
+        positive_rate = sum(1 for value in values if value > 0) / samples
+        return EdgeModelPrediction(
+            key=key,
+            samples=samples,
+            expected_delta=expected_delta,
+            positive_rate=positive_rate,
+            source=source,
+            nearest_distance=nearest_distance,
+        )
+
+    def _edge_model_load(self) -> None:
+        if not self.edge_model_enabled:
+            return
+        path = self._edge_model_resolve_path()
+        if not path or not path.exists():
+            self._edge_model_path = path
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[edge-model] failed to load {path}: {exc}")
+            self._edge_model_path = path
+            return
+        self._edge_model_path = path
+        self._edge_model_metadata = payload.get("metadata", {})
+        self._edge_model_init.update(payload.get("initializer", {}) or {})
+        cells = payload.get("cells", {}) or {}
+        for key_text, values in cells.items():
+            key = self._edge_model_parse_key(key_text)
+            if not key:
+                continue
+            queue = deque(maxlen=max(1, self.edge_model_cell_samples))
+            for value in values[-self.edge_model_cell_samples:]:
+                try:
+                    queue.append(float(value))
+                except Exception:
+                    pass
+            if queue:
+                self._edge_model_cells[key] = queue
+        print(
+            f"[edge-model] loaded {path.name}: cells {len(self._edge_model_cells)}, "
+            f"initializer {self._edge_model_init}"
+        )
+        self._edge_model_load_compare_specs(path)
+
+    def _edge_model_load_compare_specs(self, active_path: Path) -> None:
+        paths: list[Path] = []
+        raw_files = self.edge_model_compare_files or [
+            "edge_t5s_p5c_btc20_qty20_fifo20.json",
+            "edge_t4s_p3c_btc20_qty20_fifo10.json",
+            "edge_t3s_p2c_btc20_qty20_fifo10.json",
+        ]
+        for raw in raw_files:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = Path.cwd() / self.edge_model_dir / path
+            if path.exists() and path not in paths:
+                paths.append(path)
+        if active_path.exists() and active_path not in paths:
+            paths.insert(0, active_path)
+        self._edge_model_specs = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                meta = payload.get("metadata", {}) or {}
+                cells: dict[tuple[int, int, int, int], deque[float]] = {}
+                fifo = int(meta.get("cell_samples", self.edge_model_cell_samples))
+                for key_text, values in (payload.get("cells", {}) or {}).items():
+                    key = self._edge_model_parse_key(key_text)
+                    if key:
+                        cells[key] = deque((float(value) for value in values[-fifo:]), maxlen=max(1, fifo))
+                self._edge_model_specs.append(EdgeModelSpec(
+                    name=path.stem,
+                    path=path,
+                    time_bucket_seconds=float(meta.get("time_bucket_seconds", self.edge_model_time_bucket_seconds)),
+                    poly_price_bucket=float(meta.get("poly_price_bucket", self.edge_model_poly_price_bucket)),
+                    btc_move_bins=int(meta.get("btc_move_bins", self.edge_model_btc_move_bins)),
+                    qty_ratio_bins=int(meta.get("qty_ratio_bins", self.edge_model_qty_ratio_bins)),
+                    cell_samples=fifo,
+                    initializer=payload.get("initializer", {}) or {},
+                    cells=cells,
+                    recent_deltas=deque(maxlen=max(1, self.edge_model_profit_window)),
+                ))
+            except Exception as exc:
+                print(f"[edge-model] failed to load compare model {path}: {exc}")
+        if self._edge_model_specs:
+            print("[edge-model] compare models: " + ", ".join(spec.name for spec in self._edge_model_specs))
+
+    def _edge_model_save(self) -> None:
+        if not self.edge_model_enabled or not self.edge_model_save_on_stop:
+            return
+        path = self._edge_model_path or self._edge_model_resolve_path()
+        if not path:
+            return
+        try:
+            metadata = dict(self._edge_model_metadata or {})
+            metadata.update({
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "time_bucket_seconds": self.edge_model_time_bucket_seconds,
+                "poly_price_bucket": self.edge_model_poly_price_bucket,
+                "btc_move_bins": self.edge_model_btc_move_bins,
+                "qty_ratio_bins": self.edge_model_qty_ratio_bins,
+                "cell_samples": self.edge_model_cell_samples,
+            })
+            self._edge_model_write_payload(path, metadata, self._edge_model_init, self._edge_model_cells)
+            saved = {path.resolve()}
+            for spec in self._edge_model_specs:
+                spec_path = spec.path.resolve()
+                if spec_path in saved:
+                    continue
+                spec_metadata = self._edge_model_existing_metadata(spec.path)
+                spec_metadata.update({
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "time_bucket_seconds": spec.time_bucket_seconds,
+                    "poly_price_bucket": spec.poly_price_bucket,
+                    "btc_move_bins": spec.btc_move_bins,
+                    "qty_ratio_bins": spec.qty_ratio_bins,
+                    "cell_samples": spec.cell_samples,
+                })
+                self._edge_model_write_payload(spec.path, spec_metadata, spec.initializer, spec.cells)
+                saved.add(spec_path)
+        except Exception as exc:
+            print(f"[edge-model] failed to save: {exc}")
+
+    def _edge_model_existing_metadata(self, path: Path) -> dict:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return dict(payload.get("metadata", {}) or {})
+        except Exception:
+            return {}
+
+    def _edge_model_write_payload(
+        self,
+        path: Path,
+        metadata: dict,
+        initializer: dict,
+        cells: dict[tuple[int, int, int, int], deque[float]],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": metadata,
+            "initializer": initializer,
+            "cells": {
+                self._edge_model_key_text(key): list(values)
+                for key, values in cells.items()
+                if values
+            },
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        print(f"[edge-model] saved {path} ({len(payload['cells'])} cells)")
+
+    def _edge_model_resolve_path(self) -> Optional[Path]:
+        if self.edge_model_file:
+            path = Path(self.edge_model_file)
+            if not path.is_absolute():
+                if len(path.parts) == 1:
+                    path = Path.cwd() / self.edge_model_dir / path
+                else:
+                    path = Path.cwd() / path
+            return path
+        name = (
+            f"edge_t{int(self.edge_model_time_bucket_seconds)}s_"
+            f"p{int(round(self.edge_model_poly_price_bucket * 100))}c_"
+            f"btc{self.edge_model_btc_move_bins}_qty{self.edge_model_qty_ratio_bins}_"
+            f"fifo{self.edge_model_cell_samples}.json"
+        )
+        return Path.cwd() / self.edge_model_dir / name
+
+    def _edge_model_key_text(self, key: tuple[int, int, int, int]) -> str:
+        return ",".join(str(int(value)) for value in key)
+
+    def _edge_model_parse_key(self, key_text: str) -> Optional[tuple[int, int, int, int]]:
+        try:
+            parts = [int(part) for part in str(key_text).split(",")]
+        except Exception:
+            return None
+        if len(parts) != 4:
+            return None
+        return tuple(parts)  # type: ignore[return-value]
+
+    def _edge_model_log_block(
+        self,
+        features: EdgeModelFeatures,
+        prediction: Optional[EdgeModelPrediction],
+        reason: str,
+        buy_price: float = 0.0,
+        expected_profit_pct: float = 0.0,
+    ) -> None:
+        bucket_id = (features.key, int(time.time() // self.edge_model_log_interval_seconds), reason)
+        if self._edge_model_last_block_bucket == bucket_id:
+            return
+        self._edge_model_last_block_bucket = bucket_id
+        if prediction:
+            print(
+                f"  Edge model held ({reason}): key {features.key}, "
+                f"btc {features.btc_move_pct:+.4f}%, qty {features.qty_ratio:.2f}x, "
+                f"expected {prediction.expected_delta:+.3f}, profit {expected_profit_pct:.1%}, "
+                f"samples {prediction.samples} ({prediction.source})"
+            )
+        else:
+            print(
+                f"  Edge model held ({reason}): key {features.key}, "
+                f"btc {features.btc_move_pct:+.4f}%, qty {features.qty_ratio:.2f}x, "
+                f"no comparable samples yet"
+            )
+
+    def _edge_time_bucket(self, elapsed_seconds: float) -> int:
+        return self._edge_time_bucket_for(elapsed_seconds, self.edge_model_time_bucket_seconds)
+
+    def _edge_time_bucket_for(self, elapsed_seconds: float, bucket_seconds: float) -> int:
+        bucket_seconds = max(1.0, bucket_seconds)
+        max_bucket = max(0, int(math.ceil(self.period_minutes * 60.0 / bucket_seconds)) - 1)
+        return min(max(0, int(elapsed_seconds // bucket_seconds)), max_bucket)
+
+    def _edge_poly_bucket(self, poly_price: float) -> int:
+        return self._edge_poly_bucket_for(poly_price, self.edge_model_poly_price_bucket)
+
+    def _edge_poly_bucket_for(self, poly_price: float, bucket_size: float) -> int:
+        bucket_size = max(0.001, bucket_size)
+        max_bucket = max(0, int(math.ceil(1.0 / bucket_size)) - 1)
+        return min(max(0, int(poly_price // bucket_size)), max_bucket)
+
+    def _edge_btc_move_bucket(self, btc_move_pct: float) -> int:
+        return self._edge_btc_move_bucket_for(btc_move_pct, self.edge_model_btc_move_bins)
+
+    def _edge_btc_move_bucket_for(self, btc_move_pct: float, bins: int) -> int:
+        bins = max(1, bins)
+        max_abs = max(0.0001, self.edge_model_btc_move_max_pct)
+        clamped = min(max(btc_move_pct, -max_abs), max_abs)
+        index = int(((clamped + max_abs) / (2.0 * max_abs)) * bins)
+        return min(max(0, index), bins - 1)
+
+    def _edge_qty_ratio_bucket(self, qty_ratio: float) -> int:
+        return self._edge_qty_ratio_bucket_for(qty_ratio, self.edge_model_qty_ratio_bins)
+
+    def _edge_qty_ratio_bucket_for(self, qty_ratio: float, bins: int) -> int:
+        bins = max(1, bins)
+        max_ratio = max(0.1, self.edge_model_qty_ratio_max)
+        clamped = min(max(qty_ratio, 0.0), max_ratio)
+        index = int((clamped / max_ratio) * bins)
+        return min(max(0, index), bins - 1)
 
     def _entry_window_open(self) -> bool:
         if not self.market:
@@ -536,6 +1454,8 @@ class PolyBot:
         return 0 <= elapsed <= self.entry_window_seconds
 
     def _try_exit(self) -> None:
+        if self._pending_sell:
+            return
         if not self.position:
             return
         sell_price = self._live_sell_price(self.position.token_id, self.position.shares)
@@ -547,41 +1467,33 @@ class PolyBot:
         unrealized_profit = self._update_profit_trail(sell_price)
         min_sell_price = self.position.entry_price * (1.0 + self.config.min_profit_pct)
 
-        if self._pending_exit:
-            if self._process_pending_exit(sell_price, min_sell_price):
-                return
-
         if signal_result:
-            ref_poly_price, ref_poly_received_ts = self._poly_reference_snapshot()
-            if ref_poly_price <= 0:
-                ref_poly_price = sell_price
-                ref_poly_received_ts = time.time()
-            latency_plan = self._latency_sync_plan()
-            now = time.time()
-            self._pending_exit = PendingSignal(
-                kind="exit",
-                created_ts=now,
-                deadline_ts=now + (latency_plan["deadline_ms"] / 1000.0),
-                ref_poly_price=ref_poly_price,
-                ref_poly_received_ts=ref_poly_received_ts,
-                signal=signal_result,
-                trend_start_ts=now + (latency_plan["trend_start_delay_ms"] / 1000.0),
-                latency_target_ms=latency_plan["target_ms"],
-                trend_window_ms=latency_plan["trend_window_ms"],
-                safety_margin_ms=latency_plan["safety_margin_ms"],
+            if sell_price < min_sell_price:
+                print(
+                    f"  Binance down signal held: sell ${sell_price:.3f} < "
+                    f"min profit ${min_sell_price:.3f}"
+                )
+                return
+            self._sell_position(
+                sell_price,
+                reason=(
+                    f"{signal_result.reason}: BTC bucket {signal_result.move_pct:+.4f}% "
+                    f"qty {signal_result.bucket.qty:.4f} "
+                    f"(push {self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f})"
+                ),
             )
-            print(
-                f"  Exit signal pending latency sync: Binance {signal_result.move_pct:+.4f}% | "
-                f"{self._format_push_signal(signal_result)}, qty z {signal_result.volume_z:.2f} | "
-                f"Poly ref ${ref_poly_price:.3f} | avg latency {self._latency_avg_ms:.0f}ms | "
-                f"trend starts +{latency_plan['trend_start_delay_ms']:.0f}ms "
-                f"(trend {latency_plan['trend_window_ms']:.0f}ms, safety {latency_plan['safety_margin_ms']:.0f}ms)"
-            )
-            self._process_pending_exit(sell_price, min_sell_price)
             return
 
         retreat_hit, retreat_pct = self._profit_retreat_hit(unrealized_profit)
         if not retreat_hit:
+            return
+        if sell_price < min_sell_price:
+            print(
+                f"  Profit retreat held: sell ${sell_price:.3f} < "
+                f"min profit ${min_sell_price:.3f}; "
+                f"current ${unrealized_profit:+.2f}, peak ${self.position.peak_unrealized_profit:+.2f}, "
+                f"retreat {retreat_pct:.1%}"
+            )
             return
 
         price_zone = "above_50" if sell_price > 0.50 else "at_or_below_50"
@@ -704,6 +1616,18 @@ class PolyBot:
             "duration_ms": (last.ts - first.ts) * 1000.0,
         }
 
+    def _poly_recently_falling(self, start_ts: float, ticks: int) -> bool:
+        samples = self._poly_samples_since(start_ts)
+        if len(samples) < ticks:
+            return False
+        window = samples[-ticks:]
+        if window[-1].price >= window[0].price:
+            return False
+        return all(
+            current.price <= previous.price
+            for previous, current in zip(window, window[1:])
+        )
+
     def _poly_samples_since(self, start_ts: float) -> list[PriceSample]:
         if not self.market:
             return []
@@ -739,10 +1663,11 @@ class PolyBot:
         current_mean = getattr(signal_result, "push_current_mean", 0.0)
         mean_shift_z = getattr(signal_result, "push_mean_shift_z", 0.0)
         std_ratio = getattr(signal_result, "push_std_ratio", 0.0)
+        source = getattr(signal_result, "push_source", "window")
         if count <= 0:
             return "push dev n/a"
         return (
-            f"push window {deviation:+.2f}x "
+            f"push {source} {deviation:+.2f}x "
             f"(mean_z {mean_shift_z:+.2f}, mean ${mean:,.2f}->${current_mean:,.2f}, "
             f"d ${delta:+.2f}, base_std ${std:.2f}, cur_std {std_ratio:.2f}x, "
             f"n={current_count}/{count})"
@@ -767,7 +1692,8 @@ class PolyBot:
         if not self.position:
             return False, 0.0
         peak = self.position.peak_unrealized_profit
-        if peak <= 0:
+        min_profit_usd = self.position.cost * self.config.min_profit_pct
+        if peak < min_profit_usd:
             return False, 0.0
         retreat = (peak - unrealized_profit) / peak
         return retreat >= self.config.profit_retreat_pct, retreat
@@ -775,28 +1701,200 @@ class PolyBot:
     def _sell_position(self, sell_price: float, reason: str) -> None:
         if not self.position:
             return
-
-        print(f"\n[EXIT] {reason} | sell ${sell_price:.3f}")
-        result = self.executor.sell(self.position.token_id, self.position.shares, price=sell_price)
-        if not result.success:
-            print(f"  Sell failed: {result.error}")
+        if self._simulate_order_failure("SELL"):
             return
 
+        print(f"\n[EXIT] {reason} | sell ${sell_price:.3f}")
+        result = self.executor.place_sell_order(self.position.token_id, self.position.shares, price=sell_price)
+        if not result.success:
+            print(f"  Sell submit failed: {result.error}")
+            return
+
+        now = time.time()
+        required_confirm_checks = random.choices([2, 3, 4], weights=[25, 50, 25], k=1)[0] if self.dry_run else 1
+        self._pending_sell = PendingSellOrder(
+            order_id=result.order_id,
+            token_id=self.position.token_id,
+            window_ts=self.position.window_ts,
+            market_slug=self.position.market_slug,
+            price=result.price or sell_price,
+            shares=self.position.shares,
+            reason=reason,
+            created_ts=now,
+            next_check_ts=now + self._pending_buy_check_interval_seconds,
+            balance_before=result.balance_before,
+            token_balance_before=result.token_balance_before,
+            required_confirm_checks=required_confirm_checks,
+            last_signal_seq=self._edge_model_signal_seq,
+        )
+        self._last_trade_action_ts = now
+        print(
+            f"  Sell order pending: {result.order_id} | "
+            f"{self.position.shares:.0f} shares @ ${result.price:.3f}; "
+            f"check every {self._pending_buy_check_interval_seconds:.0f}s | "
+            f"confirm after {required_confirm_checks} checks"
+        )
+
+    def _apply_sell_fill(self, result, pending: PendingSellOrder) -> None:
+        if not self.position:
+            return
         self.position.exit_revenue += result.amount_usd
         self.position.shares = max(0.0, self.position.shares - result.shares)
         if self.position.shares < 1.0:
             self.position.closed = True
 
         profit = self.position.exit_revenue - self.position.cost
-        self.realized_pnl += profit
-        self._update_strategy_drawdown_guard()
-        print(f"  Exit filled: revenue ${result.amount_usd:.2f}, profit ${profit:+.2f}")
-        self.telegram.strategy_result_alert(
-            strategy="Binance latency spike",
-            profit=profit,
-            strategy_pnl=self.realized_pnl,
-            total_pnl=self.realized_pnl,
+        self._last_trade_action_ts = time.time()
+        if self.position.closed:
+            self.realized_pnl += profit
+            self._update_strategy_drawdown_guard()
+            print(f"  Exit filled: revenue ${result.amount_usd:.2f}, profit ${profit:+.2f}")
+            self.telegram.strategy_result_alert(
+                strategy="Binance latency spike",
+                profit=profit,
+                strategy_pnl=self.realized_pnl,
+                total_pnl=self.realized_pnl,
+            )
+            return
+        print(
+            f"  Exit partial: revenue ${result.amount_usd:.2f}, "
+            f"sold {result.shares:.0f}, remaining {self.position.shares:.0f}, "
+            f"unrealized profit ${profit:+.2f}"
         )
+
+    def _process_pending_sell(self) -> None:
+        pending = self._pending_sell
+        if not pending:
+            return
+
+        now = time.time()
+        if pending.cancel_requested:
+            if now >= pending.next_cancel_ts:
+                self._cancel_pending_sell(pending.cancel_reason or "cancel requested")
+            return
+
+        if self._pending_sell_cancel_signal(pending):
+            self._cancel_pending_sell(pending.cancel_reason or "positive Binance follow-through")
+            return
+
+        if now < pending.next_check_ts:
+            return
+
+        pending.check_attempts += 1
+        result = self.executor.check_pending_sell(
+            pending.order_id,
+            pending.price,
+            pending.shares,
+            pending.token_id,
+            pending.balance_before,
+            pending.token_balance_before,
+        )
+        pending.next_check_ts = now + self._pending_buy_check_interval_seconds
+        if not result:
+            print(f"  Pending sell check: {pending.order_id} not filled yet")
+            return
+        if self.dry_run and pending.check_attempts < pending.required_confirm_checks:
+            print(
+                f"  Pending sell check {pending.check_attempts}/"
+                f"{pending.required_confirm_checks}: simulated order still pending"
+            )
+            return
+
+        self._pending_sell = None
+        self._apply_sell_fill(result, pending)
+
+    def _pending_sell_cancel_signal(self, pending: PendingSellOrder) -> bool:
+        if self.dry_run and pending.dry_cancel_blocked:
+            return False
+        if self._edge_model_signal_seq <= pending.last_signal_seq:
+            return False
+        pending.last_signal_seq = self._edge_model_signal_seq
+        features = self._edge_model_features(time.time(), self.current_btc_price)
+        if not features or features.btc_move_pct < self.pending_sell_cancel_btc_move_pct:
+            return False
+        pending.cancel_reason = (
+            f"Binance up while sell pending ({features.btc_move_pct:+.4f}% "
+            f">= {self.pending_sell_cancel_btc_move_pct:.4f}%)"
+        )
+        return True
+
+    def _cancel_pending_sell(self, reason: str) -> None:
+        pending = self._pending_sell
+        if not pending:
+            return
+        if self.dry_run:
+            if not pending.dry_cancel_decided:
+                pending.dry_cancel_decided = True
+                cancel_rate = min(max(0.0, self.simulated_cancel_success_rate), 1.0)
+                pending.dry_cancel_blocked = random.random() >= cancel_rate
+            if not pending.dry_cancel_blocked:
+                print(
+                    f"  DRY pending sell cancelled {pending.order_id}: {reason} "
+                    f"(sim cancel success {self.simulated_cancel_success_rate:.0%})"
+                )
+                self._pending_sell = None
+                self._last_trade_action_ts = time.time()
+                return
+            print(
+                f"  DRY pending sell cancel failed/already matched {pending.order_id}: {reason} "
+                f"(sim cancel success {self.simulated_cancel_success_rate:.0%}); keeping order pending"
+            )
+            pending.cancel_requested = False
+            pending.next_cancel_ts = 0.0
+            return
+
+        fill = self.executor.check_pending_sell(
+            pending.order_id,
+            pending.price,
+            pending.shares,
+            pending.token_id,
+            pending.balance_before,
+            pending.token_balance_before,
+        )
+        if fill:
+            print(f"  Pending sell already filled before cancel: {pending.order_id}")
+            self._pending_sell = None
+            self._apply_sell_fill(fill, pending)
+            return
+        if self.executor.order_is_cancelled(pending.order_id):
+            print(f"  Pending sell cancel confirmed: {pending.order_id}")
+            self._pending_sell = None
+            self._last_trade_action_ts = time.time()
+            return
+
+        print(f"  Cancelling pending sell {pending.order_id}: {reason}")
+        pending.cancel_requested = True
+        pending.cancel_reason = reason
+        if self.executor.cancel_order(pending.order_id):
+            now = time.time()
+            pending.next_cancel_ts = now + 1.0
+            pending.next_check_ts = min(pending.next_check_ts, now + 1.0)
+            self._last_trade_action_ts = now
+            print("  Pending sell cancel sent; retrying every 1s until order state is confirmed")
+            return
+
+        now = time.time()
+        pending.next_cancel_ts = now + 1.0
+        pending.next_check_ts = min(pending.next_check_ts, now + 1.0)
+        print("  Pending sell cancel failed; keeping order under observation")
+
+    def _trade_cooldown_ready(self, action: str) -> bool:
+        if self.trade_cooldown_seconds <= 0 or self._last_trade_action_ts <= 0:
+            return True
+        elapsed = time.time() - self._last_trade_action_ts
+        if elapsed >= self.trade_cooldown_seconds:
+            return True
+        return False
+
+    def _simulate_order_failure(self, action: str) -> bool:
+        rate = min(max(0.0, self.simulated_order_failure_rate), 1.0)
+        if rate <= 0:
+            return False
+        if random.random() >= rate:
+            return False
+        print(f"  Simulated {action} failure ({rate:.0%}); order not sent")
+        self._last_trade_action_ts = time.time()
+        return True
 
     def _resolve_position(self, closing_btc_price: float) -> None:
         if not self.position or self.position.closed:
@@ -858,6 +1956,20 @@ class PolyBot:
         if price.last_trade > 0:
             return round(price.last_trade, 4), received_ts
         return 0.0, received_ts
+
+    def _poly_price_near(self, target_ts: float, known_until_ts: float, max_distance_seconds: float = 1.0) -> float:
+        if not self.market or target_ts <= 0:
+            return 0.0
+        candidates = [
+            sample for sample in self._poly_price_samples
+            if sample.segment == self.market.window_start
+            and sample.price > 0
+            and sample.ts <= known_until_ts
+            and abs(sample.ts - target_ts) <= max_distance_seconds
+        ]
+        if not candidates:
+            return 0.0
+        return min(candidates, key=lambda sample: abs(sample.ts - target_ts)).price
 
     def _latency_wait_seconds(self) -> float:
         wait_ms = self._latency_avg_ms if self._latency_samples_ms else self.latency_default_ms
@@ -1333,7 +2445,9 @@ class PolyBot:
         self._last_status_ts = now
 
         pos = "flat"
-        if self.position and not self.position.closed:
+        if self._pending_sell:
+            pos = f"pending sell {self._pending_sell.shares:.0f} @ ${self._pending_sell.price:.2f}"
+        elif self.position and not self.position.closed:
             pos = f"UP {self.position.shares:.0f} @ ${self.position.entry_price:.2f}"
         elif self._strategy_is_cooling_down():
             pos = f"cooldown {self._strategy_cooldown_until - time.time():.0f}s"
@@ -1364,6 +2478,15 @@ class PolyBot:
     def _handle_shutdown(self, *_):
         print("\nStopping PolyBot...")
         self._running = False
+        if self._pending_buy:
+            print(f"  Cancelling pending buy on shutdown: {self._pending_buy.order_id}")
+            self.executor.cancel_order(self._pending_buy.order_id)
+            self._pending_buy = None
+        if self._pending_sell:
+            print(f"  Cancelling pending sell on shutdown: {self._pending_sell.order_id}")
+            self.executor.cancel_order(self._pending_sell.order_id)
+            self._pending_sell = None
+        self._edge_model_save()
         self.price_feed.stop()
         self.poly_feed.stop()
         self.telegram.send("*PolyBot stopped*")

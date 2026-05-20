@@ -42,7 +42,7 @@ POLY_MIN_NOTIONAL = 5.0
 BUY_VERIFY_ATTEMPTS = 8
 BUY_VERIFY_DELAY_SECONDS = 3.0
 BUY_RETRY_BUFFER_USD = 0.05
-BALANCE_REFRESH_MIN_INTERVAL = 2.0
+BALANCE_REFRESH_MIN_INTERVAL = float(os.getenv("BALANCE_SYNC_INTERVAL_SECONDS", "300"))
 BALANCE_REFRESH_BACKOFF_SECONDS = 90.0
 
 DEFAULT_TICK_SIZE = "0.01"
@@ -62,6 +62,8 @@ class OrderResult:
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
+    balance_before: float = 0.0
+    token_balance_before: Optional[float] = None
 
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
@@ -252,6 +254,8 @@ class Executor:
         self._initialized = False
         self._balance_refresh_last: dict[str, float] = {}
         self._balance_refresh_blocked_until: float = 0.0
+        self._balance_cache_value: float = 0.0
+        self._balance_cache_ts: float = 0.0
 
         if self.signature_type == SignatureTypeV2.POLY_1271:
             print(
@@ -317,15 +321,21 @@ class Executor:
     def get_balance(self, refresh: bool = False) -> float:
         if not self._initialized:
             return 0.0
+        now = time.time()
+        if self._balance_cache_value > 0 and now - self._balance_cache_ts < BALANCE_REFRESH_MIN_INTERVAL:
+            return self._balance_cache_value
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             if refresh:
                 self._refresh_balance_allowance(params, "collateral")
             bal = self.client.get_balance_allowance(params)
-            return float(bal.get("balance", 0)) / 1e6
+            value = float(bal.get("balance", 0)) / 1e6
+            self._balance_cache_value = value
+            self._balance_cache_ts = now
+            return value
         except Exception as e:
             print(f"[executor] Balance check failed: {e}")
-            return 0.0
+            return self._balance_cache_value if self._balance_cache_value > 0 else 0.0
 
     def _get_token_balance_optional(self, token_id: str, refresh: bool = False) -> Optional[float]:
         """Return the wallet's conditional-token balance, or None if unavailable."""
@@ -590,6 +600,309 @@ class Executor:
                 success=False, status=FAILED, error=_friendly_error(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
+
+    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
+        """Post a buy order and return immediately; caller verifies/cancels later."""
+        amount_usd = round(float(amount_usd), 2)
+        if amount_usd < MIN_AMOUNT_USD:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Amount ${amount_usd:.2f} below min", side="BUY",
+            )
+
+        if price > 0:
+            market_price = round(price, 2)
+        else:
+            market_price = 0.55 if self.dry_run else self.get_market_price(token_id, "BUY", amount_usd)
+            if market_price <= 0:
+                return OrderResult(
+                    success=False, status=FAILED,
+                    error="Could not get market price", side="BUY",
+                    token_id=token_id[:16] + "...",
+                )
+            market_price = round(market_price, 2)
+
+        cap_price = max_buy_price()
+        if market_price > cap_price:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Price ${market_price:.3f} > cap ${cap_price:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        shares, clean_amount = calculate_order_size(market_price, amount_usd)
+        if shares < 1 or clean_amount <= 0:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Can't afford 1 share at ${market_price:.3f} within ${amount_usd:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+        if clean_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        print(f"  [order] Posting buy: ${market_price:.3f}/share "
+              f"-> {int(shares)} shares for ${clean_amount:.2f}")
+
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=f"DRY-{int(time.time() * 1000)}",
+                status="PENDING", side="BUY", price=market_price,
+                amount_usd=clean_amount, shares=shares,
+                token_id=token_id[:16] + "...", dry_run=True,
+            )
+
+        if not self._initialized:
+            return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+        balance_before = self.get_balance()
+        token_balance_before = self._get_token_balance_optional(token_id)
+        try:
+            result = self.client.create_and_post_order(
+                order_args=OrderArgs(
+                    token_id=token_id,
+                    price=market_price,
+                    size=float(int(shares)),
+                    side="BUY",
+                ),
+                options=_order_options(),
+                order_type=OrderType.GTC,
+            )
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"No orderID: {result}", side="BUY", price=market_price,
+                    token_id=token_id[:16] + "...",
+                )
+            return OrderResult(
+                success=True, order_id=order_id, status="PENDING",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=float(shares), token_id=token_id[:16] + "...",
+                dry_run=False, balance_before=balance_before,
+                token_balance_before=token_balance_before,
+            )
+        except Exception as e:
+            return OrderResult(
+                success=False, status=FAILED, error=_friendly_error(e),
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+                balance_before=balance_before,
+                token_balance_before=token_balance_before,
+            )
+
+    def check_pending_buy(
+        self,
+        order_id: str,
+        price: float,
+        shares: float,
+        token_id: str,
+        balance_before: float = 0.0,
+        token_balance_before: Optional[float] = None,
+    ) -> Optional[OrderResult]:
+        """Single non-blocking verification pass for a previously posted buy."""
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=order_id, status=FILLED,
+                side="BUY", price=price, amount_usd=shares * price,
+                shares=shares, token_id=token_id[:16] + "...", dry_run=True,
+            )
+
+        if balance_before > 0:
+            balance_after = self.get_balance(refresh=True)
+            spent = balance_before - balance_after
+            token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
+            token_delta = (
+                max(0.0, token_balance_after - token_balance_before)
+                if token_balance_before is not None and token_balance_after is not None
+                else None
+            )
+            if spent > 0.50 and (token_delta is None or token_delta > 0):
+                actual_shares = token_delta if token_delta is not None else (spent / price if price > 0 else shares)
+                status = FILLED if actual_shares >= shares - 0.001 else PARTIAL
+                return OrderResult(
+                    success=True, order_id=order_id, status=status,
+                    side="BUY", price=price, amount_usd=spent,
+                    shares=actual_shares, token_id=token_id[:16] + "...",
+                    dry_run=False,
+                )
+
+        fill = self._check_order(order_id)
+        if not fill:
+            return None
+        matched = self._extract_fill(fill, price)
+        if not matched:
+            return None
+        status = FILLED if matched[2] >= shares - 0.001 else PARTIAL
+        return OrderResult(
+            success=True, order_id=order_id, status=status,
+            side="BUY", price=matched[0], amount_usd=matched[1],
+            shares=matched[2], token_id=token_id[:16] + "...",
+            dry_run=False,
+        )
+
+    def place_sell_order(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
+        """Post a sell order and return immediately; caller verifies/cancels later."""
+        sell_shares = int(shares)
+        if sell_shares < 1:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="Less than 1 share", side="SELL",
+            )
+
+        if price <= 0:
+            notional = float(sell_shares) * 0.50
+            price = 0.90 if self.dry_run else self.get_market_price(token_id, "SELL", notional)
+            if price <= 0:
+                return OrderResult(
+                    success=False, status=FAILED,
+                    error="Could not get sell price", side="SELL",
+                    token_id=token_id[:16] + "...",
+                )
+        market_price = round(price, 2)
+
+        sell_amount = round(sell_shares * market_price, 2)
+        if sell_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min - hold to resolution",
+                side="SELL", price=market_price, shares=float(sell_shares),
+                shares_remaining=float(sell_shares), token_id=token_id[:16] + "...",
+            )
+
+        print(f"  [order] Posting sell: {sell_shares} shares @ ${market_price:.3f} = ${sell_amount:.2f}")
+
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=f"DRY-SELL-{int(time.time() * 1000)}",
+                status="PENDING", side="SELL", price=market_price,
+                amount_usd=sell_amount, shares=float(sell_shares),
+                shares_remaining=0.0, token_id=token_id[:16] + "...", dry_run=True,
+            )
+
+        if not self._initialized:
+            return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+        token_balance = self._get_token_balance_optional(token_id, refresh=True)
+        if token_balance is not None and token_balance > 0:
+            available_shares = int(token_balance)
+            if available_shares < sell_shares:
+                print(
+                    f"  [order] Sell size adjusted to actual token balance: "
+                    f"{sell_shares} -> {available_shares} shares"
+                )
+                sell_shares = available_shares
+                sell_amount = round(sell_shares * market_price, 2)
+        if token_balance is not None and token_balance <= 0:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="No sellable token balance", side="SELL",
+                price=market_price, shares=0.0, token_id=token_id[:16] + "...",
+            )
+        if sell_shares < 1:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="No sellable token balance", side="SELL",
+                price=market_price, shares=0.0, token_id=token_id[:16] + "...",
+            )
+        if sell_amount < POLY_MIN_NOTIONAL:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min - hold to resolution",
+                side="SELL", price=market_price, shares=float(sell_shares),
+                shares_remaining=float(sell_shares), token_id=token_id[:16] + "...",
+            )
+
+        balance_before = self.get_balance()
+        token_balance_before = token_balance if token_balance is not None else self._get_token_balance_optional(token_id)
+        try:
+            result = self.client.create_and_post_market_order(
+                order_args=MarketOrderArgs(
+                    token_id=token_id,
+                    amount=float(sell_shares),
+                    side="SELL",
+                    price=market_price,
+                    order_type=OrderType.GTC,
+                ),
+                options=_order_options(),
+                order_type=OrderType.GTC,
+            )
+            order_id = result.get("orderID", "")
+            if not order_id:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"No orderID: {result}", side="SELL", price=market_price,
+                    token_id=token_id[:16] + "...",
+                )
+            return OrderResult(
+                success=True, order_id=order_id, status="PENDING",
+                side="SELL", price=market_price, amount_usd=sell_amount,
+                shares=float(sell_shares), shares_remaining=0.0,
+                token_id=token_id[:16] + "...", dry_run=False,
+                balance_before=balance_before, token_balance_before=token_balance_before,
+            )
+        except Exception as e:
+            return OrderResult(
+                success=False, status=FAILED, error=_friendly_error(e),
+                side="SELL", price=market_price, token_id=token_id[:16] + "...",
+                balance_before=balance_before, token_balance_before=token_balance_before,
+            )
+
+    def check_pending_sell(
+        self,
+        order_id: str,
+        price: float,
+        shares: float,
+        token_id: str,
+        balance_before: float = 0.0,
+        token_balance_before: Optional[float] = None,
+    ) -> Optional[OrderResult]:
+        """Single non-blocking verification pass for a previously posted sell."""
+        if self.dry_run:
+            return OrderResult(
+                success=True, order_id=order_id, status=FILLED,
+                side="SELL", price=price, amount_usd=shares * price,
+                shares=shares, shares_remaining=0.0,
+                token_id=token_id[:16] + "...", dry_run=True,
+            )
+
+        if balance_before > 0:
+            balance_after = self.get_balance(refresh=True)
+            received = balance_after - balance_before
+            token_balance_after = self._get_token_balance_optional(token_id, refresh=True)
+            token_delta = (
+                max(0.0, token_balance_before - token_balance_after)
+                if token_balance_before is not None and token_balance_after is not None
+                else None
+            )
+            if received > 0.10 or (token_delta is not None and token_delta > 0):
+                sold_shares = token_delta if token_delta is not None else (received / price if price > 0 else shares)
+                revenue = received if received > 0.10 else sold_shares * price
+                shares_left = max(0.0, shares - sold_shares)
+                status = FILLED if shares_left < 1 else PARTIAL
+                return OrderResult(
+                    success=True, order_id=order_id, status=status,
+                    side="SELL", price=price, amount_usd=revenue,
+                    shares=sold_shares, shares_remaining=shares_left,
+                    token_id=token_id[:16] + "...", dry_run=False,
+                )
+
+        fill = self._check_order(order_id)
+        if not fill:
+            return None
+        matched = self._extract_fill(fill, price)
+        if not matched:
+            return None
+        shares_left = max(0.0, shares - matched[2])
+        status = FILLED if shares_left < 1 else PARTIAL
+        return OrderResult(
+            success=True, order_id=order_id, status=status,
+            side="SELL", price=matched[0], amount_usd=matched[1],
+            shares=matched[2], shares_remaining=shares_left,
+            token_id=token_id[:16] + "...", dry_run=False,
+        )
 
     def _verify_buy_via_balance(
         self, order_id: str, price: float, shares: float,
@@ -912,6 +1225,19 @@ class Executor:
         if not fill:
             return None
         return self._extract_fill(fill, fallback_price)
+
+    def order_is_cancelled(self, order_id: str) -> bool:
+        if self.dry_run:
+            return True
+        order = self._check_order(order_id)
+        if not order:
+            return False
+        status = str(
+            order.get("status", "")
+            or order.get("state", "")
+            or order.get("orderStatus", "")
+        ).lower()
+        return status in {"cancelled", "canceled", "cancelled_order", "canceled_order"}
 
     def cancel_order(self, order_id: str) -> bool:
         if self.dry_run or not self._initialized:
